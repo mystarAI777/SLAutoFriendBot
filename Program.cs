@@ -2,6 +2,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
+using SLVoicevoxServer.Config; // もち子さん設定クラス
 using VoicevoxClientSharp; // VoicevoxClientSharp NuGetパッケージが必要
 using System.Text.Json;
 
@@ -15,11 +16,28 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// 最新のVoicevoxClientSharpに対応した実装
+// もち子さん専用VoicevoxSynthesizerの設定
 builder.Services.AddSingleton<VoicevoxSynthesizer>(sp =>
 {
-    // デフォルトでhttp://localhost:50021に接続
-    return new VoicevoxSynthesizer();
+    // デフォルトでhttp://localhost:50021に接続（もち子さん専用）
+    var synthesizer = new VoicevoxSynthesizer();
+    
+    // もち子さん（スピーカーID: 9）を事前初期化（オプション）
+    // 初回の音声合成時間を短縮できます
+    Task.Run(async () =>
+    {
+        try
+        {
+            await synthesizer.InitializeStyleAsync(MochikoVoiceConfig.SPEAKER_ID); // もち子さんのスタイルを初期化
+            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイルを初期化しました");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイル初期化エラー: {ex.Message}");
+        }
+    });
+    
+    return synthesizer;
 });
 
 var app = builder.Build();
@@ -44,18 +62,17 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer synthesizer
 {
     string responseMessage;
     string audioUrl = "";
-    const int speakerId = 9; // もちこさん固定
 
     var user = await db.Users.FindAsync(req.UserId);
     if (user != null)
     {
         if (req.Message.StartsWith("@")) 
         { 
-            responseMessage = "申し訳ありません、このバージョンではコマンドは使用できません。"; 
+            responseMessage = MochikoVoiceConfig.Messages.COMMAND_NOT_SUPPORTED;
         }
         else 
         { 
-            responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！"; 
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.GREETING_REGISTERED, user.UserName);
         }
     }
     else
@@ -78,29 +95,38 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer synthesizer
             db.Users.Add(newUser);
             db.ChatLogs.Remove(chatLog);
             await db.SaveChangesAsync();
-            responseMessage = $"いつもありがとうございます、{req.UserName}様！今日からあなたの専属コンシェルジュになりますね。声はずっと、もちこが担当します。";
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.WELCOME_NEW_USER, req.UserName);
         }
         else 
         { 
-            responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。"; 
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.GREETING_GUEST, req.UserName);
         }
     }
 
     try
     {
-        // 最新のVoicevoxClientSharpのAPIを使用
-        var synthesisResult = await synthesizer.SynthesizeSpeechAsync(speakerId, responseMessage);
+        // もち子さんの声で音声合成を実行
+        var synthesisResult = await synthesizer.SynthesizeSpeechAsync(
+            MochikoVoiceConfig.SPEAKER_ID, 
+            responseMessage,
+            speedScale: MochikoVoiceConfig.DefaultParameters.SpeedScale,
+            pitchScale: MochikoVoiceConfig.DefaultParameters.PitchScale,
+            intonationScale: MochikoVoiceConfig.DefaultParameters.IntonationScale,
+            volumeScale: MochikoVoiceConfig.DefaultParameters.VolumeScale
+        );
         
-        var filename = $"{Guid.NewGuid()}.wav";
+        var filename = $"{MochikoVoiceConfig.AUDIO_FILE_PREFIX}_{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, synthesisResult.Wav);
         
         var baseUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL") ?? "http://localhost:5000";
         audioUrl = $"{baseUrl}/audio/{filename}";
+        
+        Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声を生成しました: {filename}");
     }
     catch (Exception ex) 
     { 
-        Console.WriteLine($"音声合成エラー: {ex.Message}"); 
+        Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声合成エラー: {ex.Message}"); 
     }
     
     return Results.Ok(new { message = responseMessage, audio_url = audioUrl });
