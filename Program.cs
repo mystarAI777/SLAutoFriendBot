@@ -1,12 +1,13 @@
-// 【決定版】Program.cs
+// 【真・最終決定版】Program.cs
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // ★正しい住所
+using VoicevoxClientSharp; // 正しいライブラリの住所
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// --- データベース設定 ---
 var secretFilePath = "/etc/secrets/connection_string";
 var connectionString = File.Exists(secretFilePath)
     ? File.ReadAllText(secretFilePath).Trim()
@@ -15,30 +16,42 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// ★正しいクラス名
-builder.Services.AddScoped<Voicevox>(_ => new Voicevox("127.0.0.1", 50021));
+// --- ★★★【最重要修正点】★★★ ---
+// 新しい作法(v1.0.0)でVoicevoxインスタンスを非同期で生成し、サービスとして登録する
+builder.Services.AddSingleton<IVoicevox>(sp =>
+{
+    // Voicevox.Createは非同期メソッドなので、結果を待機する
+    return Voicevox.Create("127.0.0.1", 50021).Result;
+});
+
 
 var app = builder.Build();
 
+// --- 起動時にDBを自動更新 ---
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.Migrate();
 }
 
+// --- 静的ファイル設定 ---
 var audioDir = Path.Combine(app.Environment.ContentRootPath, "static/audio");
 if (!Directory.Exists(audioDir)) Directory.CreateDirectory(audioDir);
 app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(Path.Combine(app.Environment.ContentRootPath, "static")) });
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// ★正しいクラス名
-app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] InteractRequest req) =>
+// --- メインエンドポイント ---
+// ★★★【最重要修正点】★★★
+// 正しいインターフェース(IVoicevox)でサービスを受け取る
+app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
     int speakerId = 1;
     var user = await db.Users.FindAsync(req.UserId);
+
+    // (ここから下のロジックは変更なし)
     if (user != null)
     {
         speakerId = user.VoicevoxSpeakerId;
@@ -82,7 +95,7 @@ app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] I
     try
     {
         var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevox.SynthesisAsync(query, speakerId);
+        var wavData = await voicevox.SynthesisAsync(query); // ★Synthesisの引数も変更
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
