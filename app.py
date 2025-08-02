@@ -301,11 +301,24 @@ def chat():
     
     try:
         data = request.json
-        user_uuid = data.get('user_uuid')
-        user_name = data.get('user_name')
+        if not data:
+            logger.error("JSONデータが空です")
+            response = jsonify({'error': 'JSON data is required'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+        
+        # LSLスクリプトからの古い形式と新しい形式の両方に対応
+        user_uuid = data.get('user_uuid') or data.get('uuid')
+        user_name = data.get('user_name') or data.get('name')
         message = data.get('message', '')
         
+        logger.info(f"受信データ: user_uuid={user_uuid}, user_name={user_name}, message={message}")
+        
         if not user_uuid or not user_name:
+            logger.error(f"必須パラメータが不足: user_uuid={user_uuid}, user_name={user_name}")
+            response = jsonify({'error': 'user_uuid and user_name are required'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
             return jsonify({'error': 'user_uuid and user_name are required'}), 400
         
         # ユーザーデータの取得または作成
@@ -319,8 +332,10 @@ def chat():
         # 音声生成
         voice_data = generate_voice(ai_response)
         
+        # LSL互換の応答形式
         response_data = {
-            'response': ai_response,
+            'text': ai_response,  # LSLスクリプトが期待する形式
+            'response': ai_response,  # 既存のクライアント用
             'interaction_count': user_data.interaction_count,
             'has_voice': voice_data is not None
         }
@@ -332,6 +347,7 @@ def chat():
             with open(voice_path, 'wb') as f:
                 f.write(voice_data)
             response_data['voice_url'] = f'/voice/{voice_filename}'
+            response_data['audio_url'] = f'/voice/{voice_filename}'  # LSLスクリプト用
         
         response = jsonify(response_data)
         response.headers.add('Access-Control-Allow-Origin', '*')
