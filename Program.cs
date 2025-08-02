@@ -1,8 +1,8 @@
-// 【これが本当に最後の最終決定版】Program.cs
+// 【決定版】Program.cs - Updated for VoicevoxClientSharp 1.0.0
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // ★★★【最後の修正点】★★★ この一行が世界を救います
+using VoicevoxClientSharp; // Updated import
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,11 +15,8 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// 新しい作法(v1.0.0)でVoicevoxインスタンスを非同期で生成し、サービスとして登録する
-builder.Services.AddSingleton<IVoicevox>(sp =>
-{
-    return Voicevox.Create("127.0.0.1", 50021).Result;
-});
+// Updated: Use VoicevoxApiClient instead of Voicevox
+builder.Services.AddScoped<VoicevoxApiClient>(_ => VoicevoxApiClient.Create("http://127.0.0.1:50021"));
 
 var app = builder.Build();
 
@@ -35,8 +32,8 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// 正しいインターフェース(IVoicevox)でサービスを受け取る
-app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
+// Updated: Use VoicevoxApiClient
+app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClient, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
@@ -84,8 +81,9 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
     }
     try
     {
-        var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevox.SynthesisAsync(query);
+        // Updated: Use VoicevoxApiClient methods
+        var audioQuery = await voicevoxClient.CreateAudioQueryAsync(responseMessage, speakerId);
+        var wavData = await voicevoxClient.SynthesisAsync(speakerId, audioQuery);
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
