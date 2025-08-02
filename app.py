@@ -108,9 +108,55 @@ try:
             DATABASE_URL = 'sqlite:///./app.db'
     
     engine = create_engine(DATABASE_URL)
+    
+    # データベースマイグレーション処理
+    def migrate_database():
+        logger.info("データベースマイグレーションを開始します...")
+        with engine.connect() as conn:
+            try:
+                # 既存テーブルの確認
+                result = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'user_memories'"))
+                existing_columns = [row[0] for row in result.fetchall()]
+                logger.info(f"既存のカラム: {existing_columns}")
+                
+                # 必要なカラムを追加
+                required_columns = {
+                    'created_at': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                    'last_interaction': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
+                }
+                
+                for column_name, column_def in required_columns.items():
+                    if column_name not in existing_columns:
+                        try:
+                            conn.execute(text(f"ALTER TABLE user_memories ADD COLUMN {column_name} {column_def}"))
+                            conn.commit()
+                            logger.info(f"カラム '{column_name}' を追加しました。")
+                        except Exception as e:
+                            logger.warning(f"カラム '{column_name}' の追加でエラー: {e}")
+                
+                logger.info("データベースマイグレーションが完了しました。")
+                
+            except Exception as e:
+                logger.warning(f"PostgreSQLのマイグレーションでエラー: {e}")
+                # SQLiteの場合の処理
+                try:
+                    conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='user_memories'"))
+                    logger.info("SQLiteテーブルの確認完了")
+                except Exception as sqlite_error:
+                    logger.warning(f"SQLiteでもエラー: {sqlite_error}")
+    
+    # まずテーブルを作成
     Base.metadata.create_all(engine)
+    
+    # 既存テーブルがある場合はマイグレーションを実行
+    try:
+        migrate_database()
+    except Exception as migration_error:
+        logger.warning(f"マイグレーション処理をスキップ: {migration_error}")
+    
     Session = sessionmaker(bind=engine)
     logger.info(f"データベース接続が完了しました。URL: {DATABASE_URL[:20]}...")
+    
 except Exception as e:
     logger.error(f"データベース接続エラー: {e}")
     logger.error("SQLiteにフォールバックします。")
@@ -149,17 +195,19 @@ def get_or_create_user(user_uuid, user_name):
             user_data = UserDataContainer(
                 user_uuid=user_memory.user_uuid,
                 user_name=user_memory.user_name,
-                personality_notes=user_memory.personality_notes,
-                favorite_topics=user_memory.favorite_topics,
+                personality_notes=user_memory.personality_notes or '',
+                favorite_topics=user_memory.favorite_topics or '',
                 interaction_count=user_memory.interaction_count,
-                created_at=user_memory.created_at,
-                last_interaction=user_memory.last_interaction
+                created_at=getattr(user_memory, 'created_at', datetime.utcnow()),
+                last_interaction=getattr(user_memory, 'last_interaction', datetime.utcnow())
             )
         else:
             # 新規ユーザーの場合
             new_user = UserMemory(
                 user_uuid=user_uuid,
                 user_name=user_name,
+                personality_notes='',
+                favorite_topics='',
                 interaction_count=1,
                 created_at=datetime.utcnow(),
                 last_interaction=datetime.utcnow()
@@ -170,16 +218,32 @@ def get_or_create_user(user_uuid, user_name):
             user_data = UserDataContainer(
                 user_uuid=user_uuid,
                 user_name=user_name,
+                personality_notes='',
+                favorite_topics='',
                 interaction_count=1,
                 created_at=new_user.created_at,
                 last_interaction=new_user.last_interaction
             )
         
         return user_data
+        
     except Exception as e:
         logger.error(f"ユーザーデータの取得/作成エラー: {e}")
         session.rollback()
-        return None
+        
+        # データベースエラーの場合、一時的なユーザーデータを作成
+        fallback_user_data = UserDataContainer(
+            user_uuid=user_uuid,
+            user_name=user_name,
+            personality_notes='',
+            favorite_topics='',
+            interaction_count=1,
+            created_at=datetime.utcnow(),
+            last_interaction=datetime.utcnow()
+        )
+        logger.warning(f"フォールバックユーザーデータを作成: {user_name}")
+        return fallback_user_data
+        
     finally:
         session.close()
 
