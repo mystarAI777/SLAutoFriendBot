@@ -15,8 +15,8 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Correct approach for VoicevoxClientSharp 1.0.0
-builder.Services.AddScoped<VoicevoxApiClient>(_ => VoicevoxApiClient.Create("http://127.0.0.1:50021"));
+// Try using VoicevoxSynthesizer (available in VoicevoxClientSharp 1.0.0)
+builder.Services.AddScoped<VoicevoxSynthesizer>(_ => new VoicevoxSynthesizer());
 
 var app = builder.Build();
 
@@ -32,8 +32,8 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// Use VoicevoxApiClient (the actual class from VoicevoxClientSharp 1.0.0)
-app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClient, [FromBody] InteractRequest req) =>
+// Use VoicevoxSynthesizer (the high-level API from VoicevoxClientSharp 1.0.0)
+app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer voicevoxSynthesizer, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
@@ -81,9 +81,9 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClien
     }
     try
     {
-        // Correct API calls for VoicevoxClientSharp 1.0.0
-        var audioQuery = await voicevoxClient.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevoxClient.SynthesisAsync(speakerId, audioQuery);
+        // Using VoicevoxSynthesizer API (simpler, high-level API)
+        var synthesisResult = await voicevoxSynthesizer.SynthesizeSpeechAsync(speakerId, responseMessage);
+        var wavData = synthesisResult.Wav;
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
