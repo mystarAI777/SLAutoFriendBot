@@ -32,8 +32,7 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 // --- 定数 ---
 const int FRIENDSHIP_THRESHOLD = 5; // ★お友達になるために必要なチャット回数
 
-// --- リクエストのデータ形式 ---
-public record InteractRequest(Guid UserId, string UserName, string Message);
+
 
 // --- メインエンドポイント ---
 app.MapPost("/interact", async (AppDbContext db, Voicevox.Voicevox voicevox, [FromBody] InteractRequest req) =>
@@ -127,3 +126,6 @@ app.MapPost("/interact", async (AppDbContext db, Voicevox.Voicevox voicevox, [Fr
 });
 
 app.Run();
+
+// --- リクエストのデータ形式 ---
+public record InteractRequest(Guid UserId, string UserName, string Message);
