@@ -1,8 +1,8 @@
-// 最終修正版 Program.cs
+// 【決定版】Program.cs
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // ★正しい住所(using)
+using VoicevoxClientSharp; // ★正しい住所
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,7 +15,7 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// ★正しいクラス名で登録
+// ★正しいクラス名
 builder.Services.AddScoped<Voicevox>(_ => new Voicevox("127.0.0.1", 50021));
 
 var app = builder.Build();
@@ -32,7 +32,7 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// ★正しいクラス名で受け取る
+// ★正しいクラス名
 app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
@@ -53,20 +53,11 @@ app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] I
                     await db.SaveChangesAsync();
                     responseMessage = $"承知いたしました。私の声をご指定のID:{user.VoicevoxSpeakerId}番に変更しますね。";
                 }
-                else
-                {
-                    responseMessage = "IDは数字で指定してください。";
-                }
+                else { responseMessage = "IDは数字で指定してください。"; }
             }
-            else
-            {
-                responseMessage = "申し訳ありません、そのコマンドは分かりかねます。「@config voice <ID>」の形式で試してください。";
-            }
+            else { responseMessage = "申し訳ありません、そのコマンドは分かりかねます。「@config voice <ID>」の形式で試してください。"; }
         }
-        else
-        {
-            responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！";
-        }
+        else { responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！"; }
     }
     else
     {
@@ -76,12 +67,8 @@ app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] I
             chatLog = new ChatLog { UserId = req.UserId, UserName = req.UserName };
             db.ChatLogs.Add(chatLog);
         }
-        else
-        {
-            chatLog.InteractionCount++;
-        }
+        else { chatLog.InteractionCount++; }
         await db.SaveChangesAsync();
-
         if (chatLog.InteractionCount >= FRIENDSHIP_THRESHOLD)
         {
             var newUser = new User { UserId = req.UserId, UserName = req.UserName };
@@ -90,10 +77,7 @@ app.MapPost("/interact", async (AppDbContext db, Voicevox voicevox, [FromBody] I
             await db.SaveChangesAsync();
             responseMessage = $"いつもお話ししに来てくださり、ありがとうございます、{req.UserName}様！ とても嬉しいです。今日からあなたの専属コンシェルジュとして、会話を記憶させていただきますね！";
         }
-        else
-        {
-            responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。";
-        }
+        else { responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。"; }
     }
     try
     {
