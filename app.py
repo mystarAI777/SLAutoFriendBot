@@ -28,9 +28,30 @@ except FileNotFoundError:
 
 # --- ▼▼▼ 【最重要修正箇所】GroqのAPIキーを読み込む ▼▼▼ ---
 raw_groq_key = os.environ.get('GROQ_API_KEY')
+
+# =======================================================
+# ▼▼▼【ここからが追加したデバッグコードです】▼▼▼
+if raw_groq_key:
+    # 取得したキーの長さと、先頭・末尾の数文字をログに出力してみる
+    logger.info("環境変数からGROQ_API_KEYを読み込みました。")
+    logger.info(f"キーの長さ: {len(raw_groq_key)}")
+    logger.info(f"キーの先頭: '{raw_groq_key[:5]}'") # シングルクォートで囲む
+    logger.info(f"キーの末尾: '{raw_groq_key[-4:]}'") # シングルクォートで囲む
+    
+    # .strip()の効果を確認する
+    stripped_key = raw_groq_key.strip()
+    if len(raw_groq_key) != len(stripped_key):
+        logger.warning("キーの前後に空白文字がありました！ .strip()で除去します。")
+        logger.info(f"除去後のキーの長さ: {len(stripped_key)}")
+
+else:
+    logger.error("環境変数'GROQ_API_KEY'が見つかりませんでした。")
+# ▲▲▲【デバッグコードはここまでです】▲▲▲
+# =======================================================
+
 if raw_groq_key:
     GROQ_API_KEY = raw_groq_key.strip()
-    logger.info(f"GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}...")  # 最初の10文字のみログ出力
+    logger.info(f"GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}...")
 else:
     GROQ_API_KEY = None
     logger.error("GROQ_API_KEY環境変数が見つかりません")
