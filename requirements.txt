@@ -1,9 +1,9 @@
-Flask==2.3.3
-Flask-CORS==4.0.0
-SQLAlchemy==2.0.21
-requests==2.31.0
-openai==1.52.0
-groq==0.4.2
-httpx==0.27.2
-psycopg2-binary==2.9.7
-pg8000==1.30.2
+flask
+flask-cors
+sqlalchemy
+groq
+openai
+gunicorn
+requests
+psycopg2-binary  # PostgreSQLを使う場合
+pg8000           # PostgreSQLの別ドライバー
