@@ -1,8 +1,8 @@
-// 【最終手術版】Program.cs
+// 【最終聖典コード】Program.cs
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp;
+using VoicevoxClientSharp; // ★★★ これが、全てを解決する魔法の一行 ★★★
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,7 +15,11 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-builder.Services.AddSingleton<IVoicevox>(sp => Voicevox.Create("127.0.0.1", 50021).Result);
+// v1.0.0の正しい作法でVoicevoxインスタンスを生成
+builder.Services.AddSingleton<IVoicevox>(sp =>
+{
+    return Voicevox.Create("127.0.0.1", 50021).Result;
+});
 
 var app = builder.Build();
 
@@ -29,18 +33,15 @@ var audioDir = Path.Combine(app.Environment.ContentRootPath, "static/audio");
 if (!Directory.Exists(audioDir)) Directory.CreateDirectory(audioDir);
 app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(Path.Combine(app.Environment.ContentRootPath, "static")) });
 
-// --- ★★★【健康診断】用の窓口を追加 ★★★ ---
+// 「健康診断」用の窓口
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
-
 
 app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
-    // ★★★【スリム化】音声は「もちこさん(ID:9)」に固定 ★★★
-    const int speakerId = 9; 
+    const int speakerId = 9; // もちこさん固定
 
-    // (ユーザー登録などのロジックは変更なし)
     var user = await db.Users.FindAsync(req.UserId);
     if (user != null)
     {
@@ -58,7 +59,7 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
         else { chatLog.InteractionCount++; }
         await db.SaveChangesAsync();
 
-        if (chatLog.InteractionCount >= 5) // FRIENDSHIP_THRESHOLD
+        if (chatLog.InteractionCount >= 5)
         {
             var newUser = new User { UserId = req.UserId, UserName = req.UserName };
             db.Users.Add(newUser);
