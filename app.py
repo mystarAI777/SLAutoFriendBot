@@ -61,6 +61,19 @@ try:
     )
     use_openai_compatible = False
     logger.info("Groq native クライアントの初期設定が完了しました。")
+    
+    # APIキーの簡単な検証
+    try:
+        test_response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": "test"}],
+            model="llama3-8b-8192",
+            max_tokens=5
+        )
+        logger.info("Groq APIキーの検証が成功しました。")
+    except Exception as auth_error:
+        logger.error(f"Groq APIキーの検証に失敗: {auth_error}")
+        raise auth_error
+        
 except Exception as groq_error:
     logger.warning(f"Groq nativeクライアントでエラー: {groq_error}")
     try:
@@ -71,9 +84,24 @@ except Exception as groq_error:
         )
         use_openai_compatible = True
         logger.info("Groq OpenAI互換クライアントの初期設定が完了しました。")
+        
+        # APIキーの検証
+        try:
+            test_response = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}],
+                model="llama3-8b-8192",
+                max_tokens=5
+            )
+            logger.info("Groq OpenAI互換APIキーの検証が成功しました。")
+        except Exception as auth_error:
+            logger.error(f"Groq OpenAI互換APIキーの検証に失敗: {auth_error}")
+            raise auth_error
+            
     except Exception as openai_error:
         logger.error(f"OpenAI互換クライアントでもエラー: {openai_error}")
-        sys.exit(1)
+        logger.error("APIキーを確認してください。フォールバックモードで起動します。")
+        groq_client = None
+        use_openai_compatible = False
 # --- ▲▲▲ ---
 
 Base = declarative_base()
@@ -251,6 +279,10 @@ def get_or_create_user(user_uuid, user_name):
 def generate_ai_response(user_data, message=""):
     """Groq AI (Llama 3)を使って応答を生成"""
     
+    # Groqクライアントが利用できない場合のフォールバック
+    if groq_client is None:
+        return f"こんにちは、{user_data.user_name}さん！現在システムメンテナンス中ですが、お話しできて嬉しいです。"
+    
     # AIに渡す「役割設定」と「過去の状況」
     system_prompt = ""
     if user_data.interaction_count == 1:
@@ -325,7 +357,12 @@ def generate_ai_response(user_data, message=""):
         logger.error(f"AI応答生成エラー: {e}")
         logger.error(f"エラータイプ: {type(e).__name__}")
         logger.error(f"エラー詳細: {str(e)}")
-        return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
+        
+        # エラータイプに応じたフォールバック応答
+        if "401" in str(e) or "Invalid API Key" in str(e):
+            return f"{user_data.user_name}さん、こんにちは！今ちょっとシステムの調子が悪いみたい。でもお話しできて嬉しいよ！"
+        else:
+            return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 def generate_voice(text, speaker_id=1):
