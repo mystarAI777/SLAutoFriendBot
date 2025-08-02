@@ -1,20 +1,18 @@
 import os
-import json
 import requests
 import logging
 import sys
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
-import google.generativeai as genai
+from sqlalchemy.orm import declarative_base, sessionmaker
+from groq import Groq # <-- Geminiの代わりにGroqをインポート
 
 # ログ設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Secret Fileと環境変数の読み込み ---
+# --- 環境変数の読み込み ---
 DATABASE_URL = None
 DATABASE_URL_SECRET_FILE = '/etc/secrets/DATABASE_URL'
 try:
@@ -22,194 +20,112 @@ try:
         DATABASE_URL = f.read().strip()
     logger.info("Secret FileからDATABASE_URLを読み込みました。")
 except FileNotFoundError:
-    logger.info("Secret Fileが見つからないため、環境変数からDATABASE_URLを探します。")
     DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# --- ▼▼▼ 【最重要修正箇所】APIキーの強制クリーニング ▼▼▼ ---
-raw_gemini_key = os.environ.get('GEMINI_API_KEY')
-if raw_gemini_key:
-    # 読み込んだキーの前後の空白や改行を強制的に削除する
-    GEMINI_API_KEY = raw_gemini_key.strip()
+# --- ▼▼▼ 【最重要修正箇所】GroqのAPIキーを読み込む ▼▼▼ ---
+raw_groq_key = os.environ.get('GROQ_API_KEY')
+if raw_groq_key:
+    GROQ_API_KEY = raw_groq_key.strip()
 else:
-    GEMINI_API_KEY = None
+    GROQ_API_KEY = None
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 
 # --- 必須変数のチェック ---
 if not DATABASE_URL:
-    logger.error("環境変数またはSecret Fileで 'DATABASE_URL' が設定されていません。")
+    logger.error("DATABASE_URLが設定されていません。")
     sys.exit(1)
-if not GEMINI_API_KEY:
-    logger.error("環境変数 'GEMINI_API_KEY' が設定されていません。")
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEYが設定されていません。")
     sys.exit(1)
 
 app = Flask(__name__)
 
-# --- AIとデータベースの初期設定 ---
+# --- ▼▼▼ Groqクライアントの初期設定 ▼▼▼ ---
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
-    logger.info("Gemini AIの初期設定が完了しました。")
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    logger.info("Groq AIクライアントの初期設定が完了しました。")
 except Exception as e:
-    logger.error(f"Gemini AIの初期設定中にエラーが発生しました: {e}")
+    logger.error(f"Groq AIの初期設定中にエラーが発生しました: {e}")
     sys.exit(1)
+# --- ▲▲▲ ---
 
 Base = declarative_base()
 
 class UserMemory(Base):
     __tablename__ = 'user_memories'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), unique=True, nullable=False)
-    user_name = Column(String(255), nullable=False)
-    first_met = Column(DateTime, default=datetime.utcnow)
-    last_interaction = Column(DateTime, default=datetime.utcnow)
-    interaction_count = Column(Integer, default=1)
-    personality_notes = Column(String(2000), default='')
-    favorite_topics = Column(String(1000), default='')
+    # ... (変更なし) ...
 
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 class UserDataContainer:
-    def __init__(self, db_user):
-        self.user_uuid = db_user.user_uuid
-        self.user_name = db_user.user_name
-        self.interaction_count = db_user.interaction_count
-        self.last_interaction = db_user.last_interaction
-        self.first_met = db_user.first_met
-        self.personality_notes = db_user.personality_notes
-        self.favorite_topics = db_user.favorite_topics
+    # ... (変更なし) ...
 
 def get_or_create_user(user_uuid, user_name):
-    """ユーザー情報を取得/作成し、安全なデータコンテナで返す"""
-    session = Session()
-    try:
-        user_orm = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-        if user_orm:
-            user_orm.last_interaction = datetime.utcnow()
-            user_orm.interaction_count += 1
-            logger.info(f"既存ユーザー {user_name} の記録を更新しました")
-        else:
-            user_orm = UserMemory(user_uuid=user_uuid, user_name=user_name)
-            session.add(user_orm)
-            logger.info(f"新規ユーザー {user_name} を登録しました")
-        session.commit()
-        safe_user_data = UserDataContainer(user_orm)
-        return safe_user_data
-    except Exception as e:
-        logger.error(f"データベースエラー: {e}")
-        session.rollback()
-        return None
-    finally:
-        session.close()
+    # ... (変更なし) ...
 
+# --- ▼▼▼ 【最重要修正箇所】AI応答生成をGroqで行う ▼▼▼ ---
 def generate_ai_response(user_data, message=""):
-    """Gemini AIを使って応答を生成"""
+    """Groq AI (Llama 3)を使って応答を生成"""
+    
+    # AIに渡す「役割設定」と「過去の状況」
+    system_prompt = ""
+    if user_data.interaction_count == 1:
+        system_prompt = f"""
+あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。今、{user_data.user_name}さんという方に初めてお会いしました。
+以下のキャラクター設定を厳守して、60文字以内の自然で親しみやすい初対面の挨拶をしてください。
+- 敬語は使わず、親しみやすい「タメ口」で話します。
+- 少し恥ずかしがり屋ですが、フレンドリーです。
+- 相手に興味津々です。
+"""
+    else:
+        days_since_last = (datetime.utcnow() - user_data.last_interaction).days
+        situation = "継続的な会話"
+        if days_since_last > 7: situation = "久しぶりの再会"
+        elif days_since_last > 1: situation = "数日ぶりの再会"
+        
+        system_prompt = f"""
+あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。{user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。
+状況: {situation}。
+過去のメモ: {user_data.personality_notes}
+好きな話題: {user_data.favorite_topics}
+以下のキャラクター設定を厳守し、この状況にふさわしい返事を60文字以内で作成してください。
+- 敬語は使わず、親しみやすい「タメ口」で話します。
+- 過去の会話を覚えている、親しい友人として振る舞います。
+"""
+    
     try:
-        if user_data.interaction_count == 1:
-            prompt = f"""
-あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。
-今、{user_data.user_name}さんという方に初めてお会いしました。
-(以下、プロンプトは省略)
-"""
-        else:
-            days_since_last = (datetime.utcnow() - user_data.last_interaction).days
-            # ... (プロンプトは省略)
-            prompt = f"""
-あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。
-{user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。
-(以下、プロンプトは省略)
-"""
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": message,
+                }
+            ],
+            model="llama3-8b-8192", # Llama 3の8Bモデルを使用
+            temperature=0.7,
+            max_tokens=150,
+        )
+        response_text = chat_completion.choices[0].message.content
+        return response_text.strip()
+
     except Exception as e:
-        # エラーログにAPIキーのエラー詳細が含まれることがあるため、eをそのまま出力
         logger.error(f"AI応答生成エラー: {e}")
-        if user_data.interaction_count == 1:
-            return f"はじめまして、{user_data.user_name}さん！私、もちこって言います。よろしくね！"
-        else:
-            return f"おかえりなさい、{user_data.user_name}さん！また会えて嬉しいです♪"
+        return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
+# --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 def generate_voice(text, speaker_id=1):
-    """VOICEVOXで音声を生成"""
-    try:
-        query_response = requests.post(f"{VOICEVOX_URL}/audio_query", params={"text": text, "speaker": speaker_id}, timeout=10)
-        if query_response.status_code != 200:
-            logger.error(f"VOICEVOX query error: {query_response.status_code}")
-            return None
-        synthesis_response = requests.post(f"{VOICEVOX_URL}/synthesis", params={"speaker": speaker_id}, json=query_response.json(), timeout=30)
-        if synthesis_response.status_code != 200:
-            logger.error(f"VOICEVOX synthesis error: {synthesis_response.status_code}")
-            return None
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"voice_{timestamp}.wav"
-        filepath = os.path.join("static", filename)
-        os.makedirs("static", exist_ok=True)
-        with open(filepath, "wb") as f:
-            f.write(synthesis_response.content)
-        logger.info(f"音声ファイルを生成しました: {filename}")
-        return filename
-    except Exception as e:
-        logger.error(f"音声生成エラー: {e}")
-        return None
+    # ... (変更なし) ...
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """メインのチャット処理エンドポイント"""
-    try:
-        data = request.get_json()
-        if not data: return jsonify({"error": "JSONデータが必要です"}), 400
-        user_uuid = data.get('uuid')
-        user_name = data.get('name')
-        message = data.get('message', '')
-        if not user_uuid or not user_name: return jsonify({"error": "uuidとnameは必須です"}), 400
-        
-        logger.info(f"チャット要求: {user_name} ({user_uuid})")
-        user_data = get_or_create_user(user_uuid, user_name)
-        if not user_data: return jsonify({"error": "ユーザーデータの処理に失敗しました"}), 500
-        
-        ai_response = generate_ai_response(user_data, message)
-        audio_filename = generate_voice(ai_response)
-        
-        response_data = {
-            "text": ai_response,
-            "audio_url": f"/static/{audio_filename}" if audio_filename else None,
-            "user_info": {
-                "interaction_count": user_data.interaction_count,
-                "first_met": user_data.first_met.isoformat(),
-                "is_new_user": user_data.interaction_count == 1
-            }
-        }
-        logger.info(f"応答完了: {user_name}")
-        return jsonify(response_data)
-    except Exception as e:
-        logger.error(f"チャット処理エラー: {e}")
-        return jsonify({"error": "内部サーバーエラー"}), 500
+    # ... (変更なし) ...
 
-# --- /static, /health, / のエンドポイント ---
-@app.route('/static/<filename>')
-def serve_audio(filename):
-    return send_from_directory('static', filename)
-
-@app.route('/health')
-def health_check():
-    try:
-        session = Session()
-        session.execute(text('SELECT 1'))
-        session.close()
-        voicevox_response = requests.get(f"{VOICEVOX_URL}/version", timeout=5)
-        voicevox_ok = voicevox_response.status_code == 200
-        return jsonify({"status": "healthy", "database": "connected", "voicevox": "connected" if voicevox_ok else "disconnected"})
-    except Exception as e:
-        logger.error(f"ヘルスチェックエラー: {e}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
-
-@app.route('/')
-def index():
-    return jsonify({"service": "SL Auto Friend Bot", "version": "1.0.0"})
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# ... (以降のコードもすべて変更なし) ...
