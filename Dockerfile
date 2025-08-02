@@ -1,20 +1,18 @@
-# VOICEVOX ENGINEをベースイメージとして使用
-FROM voicevox/voicevox_engine:latest
+# Python公式の軽量イメージをベースにする
+# バージョンはご自身のプロジェクトに合わせてください（例: 3.10, 3.11など）
+FROM python:3.10-slim
 
 # 作業ディレクトリを設定
 WORKDIR /app
 
-# ビルド時に必要なツールをインストール
-# これにより、psycopg2-binaryのビルドエラーを防ぐ
-RUN apt-get update && apt-get install -y build-essential libpq-dev && rm -rf /var/lib/apt/lists/*
-
-# 必要なPythonライブラリをインストール
+# requirements.txtを先にコピーしてライブラリをインストールする
+# （これにより、コードを変更しただけの再ビルドが高速になる）
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Python公式イメージでは `pip3` ではなく `pip` を使うのが一般的
+RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリケーションのコードをコピー
-COPY app.py .
-COPY static /app/static
+# アプリケーションのコードをすべてコピー
+COPY . .
 
-# アプリケーションとVOICEVOX ENGINEを省エネモードで起動
-CMD ["/bin/bash", "-c", "/usr/local/bin/python3 run.py --host 127.0.0.1 --num_threads 1 & gunicorn --bind 0.0.0.0:10000 --workers 1 app:app"]
+# アプリケーションの実行コマンド（例）
+CMD ["python", "app.py"]
