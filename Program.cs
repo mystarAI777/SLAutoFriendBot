@@ -1,8 +1,8 @@
-// 【最終聖典コード】Program.cs
+// 【修正版】Program.cs - 最新のVoicevoxClientSharp APIに対応
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // ★★★ これが、全てを解決する魔法の一行 ★★★
+using VoicevoxClientSharp; // VoicevoxClientSharp NuGetパッケージが必要
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,10 +15,11 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// v1.0.0の正しい作法でVoicevoxインスタンスを生成
-builder.Services.AddSingleton<IVoicevox>(sp =>
+// 最新のVoicevoxClientSharpに対応した実装
+builder.Services.AddSingleton<VoicevoxSynthesizer>(sp =>
 {
-    return Voicevox.Create("127.0.0.1", 50021).Result;
+    // デフォルトでhttp://localhost:50021に接続
+    return new VoicevoxSynthesizer();
 });
 
 var app = builder.Build();
@@ -31,12 +32,15 @@ using (var scope = app.Services.CreateScope())
 
 var audioDir = Path.Combine(app.Environment.ContentRootPath, "static/audio");
 if (!Directory.Exists(audioDir)) Directory.CreateDirectory(audioDir);
-app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(Path.Combine(app.Environment.ContentRootPath, "static")) });
+app.UseStaticFiles(new StaticFileOptions { 
+    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+        Path.Combine(app.Environment.ContentRootPath, "static")) 
+});
 
 // 「健康診断」用の窓口
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
-app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
+app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer synthesizer, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
@@ -45,8 +49,14 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
     var user = await db.Users.FindAsync(req.UserId);
     if (user != null)
     {
-        if (req.Message.StartsWith("@")) { responseMessage = "申し訳ありません、このバージョンではコマンドは使用できません。"; }
-        else { responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！"; }
+        if (req.Message.StartsWith("@")) 
+        { 
+            responseMessage = "申し訳ありません、このバージョンではコマンドは使用できません。"; 
+        }
+        else 
+        { 
+            responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！"; 
+        }
     }
     else
     {
@@ -56,7 +66,10 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
             chatLog = new ChatLog { UserId = req.UserId, UserName = req.UserName };
             db.ChatLogs.Add(chatLog);
         }
-        else { chatLog.InteractionCount++; }
+        else 
+        { 
+            chatLog.InteractionCount++; 
+        }
         await db.SaveChangesAsync();
 
         if (chatLog.InteractionCount >= 5)
@@ -67,20 +80,28 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
             await db.SaveChangesAsync();
             responseMessage = $"いつもありがとうございます、{req.UserName}様！今日からあなたの専属コンシェルジュになりますね。声はずっと、もちこが担当します。";
         }
-        else { responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。"; }
+        else 
+        { 
+            responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。"; 
+        }
     }
 
     try
     {
-        var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevox.SynthesisAsync(query);
+        // 最新のVoicevoxClientSharpのAPIを使用
+        var synthesisResult = await synthesizer.SynthesizeSpeechAsync(speakerId, responseMessage);
+        
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
-        await File.WriteAllBytesAsync(filepath, wavData);
+        await File.WriteAllBytesAsync(filepath, synthesisResult.Wav);
+        
         var baseUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL") ?? "http://localhost:5000";
         audioUrl = $"{baseUrl}/audio/{filename}";
     }
-    catch (Exception ex) { Console.WriteLine($"音声合成エラー: {ex.Message}"); }
+    catch (Exception ex) 
+    { 
+        Console.WriteLine($"音声合成エラー: {ex.Message}"); 
+    }
     
     return Results.Ok(new { message = responseMessage, audio_url = audioUrl });
 });
