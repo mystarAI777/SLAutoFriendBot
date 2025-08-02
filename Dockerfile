@@ -1,66 +1,68 @@
-# Python 3.11の公式イメージをベースとして使用
-FROM python:3.11-slim
+# ベースイメージ
+FROM ubuntu:22.04
 
-# 作業ディレクトリを設定
-WORKDIR /app
+# 環境変数の設定
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
-# システムパッケージの更新と必要なツールをインストール
+# システムの更新と必要なツールのインストール
 RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
     wget \
-    curl \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Pythonのエイリアスを設定 (pythonコマンドがpython3.10を指すように)
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# 作業ディレクトリの設定
+WORKDIR /app
+
 # VOICEVOXエンジンのダウンロードとセットアップ
-RUN wget -O voicevox.zip https://github.com/VOICEVOX/voicevox_engine/releases/download/0.14.4/voicevox_engine-linux-cpu-0.14.4.zip \
+# 安定版の最新バージョン (例: 0.14.11) を使用。
+# VOICEVOX GitHub Releasesページで最新の 'voicevox_engine-linux-cpu-*.zip' を確認してください。
+RUN wget -O voicevox.zip https://github.com/VOICEVOX/voicevox_engine/releases/download/0.14.11/voicevox_engine-linux-cpu-0.14.11.zip \
     && unzip voicevox.zip \
     && mv voicevox_engine /opt/voicevox_engine \
     && rm voicevox.zip
 
-# VOICEVOXの実行権限を設定
-RUN chmod +x /opt/voicevox_engine/run
+# VOICEVOX実行に必要なシステムライブラリのインストール
+# VOICEVOX公式のDockerイメージやドキュメントを参考にしています。
+RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libasound2 \
+    libglib2.0-0 \
+    libssl-dev \
+    libffi-dev \
+    libpq-dev \
+    build-essential \
+    pkg-config \
+    libusb-1.0-0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# VOICEVOXエンジンの実行スクリプトを作成
+# バックグラウンドで実行し、ログをリダイレクト
+RUN echo '#!/bin/bash\ncd /opt/voicevox_engine && ./run --host 0.0.0.0 --port 50021 > /var/log/voicevox_engine.log 2>&1' > /usr/local/bin/run_voicevox \
+    && chmod +x /usr/local/bin/run_voicevox
 
 # Pythonの依存関係をインストール
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリケーションファイルをコピー
-COPY app.py .
+# アプリケーションコードのコピー
+COPY . .
 
-# 静的ファイル用のディレクトリを作成
+# staticディレクトリが存在することを確認 (音声ファイル保存用)
 RUN mkdir -p static
 
-# ポートを公開（Renderが自動的に設定するPORTを使用）
-EXPOSE $PORT
+# ポートの公開 (Flaskアプリ: 5000, VOICEVOXエンジン: 50021)
+EXPOSE 5000
+EXPOSE 50021
 
-# 起動スクリプトを作成
-RUN echo '#!/bin/bash\n\
-# VOICEVOXエンジンをバックグラウンドで起動\n\
-echo "VOICEVOXエンジンを起動中..."\n\
-cd /opt/voicevox_engine\n\
-./run --host 0.0.0.0 --port 50021 --cpu_num_threads 2 &\n\
-\n\
-# VOICEVOXの起動を待機\n\
-echo "VOICEVOXの起動を待機中..."\n\
-for i in {1..30}; do\n\
-    if curl -s http://localhost:50021/version > /dev/null; then\n\
-        echo "VOICEVOX起動完了"\n\
-        break\n\
-    fi\n\
-    echo "待機中... ($i/30)"\n\
-    sleep 2\n\
-done\n\
-\n\
-# Flaskアプリケーションを起動\n\
-echo "Flaskアプリケーションを起動中..."\n\
-cd /app\n\
-exec gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app:app' > /app/start.sh
-
-# 起動スクリプトに実行権限を付与
-RUN chmod +x /app/start.sh
-
-# 環境変数の設定
-ENV VOICEVOX_URL=http://localhost:50021
-
-# アプリケーションの起動
-CMD ["/app/start.sh"]
+# アプリケーションの起動コマンド
+# VOICEVOXエンジンをバックグラウンドで起動し、その後Flaskアプリを起動
+CMD ["bash", "-c", "/usr/local/bin/run_voicevox & exec python app.py"]
