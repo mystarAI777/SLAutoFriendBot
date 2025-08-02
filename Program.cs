@@ -1,8 +1,8 @@
-// 【決定版】Program.cs - Updated for VoicevoxClientSharp 1.0.0
+// 【聖典コード】Program.cs
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // Updated import
+using VoicevoxClientSharp; // ★これが正しい辞書
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,8 +15,12 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Updated: Use VoicevoxApiClient instead of Voicevox
-builder.Services.AddScoped<VoicevoxApiClient>(_ => VoicevoxApiClient.Create("http://127.0.0.1:50021"));
+// ★★★これがv1.0.0の正しい作法★★★
+builder.Services.AddSingleton<IVoicevox>(sp =>
+{
+    // 非同期メソッドを同期的に待機してインスタンスを生成
+    return Voicevox.Create("127.0.0.1", 50021).Result;
+});
 
 var app = builder.Build();
 
@@ -32,8 +36,8 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// Updated: Use VoicevoxApiClient
-app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClient, [FromBody] InteractRequest req) =>
+// ★★★正しいインターフェースで受け取る★★★
+app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
@@ -81,9 +85,8 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClien
     }
     try
     {
-        // Updated: Use VoicevoxApiClient methods
-        var audioQuery = await voicevoxClient.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevoxClient.SynthesisAsync(speakerId, audioQuery);
+        var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
+        var wavData = await voicevox.SynthesisAsync(query); // ★正しいメソッド
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
