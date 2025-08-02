@@ -5,13 +5,12 @@ FROM ubuntu:22.04
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
-# システムの更新と、動的ダウンロードに必要なツールのインストール
+# システムの更新と必要なツールのインストール
+# 7zipを解凍するためにp7zip-fullを追加
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
     wget \
-    curl \
-    jq \
     p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,17 +23,14 @@ WORKDIR /app
 
 # --- ▼▼▼ ここからが修正箇所 ▼▼▼ ---
 
-# GitHub APIを使ってVOICEVOXエンジンの最新版URLを動的に取得し、ダウンロード・解凍する
-# /releases/latest の代わりに /releases を使い、結果の配列の先頭([0])を取得することでレートリミットを回避する
-RUN LATEST_URL=$(curl -sL https://api.github.com/repos/VOICEVOX/voicevox_engine/releases | jq -r '.[0].assets[] | select(.name | contains("linux-cpu")) | .browser_download_url') \
-    && echo "Downloading VOICEVOX from: $LATEST_URL" \
-    && wget -O voicevox_engine.7z "$LATEST_URL" \
-    && 7z x voicevox_engine.7z \
+# VOICEVOXエンジンのダウンロードとセットアップ
+# APIレートリミットを避けるため、最新の安定版(0.19.1)のURLを直接指定する
+RUN wget https://github.com/VOICEVOX/voicevox_engine/releases/download/0.19.1/voicevox_engine-linux-cpu-0.19.1.7z.001 -O voicevox.7z.001 \
+    && 7z x voicevox.7z.001 \
     && mv linux-cpu /opt/voicevox_engine \
-    && rm voicevox_engine.7z
+    && rm voicevox.7z.001
 
 # --- ▲▲▲ ここまでが修正箇所 ▲▲▲ ---
-
 
 # VOICEVOX実行に必要なシステムライブラリのインストール
 RUN apt-get update && apt-get install -y \
