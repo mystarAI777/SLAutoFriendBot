@@ -71,3 +71,23 @@ EXPOSE 50021
 
 # アプリケーションの起動コマンド
 CMD ["bash", "-c", "/usr/local/bin/run_voicevox & exec python app.py"]
+# ベースイメージを選択
+FROM python:3.11-slim
+
+# 作業ディレクトリを設定
+WORKDIR /app
+
+# requirements.txt をコンテナにコピー
+COPY requirements.txt .
+
+# 必要なライブラリをインストール
+RUN pip install --no-cache-dir -r requirements.txt
+
+# アプリケーションコードをコピー
+COPY . .
+
+# ポートを指定
+EXPOSE 5000
+
+# アプリケーションを実行するコマンド
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
