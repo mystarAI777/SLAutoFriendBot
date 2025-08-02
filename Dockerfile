@@ -1,16 +1,36 @@
-# ステージ1: .NET SDKを使ってアプリケーションをビルド
+# .NET 8.0 SDK を使用してビルド
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
-COPY *.csproj .
-RUN dotnet restore
-COPY . .
-RUN dotnet publish -c Release -o /app/publish
 
-# ステージ2: VOICEVOX ENGINEイメージをベースに、ビルドしたアプリを配置
-FROM voicevox/voicevox_engine:latest
+# プロジェクトファイルをコピーして依存関係を復元
+COPY *.csproj ./
+RUN dotnet restore
+
+# ソースコードをコピーしてビルド
+COPY . ./
+RUN dotnet publish -c Release -o /app/publish --no-restore
+
+# .NET 8.0 ランタイムを使用して実行
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
+
+# 必要なパッケージをインストール (curl等)
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ビルド成果物をコピー
 COPY --from=build /app/publish .
 
-# ★★★【省エネ起動】★★★
-# CMD命令を、省エネオプション付きで、より安定したものに変更
-CMD ["/bin/bash", "-c", "/usr/local/bin/python3 run.py --host 127.0.0.1 --num_threads 1 & ./SLAutoFriendBot --urls http://0.0.0.0:8080"]
+# 静的ファイル用ディレクトリを作成
+RUN mkdir -p /app/static/audio
+
+# ポート5000を公開
+EXPOSE 5000
+
+# 環境変数を設定
+ENV ASPNETCORE_URLS=http://+:5000
+ENV ASPNETCORE_ENVIRONMENT=Production
+
+# アプリケーションを起動
+ENTRYPOINT ["dotnet", "SLAutoFriendBot.dll"]
