@@ -1,4 +1,4 @@
-// 【決定版】Program.cs - Updated for VoicevoxClientSharp 1.0.0
+// 【最終手術版】Program.cs
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
@@ -15,8 +15,7 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Try using VoicevoxSynthesizer (available in VoicevoxClientSharp 1.0.0)
-builder.Services.AddScoped<VoicevoxSynthesizer>(_ => new VoicevoxSynthesizer());
+builder.Services.AddSingleton<IVoicevox>(sp => Voicevox.Create("127.0.0.1", 50021).Result);
 
 var app = builder.Build();
 
@@ -30,33 +29,22 @@ var audioDir = Path.Combine(app.Environment.ContentRootPath, "static/audio");
 if (!Directory.Exists(audioDir)) Directory.CreateDirectory(audioDir);
 app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(Path.Combine(app.Environment.ContentRootPath, "static")) });
 
-const int FRIENDSHIP_THRESHOLD = 5;
+// --- ★★★【健康診断】用の窓口を追加 ★★★ ---
+app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
-// Use VoicevoxSynthesizer (the high-level API from VoicevoxClientSharp 1.0.0)
-app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer voicevoxSynthesizer, [FromBody] InteractRequest req) =>
+
+app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
-    int speakerId = 1;
+    // ★★★【スリム化】音声は「もちこさん(ID:9)」に固定 ★★★
+    const int speakerId = 9; 
+
+    // (ユーザー登録などのロジックは変更なし)
     var user = await db.Users.FindAsync(req.UserId);
     if (user != null)
     {
-        speakerId = user.VoicevoxSpeakerId;
-        if (req.Message.StartsWith("@"))
-        {
-            var parts = req.Message.Split(' ');
-            if (parts.Length > 2 && parts[0] == "@config" && parts[1] == "voice")
-            {
-                if(int.TryParse(parts[2], out int newId))
-                {
-                    user.VoicevoxSpeakerId = newId;
-                    await db.SaveChangesAsync();
-                    responseMessage = $"承知いたしました。私の声をご指定のID:{user.VoicevoxSpeakerId}番に変更しますね。";
-                }
-                else { responseMessage = "IDは数字で指定してください。"; }
-            }
-            else { responseMessage = "申し訳ありません、そのコマンドは分かりかねます。「@config voice <ID>」の形式で試してください。"; }
-        }
+        if (req.Message.StartsWith("@")) { responseMessage = "申し訳ありません、このバージョンではコマンドは使用できません。"; }
         else { responseMessage = $"（AIの応答）こんにちは、{user.UserName}様！"; }
     }
     else
@@ -69,21 +57,22 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer voicevoxSyn
         }
         else { chatLog.InteractionCount++; }
         await db.SaveChangesAsync();
-        if (chatLog.InteractionCount >= FRIENDSHIP_THRESHOLD)
+
+        if (chatLog.InteractionCount >= 5) // FRIENDSHIP_THRESHOLD
         {
             var newUser = new User { UserId = req.UserId, UserName = req.UserName };
             db.Users.Add(newUser);
             db.ChatLogs.Remove(chatLog);
             await db.SaveChangesAsync();
-            responseMessage = $"いつもお話ししに来てくださり、ありがとうございます、{req.UserName}様！ とても嬉しいです。今日からあなたの専属コンシェルジュとして、会話を記憶させていただきますね！";
+            responseMessage = $"いつもありがとうございます、{req.UserName}様！今日からあなたの専属コンシェルジュになりますね。声はずっと、もちこが担当します。";
         }
         else { responseMessage = $"（AIの応答）こんにちは、{req.UserName}さん。"; }
     }
+
     try
     {
-        // Using VoicevoxSynthesizer API (simpler, high-level API)
-        var synthesisResult = await voicevoxSynthesizer.SynthesizeSpeechAsync(speakerId, responseMessage);
-        var wavData = synthesisResult.Wav;
+        var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
+        var wavData = await voicevox.SynthesisAsync(query);
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
@@ -91,6 +80,7 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer voicevoxSyn
         audioUrl = $"{baseUrl}/audio/{filename}";
     }
     catch (Exception ex) { Console.WriteLine($"音声合成エラー: {ex.Message}"); }
+    
     return Results.Ok(new { message = responseMessage, audio_url = audioUrl });
 });
 
