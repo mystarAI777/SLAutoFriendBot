@@ -5,11 +5,7 @@ FROM ubuntu:22.04
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
-# --- ▼▼▼ ここからが修正箇所 ▼▼▼ ---
-
 # システムの更新と、動的ダウンロードに必要なツールのインストール
-# jq: JSONを扱うためのツール
-# p7zip-full: .7zファイルを解凍するためのツール
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
@@ -18,8 +14,6 @@ RUN apt-get update && apt-get install -y \
     jq \
     p7zip-full \
     && rm -rf /var/lib/apt/lists/*
-
-# --- ▲▲▲ ここまでが修正箇所 ▲▲▲ ---
 
 # Pythonのエイリアスを設定
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
@@ -31,11 +25,8 @@ WORKDIR /app
 # --- ▼▼▼ ここからが修正箇所 ▼▼▼ ---
 
 # GitHub APIを使ってVOICEVOXエンジンの最新版URLを動的に取得し、ダウンロード・解凍する
-# 1. curlでGitHub APIを叩き、最新リリースの情報をJSONで取得
-# 2. jqでJSONを解析し、"linux-cpu"を含むアセットのダウンロードURLを抽出
-# 3. 抽出したURLを使ってwgetでダウンロード
-# 4. 7zで解凍し、所定の場所に移動
-RUN LATEST_URL=$(curl -sL https://api.github.com/repos/VOICEVOX/voicevox_engine/releases/latest | jq -r '.assets[] | select(.name | contains("linux-cpu")) | .browser_download_url') \
+# /releases/latest の代わりに /releases を使い、結果の配列の先頭([0])を取得することでレートリミットを回避する
+RUN LATEST_URL=$(curl -sL https://api.github.com/repos/VOICEVOX/voicevox_engine/releases | jq -r '.[0].assets[] | select(.name | contains("linux-cpu")) | .browser_download_url') \
     && echo "Downloading VOICEVOX from: $LATEST_URL" \
     && wget -O voicevox_engine.7z "$LATEST_URL" \
     && 7z x voicevox_engine.7z \
