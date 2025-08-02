@@ -36,6 +36,7 @@ VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 if not DATABASE_URL:
     logger.error("DATABASE_URLが設定されていません。")
     sys.exit(1)
+
 if not GROQ_API_KEY:
     logger.error("GROQ_API_KEYが設定されていません。")
     sys.exit(1)
@@ -55,17 +56,78 @@ Base = declarative_base()
 
 class UserMemory(Base):
     __tablename__ = 'user_memories'
-    # ... (変更なし) ...
+    
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False)
+    user_name = Column(String(255), nullable=False)
+    personality_notes = Column(String(2000), default='')
+    favorite_topics = Column(String(2000), default='')
+    interaction_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_interaction = Column(DateTime, default=datetime.utcnow)
 
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 class UserDataContainer:
-    # ... (変更なし) ...
+    def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='', 
+                 interaction_count=0, created_at=None, last_interaction=None):
+        self.user_uuid = user_uuid
+        self.user_name = user_name
+        self.personality_notes = personality_notes
+        self.favorite_topics = favorite_topics
+        self.interaction_count = interaction_count
+        self.created_at = created_at or datetime.utcnow()
+        self.last_interaction = last_interaction or datetime.utcnow()
 
 def get_or_create_user(user_uuid, user_name):
-    # ... (変更なし) ...
+    session = Session()
+    try:
+        user_memory = session.query(UserMemory).filter(UserMemory.user_uuid == user_uuid).first()
+        
+        if user_memory:
+            # 既存ユーザーの場合、交流回数を増やして最終交流日時を更新
+            user_memory.interaction_count += 1
+            user_memory.last_interaction = datetime.utcnow()
+            session.commit()
+            
+            user_data = UserDataContainer(
+                user_uuid=user_memory.user_uuid,
+                user_name=user_memory.user_name,
+                personality_notes=user_memory.personality_notes,
+                favorite_topics=user_memory.favorite_topics,
+                interaction_count=user_memory.interaction_count,
+                created_at=user_memory.created_at,
+                last_interaction=user_memory.last_interaction
+            )
+        else:
+            # 新規ユーザーの場合
+            new_user = UserMemory(
+                user_uuid=user_uuid,
+                user_name=user_name,
+                interaction_count=1,
+                created_at=datetime.utcnow(),
+                last_interaction=datetime.utcnow()
+            )
+            session.add(new_user)
+            session.commit()
+            
+            user_data = UserDataContainer(
+                user_uuid=user_uuid,
+                user_name=user_name,
+                interaction_count=1,
+                created_at=new_user.created_at,
+                last_interaction=new_user.last_interaction
+            )
+        
+        return user_data
+    except Exception as e:
+        logger.error(f"ユーザーデータの取得/作成エラー: {e}")
+        session.rollback()
+        return None
+    finally:
+        session.close()
 
 # --- ▼▼▼ 【最重要修正箇所】AI応答生成をGroqで行う ▼▼▼ ---
 def generate_ai_response(user_data, message=""):
@@ -105,7 +167,7 @@ def generate_ai_response(user_data, message=""):
                     "content": system_prompt,
                 },
                 {
-                    "role": "user",
+                    "role": "user", 
                     "content": message,
                 }
             ],
@@ -115,17 +177,86 @@ def generate_ai_response(user_data, message=""):
         )
         response_text = chat_completion.choices[0].message.content
         return response_text.strip()
-
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 def generate_voice(text, speaker_id=1):
-    # ... (変更なし) ...
+    """VOICEVOX APIを使って音声を生成する"""
+    try:
+        # 音声クエリを作成
+        audio_query_response = requests.post(
+            f"{VOICEVOX_URL}/audio_query",
+            params={"text": text, "speaker": speaker_id}
+        )
+        audio_query_response.raise_for_status()
+        audio_query = audio_query_response.json()
+        
+        # 音声を合成
+        synthesis_response = requests.post(
+            f"{VOICEVOX_URL}/synthesis", 
+            headers={"Content-Type": "application/json"},
+            params={"speaker": speaker_id},
+            json=audio_query
+        )
+        synthesis_response.raise_for_status()
+        
+        return synthesis_response.content
+    except Exception as e:
+        logger.error(f"音声生成エラー: {e}")
+        return None
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # ... (変更なし) ...
+    try:
+        data = request.json
+        user_uuid = data.get('user_uuid')
+        user_name = data.get('user_name')
+        message = data.get('message', '')
+        
+        if not user_uuid or not user_name:
+            return jsonify({'error': 'user_uuid and user_name are required'}), 400
+        
+        # ユーザーデータの取得または作成
+        user_data = get_or_create_user(user_uuid, user_name)
+        if not user_data:
+            return jsonify({'error': 'Failed to get user data'}), 500
+        
+        # AI応答の生成
+        ai_response = generate_ai_response(user_data, message)
+        
+        # 音声生成
+        voice_data = generate_voice(ai_response)
+        
+        response_data = {
+            'response': ai_response,
+            'interaction_count': user_data.interaction_count,
+            'has_voice': voice_data is not None
+        }
+        
+        if voice_data:
+            # 音声データを一時的に保存（実際の実装では適切な場所に保存）
+            voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
+            voice_path = os.path.join('/tmp', voice_filename)
+            with open(voice_path, 'wb') as f:
+                f.write(voice_data)
+            response_data['voice_url'] = f'/voice/{voice_filename}'
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"チャットエラー: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
-# ... (以降のコードもすべて変更なし) ...
+@app.route('/voice/<filename>')
+def serve_voice(filename):
+    return send_from_directory('/tmp', filename)
+
+@app.route('/health')
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
