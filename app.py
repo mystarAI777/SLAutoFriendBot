@@ -24,7 +24,16 @@ try:
 except FileNotFoundError:
     logger.info("Secret Fileが見つからないため、環境変数からDATABASE_URLを探します。")
     DATABASE_URL = os.environ.get('DATABASE_URL')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# --- ▼▼▼ 【最重要修正箇所】APIキーの強制クリーニング ▼▼▼ ---
+raw_gemini_key = os.environ.get('GEMINI_API_KEY')
+if raw_gemini_key:
+    # 読み込んだキーの前後の空白や改行を強制的に削除する
+    GEMINI_API_KEY = raw_gemini_key.strip()
+else:
+    GEMINI_API_KEY = None
+# --- ▲▲▲ 修正はここまで ▲▲▲ ---
+
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 
 # --- 必須変数のチェック ---
@@ -38,8 +47,14 @@ if not GEMINI_API_KEY:
 app = Flask(__name__)
 
 # --- AIとデータベースの初期設定 ---
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-pro')
+    logger.info("Gemini AIの初期設定が完了しました。")
+except Exception as e:
+    logger.error(f"Gemini AIの初期設定中にエラーが発生しました: {e}")
+    sys.exit(1)
+
 Base = declarative_base()
 
 class UserMemory(Base):
@@ -57,11 +72,6 @@ engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-# =====================================================================
-# ▼▼▼ 【根本的な設計変更】ここからが今回の最重要修正箇所です ▼▼▼
-# =====================================================================
-
-# データベースオブジェクトから安全にデータを持ち運ぶための「お弁当箱」クラス
 class UserDataContainer:
     def __init__(self, db_user):
         self.user_uuid = db_user.user_uuid
@@ -85,46 +95,37 @@ def get_or_create_user(user_uuid, user_name):
             user_orm = UserMemory(user_uuid=user_uuid, user_name=user_name)
             session.add(user_orm)
             logger.info(f"新規ユーザー {user_name} を登録しました")
-        
         session.commit()
-        
-        # データベースオブジェクトから安全なコンテナに情報をコピーする
         safe_user_data = UserDataContainer(user_orm)
-        
-        return safe_user_data # ★★★「お弁当箱」を返す
-        
+        return safe_user_data
     except Exception as e:
         logger.error(f"データベースエラー: {e}")
         session.rollback()
         return None
     finally:
-        # ここでセッションを閉じても、データはコンテナ内にあるので安全
         session.close()
 
-# =====================================================================
-# ▲▲▲ 設計変更はここまでです ▲▲▲
-# =====================================================================
-
 def generate_ai_response(user_data, message=""):
-    """Gemini AIを使って応答を生成 (引数は安全なコンテナ)"""
+    """Gemini AIを使って応答を生成"""
     try:
         if user_data.interaction_count == 1:
             prompt = f"""
 あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。
 今、{user_data.user_name}さんという方に初めてお会いしました。
-(以下、プロンプトは変更なし)
+(以下、プロンプトは省略)
 """
         else:
             days_since_last = (datetime.utcnow() - user_data.last_interaction).days
-            # ... (以下、プロンプトは変更なし)
+            # ... (プロンプトは省略)
             prompt = f"""
 あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。
 {user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。
-(以下、プロンプトは変更なし)
+(以下、プロンプトは省略)
 """
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
+        # エラーログにAPIキーのエラー詳細が含まれることがあるため、eをそのまま出力
         logger.error(f"AI応答生成エラー: {e}")
         if user_data.interaction_count == 1:
             return f"はじめまして、{user_data.user_name}さん！私、もちこって言います。よろしくね！"
@@ -133,7 +134,6 @@ def generate_ai_response(user_data, message=""):
 
 def generate_voice(text, speaker_id=1):
     """VOICEVOXで音声を生成"""
-    # (この関数に変更はありません)
     try:
         query_response = requests.post(f"{VOICEVOX_URL}/audio_query", params={"text": text, "speaker": speaker_id}, timeout=10)
         if query_response.status_code != 200:
@@ -158,7 +158,6 @@ def generate_voice(text, speaker_id=1):
 @app.route('/chat', methods=['POST'])
 def chat():
     """メインのチャット処理エンドポイント"""
-    # (この関数に変更はありません)
     try:
         data = request.get_json()
         if not data: return jsonify({"error": "JSONデータが必要です"}), 400
@@ -189,7 +188,7 @@ def chat():
         logger.error(f"チャット処理エラー: {e}")
         return jsonify({"error": "内部サーバーエラー"}), 500
 
-# --- /static, /health, / のエンドポイント (変更なし) ---
+# --- /static, /health, / のエンドポイント ---
 @app.route('/static/<filename>')
 def serve_audio(filename):
     return send_from_directory('static', filename)
