@@ -16,28 +16,43 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// もち子さん専用VoicevoxSynthesizerの設定
-builder.Services.AddSingleton<VoicevoxSynthesizer>(sp =>
+// もち子さん専用VoicevoxSynthesizerの設定（エラーハンドリング付き）
+builder.Services.AddSingleton<VoicevoxSynthesizer?>(sp =>
 {
-    // デフォルトでhttp://localhost:50021に接続（もち子さん専用）
-    var synthesizer = new VoicevoxSynthesizer();
-    
-    // もち子さん（スピーカーID: 9）を事前初期化（オプション）
-    // 初回の音声合成時間を短縮できます
-    Task.Run(async () =>
+    try
     {
-        try
+        // VOICEVOXエンジンの接続確認
+        var voicevoxUrl = Environment.GetEnvironmentVariable("VOICEVOX_URL") ?? "http://localhost:50021";
+        Console.WriteLine($"VOICEVOXエンジンへの接続を試行中: {voicevoxUrl}");
+        
+        // カスタムHttpClientでタイムアウトを短く設定
+        var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var apiClient = VoicevoxApiClient.Create(baseUri: voicevoxUrl, httpClient);
+        var synthesizer = new VoicevoxSynthesizer(apiClient);
+        
+        // 非同期で初期化を試行（失敗しても続行）
+        Task.Run(async () =>
         {
-            await synthesizer.InitializeStyleAsync(MochikoVoiceConfig.SPEAKER_ID); // もち子さんのスタイルを初期化
-            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイルを初期化しました");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイル初期化エラー: {ex.Message}");
-        }
-    });
-    
-    return synthesizer;
+            try
+            {
+                await synthesizer.InitializeStyleAsync(MochikoVoiceConfig.SPEAKER_ID);
+                Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイルを初期化しました");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんのスタイル初期化エラー: {ex.Message}");
+            }
+        });
+        
+        Console.WriteLine("VOICEVOXエンジンとの接続に成功しました");
+        return synthesizer;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"VOICEVOXエンジンとの接続に失敗しました: {ex.Message}");
+        Console.WriteLine("音声機能は無効になりますが、アプリケーションは継続します");
+        return null; // nullを返してアプリケーションを継続
+    }
 });
 
 var app = builder.Build();
@@ -103,30 +118,85 @@ app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer synthesizer
         }
     }
 
-    try
+app.MapPost("/interact", async (AppDbContext db, VoicevoxSynthesizer? synthesizer, [FromBody] InteractRequest req) =>
+{
+    string responseMessage;
+    string audioUrl = "";
+
+    var user = await db.Users.FindAsync(req.UserId);
+    if (user != null)
     {
-        // もち子さんの声で音声合成を実行
-        var synthesisResult = await synthesizer.SynthesizeSpeechAsync(
-            MochikoVoiceConfig.SPEAKER_ID, 
-            responseMessage,
-            speedScale: MochikoVoiceConfig.DefaultParameters.SpeedScale,
-            pitchScale: MochikoVoiceConfig.DefaultParameters.PitchScale,
-            intonationScale: MochikoVoiceConfig.DefaultParameters.IntonationScale,
-            volumeScale: MochikoVoiceConfig.DefaultParameters.VolumeScale
-        );
-        
-        var filename = $"{MochikoVoiceConfig.AUDIO_FILE_PREFIX}_{Guid.NewGuid()}.wav";
-        var filepath = Path.Combine(audioDir, filename);
-        await File.WriteAllBytesAsync(filepath, synthesisResult.Wav);
-        
-        var baseUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL") ?? "http://localhost:5000";
-        audioUrl = $"{baseUrl}/audio/{filename}";
-        
-        Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声を生成しました: {filename}");
+        if (req.Message.StartsWith("@")) 
+        { 
+            responseMessage = MochikoVoiceConfig.Messages.COMMAND_NOT_SUPPORTED;
+        }
+        else 
+        { 
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.GREETING_REGISTERED, user.UserName);
+        }
     }
-    catch (Exception ex) 
-    { 
-        Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声合成エラー: {ex.Message}"); 
+    else
+    {
+        var chatLog = await db.ChatLogs.FindAsync(req.UserId);
+        if (chatLog == null)
+        {
+            chatLog = new ChatLog { UserId = req.UserId, UserName = req.UserName };
+            db.ChatLogs.Add(chatLog);
+        }
+        else 
+        { 
+            chatLog.InteractionCount++; 
+        }
+        await db.SaveChangesAsync();
+
+        if (chatLog.InteractionCount >= 5)
+        {
+            var newUser = new User { UserId = req.UserId, UserName = req.UserName };
+            db.Users.Add(newUser);
+            db.ChatLogs.Remove(chatLog);
+            await db.SaveChangesAsync();
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.WELCOME_NEW_USER, req.UserName);
+        }
+        else 
+        { 
+            responseMessage = string.Format(MochikoVoiceConfig.Messages.GREETING_GUEST, req.UserName);
+        }
+    }
+
+    // VOICEVOXエンジンが利用可能な場合のみ音声合成を実行
+    if (synthesizer != null)
+    {
+        try
+        {
+            // もち子さんの声で音声合成を実行
+            var synthesisResult = await synthesizer.SynthesizeSpeechAsync(
+                MochikoVoiceConfig.SPEAKER_ID, 
+                responseMessage,
+                speedScale: MochikoVoiceConfig.DefaultParameters.SpeedScale,
+                pitchScale: MochikoVoiceConfig.DefaultParameters.PitchScale,
+                intonationScale: MochikoVoiceConfig.DefaultParameters.IntonationScale,
+                volumeScale: MochikoVoiceConfig.DefaultParameters.VolumeScale
+            );
+            
+            var filename = $"{MochikoVoiceConfig.AUDIO_FILE_PREFIX}_{Guid.NewGuid()}.wav";
+            var filepath = Path.Combine(audioDir, filename);
+            await File.WriteAllBytesAsync(filepath, synthesisResult.Wav);
+            
+            var baseUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL") ?? "http://localhost:5000";
+            audioUrl = $"{baseUrl}/audio/{filename}";
+            
+            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声を生成しました: {filename}");
+        }
+        catch (Exception ex) 
+        { 
+            Console.WriteLine($"{MochikoVoiceConfig.SPEAKER_NAME}さんの音声合成エラー: {ex.Message}"); 
+            audioUrl = ""; // エラー時は音声URLを空にする
+        }
+    }
+    else
+    {
+        Console.WriteLine("VOICEVOXエンジンが利用できないため、音声は生成されません");
+        audioUrl = ""; // VOICEVOXが利用できない場合
     }
     
     return Results.Ok(new { message = responseMessage, audio_url = audioUrl });
