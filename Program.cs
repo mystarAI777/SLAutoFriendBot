@@ -1,8 +1,8 @@
-// 【聖典コード】Program.cs
+// 【決定版】Program.cs - Updated for VoicevoxClientSharp 1.0.0
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SLVoicevoxServer.Data;
-using VoicevoxClientSharp; // ★これが正しい辞書
+using VoicevoxClientSharp;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,12 +15,8 @@ var connectionString = File.Exists(secretFilePath)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// ★★★これがv1.0.0の正しい作法★★★
-builder.Services.AddSingleton<IVoicevox>(sp =>
-{
-    // 非同期メソッドを同期的に待機してインスタンスを生成
-    return Voicevox.Create("127.0.0.1", 50021).Result;
-});
+// Correct approach for VoicevoxClientSharp 1.0.0
+builder.Services.AddScoped<VoicevoxApiClient>(_ => VoicevoxApiClient.Create("http://127.0.0.1:50021"));
 
 var app = builder.Build();
 
@@ -36,8 +32,8 @@ app.UseStaticFiles(new StaticFileOptions { FileProvider = new Microsoft.Extensio
 
 const int FRIENDSHIP_THRESHOLD = 5;
 
-// ★★★正しいインターフェースで受け取る★★★
-app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] InteractRequest req) =>
+// Use VoicevoxApiClient (the actual class from VoicevoxClientSharp 1.0.0)
+app.MapPost("/interact", async (AppDbContext db, VoicevoxApiClient voicevoxClient, [FromBody] InteractRequest req) =>
 {
     string responseMessage;
     string audioUrl = "";
@@ -85,8 +81,9 @@ app.MapPost("/interact", async (AppDbContext db, IVoicevox voicevox, [FromBody] 
     }
     try
     {
-        var query = await voicevox.CreateAudioQueryAsync(responseMessage, speakerId);
-        var wavData = await voicevox.SynthesisAsync(query); // ★正しいメソッド
+        // Correct API calls for VoicevoxClientSharp 1.0.0
+        var audioQuery = await voicevoxClient.CreateAudioQueryAsync(responseMessage, speakerId);
+        var wavData = await voicevoxClient.SynthesisAsync(speakerId, audioQuery);
         var filename = $"{Guid.NewGuid()}.wav";
         var filepath = Path.Combine(audioDir, filename);
         await File.WriteAllBytesAsync(filepath, wavData);
