@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: sl-auto-friend-bot
+    runtime: docker
+    plan: starter
+    region: oregon
+    branch: main
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: ASPNETCORE_URLS
+        value: http://+:5000
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+    healthCheckPath: /healthz
+    numInstances: 1
+    disk:
+      name: static-files
+      mountPath: /app/static
+      sizeGB: 1
