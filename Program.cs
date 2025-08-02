@@ -23,7 +23,7 @@ builder.Services.AddSingleton<VoicevoxSynthesizer?>(sp =>
     {
         var voicevoxUrl = Environment.GetEnvironmentVariable("VOICEVOX_URL") ?? "http://127.0.0.1:50021";
         var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) }; // タイムアウトを少し延長
-        var apiClient = VoicevoxApiClient.Create(baseUri: voicevoxUrl, httpClient);
+        var apiClient = Voicevox.Create(baseUri: voicevoxUrl, httpClient).Result;
         var synthesizer = new VoicevoxSynthesizer(apiClient);
         
         // バックグラウンドで初期化
