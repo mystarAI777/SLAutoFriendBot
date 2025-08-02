@@ -8,6 +8,8 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from groq import Groq # <-- Geminiの代わりにGroqをインポート
+# OpenAIクライアントも併用（バックアップ用）
+from openai import OpenAI
 
 # ログ設定
 logging.basicConfig(level=logging.INFO)
@@ -52,15 +54,25 @@ CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"],
 
 # --- ▼▼▼ Groqクライアントの初期設定 ▼▼▼ ---
 try:
-    # Groqクライアントの初期化（シンプルな方法）
+    # まずGroqクライアントを試す
     groq_client = Groq(
         api_key=GROQ_API_KEY
     )
-    logger.info("Groq AIクライアントの初期設定が完了しました。")
-except Exception as e:
-    logger.error(f"Groq AIの初期設定中にエラーが発生しました: {e}")
-    logger.error(f"詳細なエラー情報: {str(e)}")
-    sys.exit(1)
+    use_openai_compatible = False
+    logger.info("Groq native クライアントの初期設定が完了しました。")
+except Exception as groq_error:
+    logger.warning(f"Groq nativeクライアントでエラー: {groq_error}")
+    try:
+        # OpenAI互換クライアントを使用
+        groq_client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY
+        )
+        use_openai_compatible = True
+        logger.info("Groq OpenAI互換クライアントの初期設定が完了しました。")
+    except Exception as openai_error:
+        logger.error(f"OpenAI互換クライアントでもエラー: {openai_error}")
+        sys.exit(1)
 # --- ▲▲▲ ---
 
 Base = declarative_base()
@@ -174,21 +186,41 @@ def generate_ai_response(user_data, message=""):
         # Groq API呼び出しの詳細ログ
         logger.info(f"Groq API呼び出し開始 - User: {user_data.user_name}, Model: llama3-8b-8192")
         
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user", 
-                    "content": message or "こんにちは",  # 空メッセージ対策
-                }
-            ],
-            model="llama3-8b-8192", # Llama 3の8Bモデルを使用
-            temperature=0.7,
-            max_tokens=150,
-        )
+        # クライアントの種類に応じて適切なメソッドを使用
+        if use_openai_compatible:
+            # OpenAI互換クライアント使用
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user", 
+                        "content": message or "こんにちは",
+                    }
+                ],
+                model="llama3-8b-8192",
+                temperature=0.7,
+                max_tokens=150,
+            )
+        else:
+            # Groq nativeクライアント使用
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user", 
+                        "content": message or "こんにちは",
+                    }
+                ],
+                model="llama3-8b-8192",
+                temperature=0.7,
+                max_tokens=150,
+            )
         
         response_text = chat_completion.choices[0].message.content
         logger.info(f"Groq API呼び出し成功 - Response length: {len(response_text)}")
