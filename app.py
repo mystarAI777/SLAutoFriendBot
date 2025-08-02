@@ -2,10 +2,11 @@ import os
 import json
 import requests
 import logging
+import sys # <-- 追加
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base # <-- 変更
 from sqlalchemy.orm import sessionmaker
 import google.generativeai as genai
 
@@ -13,19 +14,34 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# --- ▼▼▼ ここからが修正箇所 ▼▼▼ ---
 
 # 環境変数から設定を取得
 DATABASE_URL = os.environ.get('DATABASE_URL')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 
+# 必須の環境変数が設定されているかチェック
+if not DATABASE_URL:
+    logger.error("環境変数 'DATABASE_URL' が設定されていません。")
+    sys.exit(1) # プログラムを終了
+
+if not GEMINI_API_KEY:
+    logger.error("環境変数 'GEMINI_API_KEY' が設定されていません。")
+    sys.exit(1) # プログラムを終了
+
+# --- ▲▲▲ ここまでが修正箇所 ▲▲▲ ---
+
+
+app = Flask(__name__)
+
+
 # Gemini AI設定
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
 # データベース設定
-Base = declarative_base()
+Base = declarative_base() # この行は変更なし（インポート元が変わっただけ）
 
 class UserMemory(Base):
     __tablename__ = 'user_memories'
@@ -40,6 +56,7 @@ class UserMemory(Base):
     favorite_topics = Column(String(1000), default='')
 
 # データベース接続
+# この時点でDATABASE_URLには有効な値が入っているはず
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
@@ -277,4 +294,4 @@ def index():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)```
