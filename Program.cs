@@ -7,9 +7,13 @@ using System.Text.Json;
 // --- 初期設定 ---
 var builder = WebApplication.CreateBuilder(args);
 
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString));
-builder.Services.AddScoped<Voicevox.Voicevox>(_ => new Voicevox.Voicevox("127.0.0.1", 50021));
+var secretFilePath = "/etc/secrets/connection_string"; // Renderの秘密のファイルパス
+var connectionString = File.Exists(secretFilePath)
+    ? File.ReadAllText(secretFilePath).Trim() // Render上ではファイルから読み込む
+    : builder.Configuration.GetConnectionString("DefaultConnection"); // ローカル開発用の予備設定
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
 
 var app = builder.Build();
 
