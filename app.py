@@ -27,8 +27,10 @@ except FileNotFoundError:
 raw_groq_key = os.environ.get('GROQ_API_KEY')
 if raw_groq_key:
     GROQ_API_KEY = raw_groq_key.strip()
+    logger.info(f"GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}...")  # 最初の10文字のみログ出力
 else:
     GROQ_API_KEY = None
+    logger.error("GROQ_API_KEY環境変数が見つかりません")
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
@@ -50,10 +52,14 @@ CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"],
 
 # --- ▼▼▼ Groqクライアントの初期設定 ▼▼▼ ---
 try:
-    groq_client = Groq(api_key=GROQ_API_KEY)
+    # Groqクライアントの初期化（シンプルな方法）
+    groq_client = Groq(
+        api_key=GROQ_API_KEY
+    )
     logger.info("Groq AIクライアントの初期設定が完了しました。")
 except Exception as e:
     logger.error(f"Groq AIの初期設定中にエラーが発生しました: {e}")
+    logger.error(f"詳細なエラー情報: {str(e)}")
     sys.exit(1)
 # --- ▲▲▲ ---
 
@@ -165,6 +171,9 @@ def generate_ai_response(user_data, message=""):
 """
     
     try:
+        # Groq API呼び出しの詳細ログ
+        logger.info(f"Groq API呼び出し開始 - User: {user_data.user_name}, Model: llama3-8b-8192")
+        
         chat_completion = groq_client.chat.completions.create(
             messages=[
                 {
@@ -173,17 +182,22 @@ def generate_ai_response(user_data, message=""):
                 },
                 {
                     "role": "user", 
-                    "content": message,
+                    "content": message or "こんにちは",  # 空メッセージ対策
                 }
             ],
             model="llama3-8b-8192", # Llama 3の8Bモデルを使用
             temperature=0.7,
             max_tokens=150,
         )
+        
         response_text = chat_completion.choices[0].message.content
+        logger.info(f"Groq API呼び出し成功 - Response length: {len(response_text)}")
         return response_text.strip()
+        
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
+        logger.error(f"エラータイプ: {type(e).__name__}")
+        logger.error(f"エラー詳細: {str(e)}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
