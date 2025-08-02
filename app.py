@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 from groq import Groq # <-- Geminiの代わりにGroqをインポート
 # OpenAIクライアントも併用（バックアップ用）
 from openai import OpenAI
@@ -91,14 +92,37 @@ class UserMemory(Base):
 
 # データベース接続とテーブル作成
 try:
+    # PostgreSQLドライバーの動的インポートを試行
+    try:
+        import psycopg2
+        logger.info("psycopg2 ドライバーを使用します。")
+    except ImportError:
+        try:
+            import pg8000
+            # pg8000を使用する場合、URLを調整
+            if DATABASE_URL.startswith('postgresql://'):
+                DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+pg8000://')
+            logger.info("pg8000 ドライバーを使用します。")
+        except ImportError:
+            logger.error("PostgreSQLドライバーが見つかりません。SQLiteにフォールバックします。")
+            DATABASE_URL = 'sqlite:///./app.db'
+    
     engine = create_engine(DATABASE_URL)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    logger.info("データベース接続とテーブル作成が完了しました。")
+    logger.info(f"データベース接続が完了しました。URL: {DATABASE_URL[:20]}...")
 except Exception as e:
     logger.error(f"データベース接続エラー: {e}")
-    logger.error("DATABASE_URLを確認してください。")
-    sys.exit(1)
+    logger.error("SQLiteにフォールバックします。")
+    try:
+        DATABASE_URL = 'sqlite:///./app.db'
+        engine = create_engine(DATABASE_URL)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        logger.info("SQLiteデータベースで起動しました。")
+    except Exception as sqlite_error:
+        logger.error(f"SQLiteでもエラーが発生しました: {sqlite_error}")
+        sys.exit(1)
 
 class UserDataContainer:
     def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='', 
