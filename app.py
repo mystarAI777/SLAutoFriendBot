@@ -14,34 +14,19 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 環境変数とSecret Fileから設定を取得
-
-# --- DATABASE_URLの読み込み (Secret Fileから) ---
-DATABASE_URL_SECRET_FILE = '/etc/secrets/DATABASE_URL'
-try:
-    with open(DATABASE_URL_SECRET_FILE, 'r') as f:
-        DATABASE_URL = f.read().strip()
-    logger.info("Secret FileからDATABASE_URLを読み込みました。")
-except FileNotFoundError:
-    logger.info("Secret Fileが見つからないため、環境変数からDATABASE_URLを試します。")
-    DATABASE_URL = os.environ.get('DATABASE_URL')
-
-# --- GEMINI_API_KEYの読み込み (環境変数から) ---
+# 環境変数から設定を取得
+DATABASE_URL = os.environ.get('DATABASE_URL')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 
 # 必須の環境変数が設定されているかチェック
 if not DATABASE_URL:
-    logger.error("環境変数またはSecret Fileで 'DATABASE_URL' が設定されていません。")
-    sys.exit(1) # プログラムを終了
+    logger.error("環境変数 'DATABASE_URL' が設定されていません。")
+    sys.exit(1)
 
 if not GEMINI_API_KEY:
     logger.error("環境変数 'GEMINI_API_KEY' が設定されていません。")
-    sys.exit(1) # プログラムを終了
-
-if not GEMINI_API_KEY:
-    logger.error("環境変数 'GEMINI_API_KEY' が設定されていません。")
-    sys.exit(1) # プログラムを終了
+    sys.exit(1)
 
 app = Flask(__name__)
 
@@ -72,29 +57,30 @@ Session = sessionmaker(bind=engine)
 def get_or_create_user(user_uuid, user_name):
     """ユーザー情報を取得または新規作成"""
     session = Session()
+    user = None # tryブロックの外でアクセスできるように初期化
     try:
         user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
         
         if user:
-            # 既存ユーザーの最終対話時間を更新
             user.last_interaction = datetime.utcnow()
             user.interaction_count += 1
             session.commit()
             logger.info(f"既存ユーザー {user_name} の記録を更新しました")
         else:
-            # 新規ユーザーを作成
             user = UserMemory(
                 user_uuid=user_uuid,
-                user_name=user_name,
-                first_met=datetime.utcnow(),
-                last_interaction=datetime.utcnow(),
-                interaction_count=1
+                user_name=user_name
             )
             session.add(user)
             session.commit()
             logger.info(f"新規ユーザー {user_name} を登録しました")
         
+        # ★★★ ここが最重要修正点 ★★★
+        # セッションが閉じる前に、オブジェクトをセッションから切り離す
+        # これにより、セッションがなくてもオブジェクトの情報を読み取れるようになる
+        session.expunge(user)
         return user
+        
     except Exception as e:
         logger.error(f"データベースエラー: {e}")
         session.rollback()
@@ -105,9 +91,7 @@ def get_or_create_user(user_uuid, user_name):
 def generate_ai_response(user_data, message=""):
     """Gemini AIを使って応答を生成"""
     try:
-        # ユーザーの状況に応じたプロンプトを作成
         if user_data.interaction_count == 1:
-            # 初回の場合
             prompt = f"""
 あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。
 今、{user_data.user_name}さんという方に初めてお会いしました。
@@ -122,7 +106,6 @@ def generate_ai_response(user_data, message=""):
 ユーザーからのメッセージ: {message}
 """
         else:
-            # 2回目以降の場合
             days_since_last = (datetime.utcnow() - user_data.last_interaction).days
             
             if days_since_last > 7:
@@ -156,7 +139,6 @@ def generate_ai_response(user_data, message=""):
         
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
-        # フォールバック応答
         if user_data.interaction_count == 1:
             return f"はじめまして、{user_data.user_name}さん！私、もちこって言います。よろしくね！"
         else:
@@ -165,35 +147,28 @@ def generate_ai_response(user_data, message=""):
 def generate_voice(text, speaker_id=1):
     """VOICEVOXで音声を生成"""
     try:
-        # 音声クエリを作成
         query_response = requests.post(
             f"{VOICEVOX_URL}/audio_query",
             params={"text": text, "speaker": speaker_id},
             timeout=10
         )
-        
         if query_response.status_code != 200:
             logger.error(f"VOICEVOX query error: {query_response.status_code}")
             return None
         
-        # 音声を合成
         synthesis_response = requests.post(
             f"{VOICEVOX_URL}/synthesis",
             params={"speaker": speaker_id},
             json=query_response.json(),
             timeout=30
         )
-        
         if synthesis_response.status_code != 200:
             logger.error(f"VOICEVOX synthesis error: {synthesis_response.status_code}")
             return None
         
-        # 音声ファイルを保存
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"voice_{timestamp}.wav"
         filepath = os.path.join("static", filename)
-        
-        # staticディレクトリが存在しない場合は作成
         os.makedirs("static", exist_ok=True)
         
         with open(filepath, "wb") as f:
@@ -211,7 +186,6 @@ def chat():
     """メインのチャット処理エンドポイント"""
     try:
         data = request.get_json()
-        
         if not data:
             return jsonify({"error": "JSONデータが必要です"}), 400
         
@@ -224,18 +198,14 @@ def chat():
         
         logger.info(f"チャット要求: {user_name} ({user_uuid})")
         
-        # ユーザー情報の取得・更新
         user_data = get_or_create_user(user_uuid, user_name)
         if not user_data:
             return jsonify({"error": "ユーザーデータの処理に失敗しました"}), 500
         
-        # AI応答の生成
         ai_response = generate_ai_response(user_data, message)
         
-        # 音声の生成
         audio_filename = generate_voice(ai_response)
         
-        # レスポンスの構築
         response_data = {
             "text": ai_response,
             "audio_url": f"/static/{audio_filename}" if audio_filename else None,
@@ -262,12 +232,10 @@ def serve_audio(filename):
 def health_check():
     """ヘルスチェック用エンドポイント"""
     try:
-        # データベース接続テスト
         session = Session()
         session.execute(text('SELECT 1'))
         session.close()
         
-        # VOICEVOX接続テスト
         voicevox_response = requests.get(f"{VOICEVOX_URL}/version", timeout=5)
         voicevox_ok = voicevox_response.status_code == 200
         
