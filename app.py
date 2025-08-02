@@ -89,9 +89,16 @@ class UserMemory(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_interaction = Column(DateTime, default=datetime.utcnow)
 
-engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(engine)
-Session = sessionmaker(bind=engine)
+# データベース接続とテーブル作成
+try:
+    engine = create_engine(DATABASE_URL)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    logger.info("データベース接続とテーブル作成が完了しました。")
+except Exception as e:
+    logger.error(f"データベース接続エラー: {e}")
+    logger.error("DATABASE_URLを確認してください。")
+    sys.exit(1)
 
 class UserDataContainer:
     def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='', 
