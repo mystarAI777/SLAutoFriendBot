@@ -4,6 +4,7 @@ import logging
 import sys
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from groq import Groq # <-- Geminiの代わりにGroqをインポート
@@ -42,6 +43,10 @@ if not GROQ_API_KEY:
     sys.exit(1)
 
 app = Flask(__name__)
+
+# CORS設定を追加
+CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"], 
+     allow_headers=["Content-Type", "Authorization"])
 
 # --- ▼▼▼ Groqクライアントの初期設定 ▼▼▼ ---
 try:
@@ -207,8 +212,16 @@ def generate_voice(text, speaker_id=1):
         logger.error(f"音声生成エラー: {e}")
         return None
 
-@app.route('/chat', methods=['POST'])
+@app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
+    # OPTIONSリクエスト（プリフライト）への対応
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+        return response
+    
     try:
         data = request.json
         user_uuid = data.get('user_uuid')
@@ -243,11 +256,15 @@ def chat():
                 f.write(voice_data)
             response_data['voice_url'] = f'/voice/{voice_filename}'
         
-        return jsonify(response_data)
+        response = jsonify(response_data)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
         
     except Exception as e:
         logger.error(f"チャットエラー: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+        response = jsonify({'error': 'Internal server error'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
 
 @app.route('/voice/<filename>')
 def serve_voice(filename):
