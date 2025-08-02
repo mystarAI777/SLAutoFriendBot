@@ -1,40 +1,66 @@
-# Python公式の軽量イメージをベースにする
-FROM python:3.10-slim
+# Python 3.11の公式イメージをベースとして使用
+FROM python:3.11-slim
 
-# 常に最新のpipを利用するようにアップグレードする
-RUN pip install --no-cache-dir --upgrade pip
-
-# 環境変数設定
-# - PYTHONUNBUFFERED: Pythonの出力がすぐにログに表示されるようにする
-# - PIP_NO_CACHE_DIR: キャッシュを使わずイメージサイズを削減
-# - PIP_DISABLE_PIP_VERSION_CHECK: pipのバージョンチェックを無効化しビルドを高速化
-# - PIP_DEFAULT_TIMEOUT: タイムアウト時間を延長
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=on \
-    PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_DEFAULT_TIMEOUT=100
-
-# ★ここからがユーザー作成のパート★
-# 1. アプリケーション用のディレクトリを作成
+# 作業ディレクトリを設定
 WORKDIR /app
 
-# 2. requirements.txtをコピーしてライブラリをインストール
-#    この時点ではまだrootユーザーでOK
+# システムパッケージの更新と必要なツールをインストール
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# VOICEVOXエンジンのダウンロードとセットアップ
+RUN wget -O voicevox.zip https://github.com/VOICEVOX/voicevox_engine/releases/download/0.14.4/voicevox_engine-linux-cpu-0.14.4.zip \
+    && unzip voicevox.zip \
+    && mv voicevox_engine /opt/voicevox_engine \
+    && rm voicevox.zip
+
+# VOICEVOXの実行権限を設定
+RUN chmod +x /opt/voicevox_engine/run
+
+# Pythonの依存関係をインストール
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. 'appuser'という名前で一般ユーザーを作成
-RUN useradd --create-home --shell /bin/bash appuser
+# アプリケーションファイルをコピー
+COPY app.py .
 
-# 4. アプリケーションのコードをコピー
-COPY . .
+# 静的ファイル用のディレクトリを作成
+RUN mkdir -p static
 
-# 5. ファイルの所有者を新しいユーザーに変更
-RUN chown -R appuser:appuser /app
+# ポートを公開（Renderが自動的に設定するPORTを使用）
+EXPOSE $PORT
 
-# 6. これ以降のコマンドを実行するユーザーを'appuser'に切り替え
-USER appuser
-# ★ここまで★
+# 起動スクリプトを作成
+RUN echo '#!/bin/bash\n\
+# VOICEVOXエンジンをバックグラウンドで起動\n\
+echo "VOICEVOXエンジンを起動中..."\n\
+cd /opt/voicevox_engine\n\
+./run --host 0.0.0.0 --port 50021 --cpu_num_threads 2 &\n\
+\n\
+# VOICEVOXの起動を待機\n\
+echo "VOICEVOXの起動を待機中..."\n\
+for i in {1..30}; do\n\
+    if curl -s http://localhost:50021/version > /dev/null; then\n\
+        echo "VOICEVOX起動完了"\n\
+        break\n\
+    fi\n\
+    echo "待機中... ($i/30)"\n\
+    sleep 2\n\
+done\n\
+\n\
+# Flaskアプリケーションを起動\n\
+echo "Flaskアプリケーションを起動中..."\n\
+cd /app\n\
+exec gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app:app' > /app/start.sh
 
-# アプリケーションの実行コマンド（例）
-CMD ["python", "app.py"]
+# 起動スクリプトに実行権限を付与
+RUN chmod +x /app/start.sh
+
+# 環境変数の設定
+ENV VOICEVOX_URL=http://localhost:50021
+
+# アプリケーションの起動
+CMD ["/app/start.sh"]
