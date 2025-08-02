@@ -14,14 +14,29 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 環境変数から設定を取得
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# 環境変数とSecret Fileから設定を取得
+
+# --- DATABASE_URLの読み込み (Secret Fileから) ---
+DATABASE_URL_SECRET_FILE = '/etc/secrets/DATABASE_URL'
+try:
+    with open(DATABASE_URL_SECRET_FILE, 'r') as f:
+        DATABASE_URL = f.read().strip()
+    logger.info("Secret FileからDATABASE_URLを読み込みました。")
+except FileNotFoundError:
+    logger.info("Secret Fileが見つからないため、環境変数からDATABASE_URLを試します。")
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# --- GEMINI_API_KEYの読み込み (環境変数から) ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 
 # 必須の環境変数が設定されているかチェック
 if not DATABASE_URL:
-    logger.error("環境変数 'DATABASE_URL' が設定されていません。")
+    logger.error("環境変数またはSecret Fileで 'DATABASE_URL' が設定されていません。")
+    sys.exit(1) # プログラムを終了
+
+if not GEMINI_API_KEY:
+    logger.error("環境変数 'GEMINI_API_KEY' が設定されていません。")
     sys.exit(1) # プログラムを終了
 
 if not GEMINI_API_KEY:
