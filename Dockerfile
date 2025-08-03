@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# VOICEVOXエンジン（Linux CPU版）をダウンロード
+# VOICEVOXエンジン（Linux CPU版）をダウンロード - 正しいURL使用
 WORKDIR /opt
-RUN wget -O voicevox-engine.zip https://github.com/VOICEVOX/voicevox_engine/releases/latest/download/linux-cpu.zip \
+RUN wget -O voicevox-engine.zip https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.1/linux-cpu.zip \
     && unzip voicevox-engine.zip \
     && rm voicevox-engine.zip \
     && mv linux-cpu voicevox-engine \
