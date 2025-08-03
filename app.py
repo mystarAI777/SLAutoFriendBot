@@ -3,7 +3,8 @@ import requests
 import logging
 import sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, safe_join
+# ▼▼▼【修正点1】safe_joinを削除 ▼▼▼
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -15,7 +16,7 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ▼▼▼ Secret Fileからの設定読み込み ▼▼▼ ---
+# --- Secret Fileからの設定読み込み ---
 
 # --- DATABASE_URL ---
 DATABASE_URL = None
@@ -40,7 +41,7 @@ except FileNotFoundError:
 except Exception as e:
     logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
 
-# --- 【修正箇所】VOICEVOX_URL ---
+# --- VOICEVOX_URL ---
 VOICEVOX_URL = 'http://localhost:50021' # デフォルト値を設定
 VOICEVOX_URL_SECRET_FILE = '/etc/secrets/VOICEVOX_URL'
 try:
@@ -52,8 +53,6 @@ except FileNotFoundError:
     VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
 except Exception as e:
     logger.error(f"VOICEVOX_URLの読み込み中に予期せぬエラー: {e}")
-
-# --- ▲▲▲ 設定読み込みはここまで ▲▲▲ ---
 
 
 # --- 必須変数のチェック ---
@@ -214,19 +213,23 @@ def chat_lsl():
         logger.error(f"LSLチャットエラー: {e}")
         return "Error: Internal server error", 500
 
+# ▼▼▼【修正点2】safe_join を使わない形に修正 ▼▼▼
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     directory = '/tmp'
+    # send_from_directoryはセキュリティ機能を含むため、これで安全
     try:
-        safe_path = safe_join(directory, filename)
-        if os.path.exists(safe_path):
+        filepath = os.path.join(directory, filename)
+        # ファイルの存在を確認してから送信する
+        if os.path.exists(filepath):
             return send_from_directory(directory, filename)
         else:
-            logger.error(f"音声ファイルが見つかりません: {safe_path}")
+            logger.error(f"音声ファイルが見つかりません: {filepath}")
             return "File not found", 404
     except Exception as e:
         logger.error(f"音声ファイル提供エラー: {e}")
         return "Server error", 500
+# ▲▲▲ 修正はここまで ▲▲▲
 
 @app.route('/health')
 def health_check():
