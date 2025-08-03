@@ -1,93 +1,68 @@
-# ベースイメージ
-FROM ubuntu:22.04
+FROM python:3.9-slim
 
-# 環境変数の設定
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
-
-# システムの更新と必要なツールのインストール
-# PostgreSQL開発ライブラリを追加
+# 必要なシステムパッケージをインストール
 RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    python3.10-dev \
     wget \
-    p7zip-full \
-    gcc \
-    g++ \
-    libpq-dev \
-    libssl-dev \
-    libffi-dev \
-    build-essential \
-    pkg-config \
+    unzip \
+    curl \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Pythonのエイリアスを設定
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
-    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+# VOICEVOXエンジン（Linux CPU版）をダウンロード
+WORKDIR /opt
+RUN wget -O voicevox-engine.zip https://github.com/VOICEVOX/voicevox_engine/releases/latest/download/linux-cpu.zip \
+    && unzip voicevox-engine.zip \
+    && rm voicevox-engine.zip \
+    && mv linux-cpu voicevox-engine \
+    && chmod +x voicevox-engine/run
 
-# 作業ディレクトリの設定
+# アプリケーションディレクトリ
 WORKDIR /app
 
-# --- ▼▼▼ ここからが修正箇所 ▼▼▼ ---
-# VOICEVOXエンジンのダウンロードとセットアップ
-# APIレートリミットを避けるため、最新の安定版(0.19.1)のURLを直接指定する
-RUN wget https://github.com/VOICEVOX/voicevox_engine/releases/download/0.19.1/voicevox_engine-linux-cpu-0.19.1.7z.001 -O voicevox.7z.001 \
-    && 7z x voicevox.7z.001 \
-    && mv linux-cpu /opt/voicevox_engine \
-    && rm voicevox.7z.001
-# --- ▲▲▲ ここまでが修正箇所 ▲▲▲ ---
-
-# VOICEVOX実行に必要なシステムライブラリのインストール
-RUN apt-get update && apt-get install -y \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libasound2 \
-    libglib2.0-0 \
-    libusb-1.0-0-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# VOICEVOXエンジンの実行スクリプトを作成
-RUN echo '#!/bin/bash\ncd /opt/voicevox_engine && ./run --host 0.0.0.0 --port 50021 > /var/log/voicevox_engine.log 2>&1' > /usr/local/bin/run_voicevox \
-    && chmod +x /usr/local/bin/run_voicevox
-
-# pipをアップグレード
-RUN pip install --upgrade pip
-
-# Pythonの依存関係をインストール
+# Python依存関係をインストール
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリケーションコードのコピー
+# アプリケーションファイルをコピー
 COPY . .
 
-# staticディレクトリが存在することを確認
-RUN mkdir -p static
+# 起動スクリプトを作成（記事のアプローチを参考）
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "=== Starting VOICEVOX Engine ==="\n\
+# VOICEVOXエンジンをバックグラウンドで起動\n\
+cd /opt/voicevox-engine\n\
+./run --host 0.0.0.0 --port 50021 &\n\
+VOICEVOX_PID=$!\n\
+\n\
+# VOICEVOXの起動を待つ（記事と同様のアプローチ）\n\
+echo "Waiting for VOICEVOX engine to be ready..."\n\
+for i in {1..30}; do\n\
+    if curl -s http://localhost:50021/version > /dev/null 2>&1; then\n\
+        echo "✅ VOICEVOX engine is ready!"\n\
+        curl -s http://localhost:50021/version | head -1\n\
+        break\n\
+    fi\n\
+    echo "⏳ Waiting... ($i/30)"\n\
+    sleep 2\n\
+done\n\
+\n\
+# 簡単な動作テスト（記事のAPIパターンに従う）\n\
+echo "=== Testing VOICEVOX API ==="\n\
+if curl -s "http://localhost:50021/audio_query?text=テスト&speaker=3" > /dev/null 2>&1; then\n\
+    echo "✅ VOICEVOX API test successful"\n\
+else\n\
+    echo "⚠️  VOICEVOX API test failed, but continuing..."\n\
+fi\n\
+\n\
+echo "=== Starting Flask Application ==="\n\
+cd /app\n\
+exec python app.py\n\
+' > /start.sh && chmod +x /start.sh
 
-# ポートの公開
+# ポートを公開
 EXPOSE 5000
-EXPOSE 50021
 
-# アプリケーションの起動コマンド
-CMD ["bash", "-c", "/usr/local/bin/run_voicevox & exec python app.py"]
-# ベースイメージを選択
-FROM python:3.11-slim
-
-# 作業ディレクトリを設定
-WORKDIR /app
-
-# requirements.txt をコンテナにコピー
-COPY requirements.txt .
-
-# 必要なライブラリをインストール
-RUN pip install --no-cache-dir -r requirements.txt
-
-# アプリケーションコードをコピー
-COPY . .
-
-# ポートを指定
-EXPOSE 5000
-
-# アプリケーションを実行するコマンド
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+# 起動コマンド
+CMD ["/start.sh"]
