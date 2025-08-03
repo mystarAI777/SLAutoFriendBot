@@ -41,14 +41,21 @@ except Exception as e:
     logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
 
 # --- VOICEVOX_URL ---
-# ▼▼▼【修正点】より包括的なVOICEVOX URL候補と接続改善 ▼▼▼
+# ▼▼▼【2024年版修正】最新のVOICEVOX接続設定 ▼▼▼
 VOICEVOX_URLS = [
     'http://localhost:50021',        # ローカル環境
     'http://127.0.0.1:50021',        # ローカルループバック
-    'http://0.0.0.0:50021',          # 全インターフェース
     'http://voicevox-engine:50021',  # Docker Compose環境
     'http://voicevox:50021',         # 別のDocker名
     'http://host.docker.internal:50021',  # Docker Desktop環境
+    'http://0.0.0.0:50021',          # 全インターフェース（最後に試行）
+]
+
+# VOICEVOXエンジンの推奨バージョン情報
+RECOMMENDED_VOICEVOX_IMAGES = [
+    "voicevox/voicevox_engine:cpu-0.19.1",
+    "voicevox/voicevox_engine:latest",
+    "voicevox/voicevox_engine:cpu-0.18.2"
 ]
 
 VOICEVOX_URL = None
@@ -63,7 +70,7 @@ except FileNotFoundError:
 
 # VOICEVOX接続テスト（改善版）
 def find_working_voicevox_url():
-    """利用可能なVOICEVOX URLを見つける（接続テスト強化版）"""
+    """利用可能なVOICEVOX URLを見つける（2024年版強化）"""
     urls_to_test = []
     
     # Secret Fileまたは環境変数で指定されたURLがあれば最初に試す
@@ -81,8 +88,20 @@ def find_working_voicevox_url():
             version_response = requests.get(f"{url}/version", timeout=3)
             if version_response.status_code == 200:
                 version_info = version_response.json()
+                engine_version = version_info.get('version', 'unknown')
                 logger.info(f"✅ VOICEVOX version確認成功: {url}")
-                logger.info(f"📋 Engine version: {version_info.get('version', 'unknown')}")
+                logger.info(f"📋 Engine version: {engine_version}")
+                
+                # バージョン警告チェック
+                if engine_version != 'unknown':
+                    try:
+                        version_parts = engine_version.split('.')
+                        major, minor = int(version_parts[0]), int(version_parts[1])
+                        if major == 0 and minor < 18:
+                            logger.warning(f"⚠️ 古いVOICEVOXバージョン検出: {engine_version}")
+                            logger.warning(f"💡 推奨バージョン: {', '.join(RECOMMENDED_VOICEVOX_IMAGES)}")
+                    except (ValueError, IndexError):
+                        pass  # バージョン解析失敗は無視
                 
                 # ステップ2: スピーカー情報取得テスト
                 try:
@@ -92,9 +111,14 @@ def find_working_voicevox_url():
                         speaker_count = len(speakers) if isinstance(speakers, list) else "unknown"
                         logger.info(f"📢 Available speakers: {speaker_count}")
                         
-                        # ステップ3: 実際の音声合成テスト
-                        test_text = "テスト"
+                        # サポート機能確認
+                        supported_features = version_info.get('supported_features', {})
+                        if supported_features:
+                            logger.info(f"🔧 Supported features: {list(supported_features.keys())[:3]}...")
+                        
+                        # ステップ3: 軽量な音声合成テスト
                         try:
+                            test_text = "テスト"
                             # audio_queryテスト
                             query_response = requests.post(
                                 f"{url}/audio_query",
@@ -102,25 +126,19 @@ def find_working_voicevox_url():
                                 timeout=5
                             )
                             if query_response.status_code == 200:
-                                # synthesisテスト
-                                synthesis_response = requests.post(
-                                    f"{url}/synthesis",
-                                    headers={"Content-Type": "application/json"},
-                                    params={'speaker': 1},
-                                    json=query_response.json(),
-                                    timeout=10
-                                )
-                                if synthesis_response.status_code == 200:
-                                    audio_size = len(synthesis_response.content)
-                                    logger.info(f"🎵 音声合成テスト成功: {audio_size}bytes")
+                                query_data = query_response.json()
+                                # クエリデータの妥当性確認
+                                if query_data and 'accent_phrases' in query_data:
+                                    logger.info(f"🎵 Audio query test successful")
                                     return url
                                 else:
-                                    logger.warning(f"⚠️ Synthesis failed: {synthesis_response.status_code}")
+                                    logger.warning(f"⚠️ Invalid query response format")
                             else:
                                 logger.warning(f"⚠️ Audio query failed: {query_response.status_code}")
+                                
                         except Exception as synthesis_error:
                             logger.warning(f"⚠️ Synthesis test failed: {synthesis_error}")
-                            # バージョン確認が成功していればURLを返す（基本的な接続は可能）
+                            # 基本接続が成功していればURLを返す
                             return url
                     else:
                         logger.warning(f"⚠️ Speakers endpoint failed: {speakers_response.status_code}")
@@ -143,9 +161,12 @@ def find_working_voicevox_url():
     
     logger.error("❌ 利用可能なVOICEVOXエンジンが見つかりませんでした。")
     logger.error("💡 解決方法:")
-    logger.error("1. VOICEVOXエンジンが起動しているか確認してください")
-    logger.error("2. Dockerで起動する場合: docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-ubuntu20.04-latest")
-    logger.error("3. ポート50021が利用可能か確認してください")
+    logger.error("1. 正しいDockerイメージを使用してください:")
+    for image in RECOMMENDED_VOICEVOX_IMAGES:
+        logger.error(f"   docker run --rm -p 50021:50021 {image}")
+    logger.error("2. 古いイメージを削除してください:")
+    logger.error("   docker rmi voicevox/voicevox_engine:cpu-ubuntu20.04-latest")
+    logger.error("3. ポート50021が利用可能か確認してください: lsof -i :50021")
     logger.error("4. ファイアウォールの設定を確認してください")
     return None
 
