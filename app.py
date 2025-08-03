@@ -85,6 +85,19 @@ def find_working_voicevox_url():
 
 # 起動時にVOICEVOX接続をテスト
 WORKING_VOICEVOX_URL = find_working_voicevox_url()
+
+# デバッグ情報をログに出力
+logger.info(f"設定されたVOICEVOX_URL: {VOICEVOX_URL}")
+logger.info(f"動作するVOICEVOX_URL: {WORKING_VOICEVOX_URL}")
+
+# DNS解決テスト
+import socket
+if VOICEVOX_URL and 'voicevox-engine' in VOICEVOX_URL:
+    try:
+        ip = socket.gethostbyname('voicevox-engine')
+        logger.info(f"DNS解決成功: voicevox-engine -> {ip}")
+    except socket.gaierror as e:
+        logger.error(f"DNS解決失敗: voicevox-engine -> {e}")
 # ▲▲▲【修正はここまで】▲▲▲
 
 # --- 必須変数のチェック ---
@@ -186,44 +199,60 @@ def generate_ai_response(user_data, message=""):
         logger.error(f"AI応答生成エラー: {e}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 
-# ▼▼▼【修正点】VOICEVOX接続の改善 ▼▼▼
-def generate_voice(text, speaker_id=1):
-    """音声を生成する（改善版）"""
+# ▼▼▼【記事参考】VOICEVOX音声生成（最適化版） ▼▼▼
+def generate_voice(text, speaker_id=3):  # speaker_id=3でずんだもん（記事と同様）
+    """音声を生成する（記事のアプローチを参考にした版）"""
     if not WORKING_VOICEVOX_URL:
         logger.warning("VOICEVOXエンジンが利用できないため、音声生成をスキップします。")
         return None
     
+    # 記事と同様のアプローチ：文字数制限でパフォーマンス向上
+    if len(text) > 100:  # 記事では20文字程度が1秒以内、250文字で8秒だったため
+        text = text[:100] + "..."
+        logger.info(f"テキストを100文字に制限しました: {text}")
+    
     try:
-        # タイムアウトを短くしてレスポンスを改善
-        audio_query_response = requests.post(
-            f"{WORKING_VOICEVOX_URL}/audio_query", 
-            params={"text": text, "speaker": speaker_id},
-            timeout=10  # 10秒でタイムアウト
-        )
-        audio_query_response.raise_for_status()
+        # 記事と同じAPIパターン
+        host = WORKING_VOICEVOX_URL.replace('http://', '').replace('https://', '')
+        if ':' in host:
+            host = host.split(':')[0]
         
+        # audio_queryでクエリ作成（記事と同様）
+        params = {
+            'text': text,
+            'speaker': speaker_id
+        }
+        
+        query_response = requests.post(
+            f"{WORKING_VOICEVOX_URL}/audio_query",
+            params=params,
+            timeout=8  # 記事の結果を参考に8秒でタイムアウト
+        )
+        query_response.raise_for_status()
+        
+        # synthesis で音声合成（記事と同様）
         synthesis_response = requests.post(
-            f"{WORKING_VOICEVOX_URL}/synthesis", 
-            headers={"Content-Type": "application/json"}, 
-            params={"speaker": speaker_id}, 
-            json=audio_query_response.json(),
-            timeout=10  # 10秒でタイムアウト
+            f"{WORKING_VOICEVOX_URL}/synthesis",
+            headers={"Content-Type": "application/json"},
+            params={'speaker': speaker_id},
+            json=query_response.json(),  # 記事ではjson.dumps()していたが、requestsのjsonパラメーターを使用
+            timeout=8
         )
         synthesis_response.raise_for_status()
         
-        logger.info(f"音声生成成功: テキスト長={len(text)}, 音声データサイズ={len(synthesis_response.content)}")
+        logger.info(f"✅ VOICEVOX音声生成成功: テキスト='{text[:20]}...', データサイズ={len(synthesis_response.content)}bytes")
         return synthesis_response.content
         
-    except requests.exceptions.ConnectTimeout:
-        logger.error(f"VOICEVOX接続タイムアウト: {WORKING_VOICEVOX_URL}")
+    except requests.exceptions.Timeout:
+        logger.error(f"⏰ VOICEVOX音声生成タイムアウト（8秒超過）: テキスト長={len(text)}")
         return None
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"VOICEVOX接続エラー: {e}")
+        logger.error(f"🔌 VOICEVOX接続エラー: {e}")
         return None
     except Exception as e:
-        logger.error(f"音声生成エラー: {e}")
+        logger.error(f"❌ VOICEVOX音声生成エラー: {e}")
         return None
-# ▲▲▲【修正はここまで】▲▲▲
+# ▲▲▲【記事参考版はここまで】▲▲▲
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
