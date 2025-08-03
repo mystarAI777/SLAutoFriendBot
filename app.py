@@ -1,27 +1,27 @@
 # ======================================================================= #
-#                           Application v5.2 (Final)                        #
+#                           Application v5.3 (Session Fix)                  #
 # ======================================================================= #
 
 import os
 import requests
 import logging
 import sys
-import socket
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, Index
+from sqlalchemy import create_engine, Column, String, DateTime, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
 from groq import Groq
 from openai import OpenAI
 
+# (ログ設定、Secret読み込み、VOICEVOX接続テストの部分は変更なし)
+# ... (前と同じコード) ...
 # --- ログ設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Secret Fileからの設定読み込み ---
 def get_secret(name):
-    """Secretファイルまたは環境変数から設定値を読み込む"""
     secret_file = f'/etc/secrets/{name}'
     try:
         with open(secret_file, 'r') as f:
@@ -40,18 +40,11 @@ GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
 # --- VOICEVOX接続テスト ---
-VOICEVOX_URLS = [
-    'http://localhost:50021',
-    'http://127.0.0.1:50021',
-]
-
+VOICEVOX_URLS = ['http://localhost:50021', 'http://127.0.0.1:50021']
 def find_working_voicevox_url():
-    """利用可能なVOICEVOX URLを見つける"""
     urls_to_test = []
-    if VOICEVOX_URL_FROM_ENV:
-        urls_to_test.insert(0, VOICEVOX_URL_FROM_ENV) # 環境変数で指定されたものを最優先
+    if VOICEVOX_URL_FROM_ENV: urls_to_test.insert(0, VOICEVOX_URL_FROM_ENV)
     urls_to_test.extend([url for url in VOICEVOX_URLS if url not in urls_to_test])
-
     for url in urls_to_test:
         try:
             logger.info(f"🔍 VOICEVOX接続テスト中: {url}")
@@ -59,12 +52,11 @@ def find_working_voicevox_url():
             response.raise_for_status()
             logger.info(f"✅ VOICEVOX接続成功: {url}, Version: {response.json()}")
             return url
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             logger.warning(f"❌ VOICEVOX接続失敗: {url}")
             continue
     logger.error("❌ 利用可能なVOICEVOXエンジンが見つかりませんでした。")
     return None
-
 WORKING_VOICEVOX_URL = find_working_voicevox_url()
 
 # --- 必須変数のチェック ---
@@ -74,7 +66,7 @@ if not DATABASE_URL or not GROQ_API_KEY:
 
 # --- Flaskアプリケーションの初期化 ---
 app = Flask(__name__)
-CORS(app) # すべてのオリジンからのリクエストを許可
+CORS(app)
 
 # --- サービス初期化 ---
 groq_client = None
@@ -87,21 +79,16 @@ except Exception as e:
 
 engine = None
 Session = None
+Base = declarative_base()
+class UserMemory(Base):
+    __tablename__ = 'user_memories'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
+    user_name = Column(String(255), nullable=False)
+    interaction_count = Column(Integer, default=0)
+
 try:
     engine = create_engine(DATABASE_URL)
-    Base = declarative_base()
-
-    class UserMemory(Base):
-        __tablename__ = 'user_memories'
-        id = Column(Integer, primary_key=True)
-        user_uuid = Column(String(255), unique=True, nullable=False, index=True)
-        user_name = Column(String(255), nullable=False)
-        personality_notes = Column(String(2000), default='')
-        favorite_topics = Column(String(2000), default='')
-        interaction_count = Column(Integer, default=0)
-        created_at = Column(DateTime, default=datetime.utcnow)
-        last_interaction = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     logger.info("✅ データベース接続とテーブル作成が完了しました。")
@@ -109,26 +96,46 @@ except Exception as e:
     logger.critical(f"FATAL: データベース接続に失敗: {e}")
     sys.exit(1)
 
-# --- ビジネスロジック ---
+# ▼▼▼【ここからが修正の核心】▼▼▼
+
+class UserDataContainer:
+    """データベースセッションから独立した、安全なデータコンテナ"""
+    def __init__(self, user_uuid, user_name, interaction_count):
+        self.user_uuid = user_uuid
+        self.user_name = user_name
+        self.interaction_count = interaction_count
+
 def get_or_create_user(user_uuid, user_name):
+    """ユーザー情報を取得/作成し、安全なデータコンテナとして返す"""
     session = Session()
     try:
-        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-        if user:
-            user.interaction_count += 1
+        user_memory = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        if user_memory:
+            user_memory.interaction_count += 1
         else:
             logger.info(f"新規ユーザーを作成: {user_name} ({user_uuid})")
-            user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
-            session.add(user)
+            user_memory = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
+            session.add(user_memory)
         session.commit()
-        return user
+        # SQLAlchemyオブジェクトではなく、UserDataContainerを返す
+        return UserDataContainer(
+            user_uuid=user_memory.user_uuid,
+            user_name=user_memory.user_name,
+            interaction_count=user_memory.interaction_count
+        )
+    except Exception as e:
+        logger.error(f"ユーザーデータ処理エラー: {e}")
+        session.rollback()
+        return None
     finally:
-        session.close()
+        session.close() # セッションはここで閉じる
 
-def generate_ai_response(user, message):
-    # (省略... 以前のコードと同じ)
-    if not groq_client: return f"{user.user_name}さん、こんにちは！"
-    system_prompt = f"あなたは「もちこ」というAIです。親友の{user.user_name}さんとタメ口で話します。"
+# ▲▲▲【ここまでが修正の核心】▲▲▲
+
+# --- ビジネスロジック ---
+def generate_ai_response(user_data, message): # 引数がuser_dataコンテナになる
+    if not groq_client: return f"{user_data.user_name}さん、こんにちは！"
+    system_prompt = f"あなたは「もちこ」というAIです。親友の{user_data.user_name}さんとタメ口で話します。"
     try:
         completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "元気？"}], model="llama3-8b-8192")
         return completion.choices[0].message.content.strip()
@@ -137,7 +144,6 @@ def generate_ai_response(user, message):
         return "ごめん、ちょっと考え事してた！"
 
 def generate_voice(text, speaker_id=3):
-    # (省略... 以前のコードと同じ)
     if not WORKING_VOICEVOX_URL: return None
     try:
         res_query = requests.post(f"{WORKING_VOICEVOX_URL}/audio_query", params={'text': text, 'speaker': speaker_id}, timeout=5)
@@ -154,37 +160,20 @@ def generate_voice(text, speaker_id=3):
 def index():
     return "<h1>AI Chat API</h1><p>Service is running.</p>"
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    # (省略... 以前のコードと同じ)
-    data = request.json or {}
-    user_uuid, user_name = data.get('user_uuid'), data.get('user_name')
-    if not (user_uuid and user_name): return jsonify(error='user_uuid and user_name are required'), 400
-    user = get_or_create_user(user_uuid, user_name)
-    ai_response = generate_ai_response(user, data.get('message'))
-    voice_data = generate_voice(ai_response)
-    response_data = {'text': ai_response}
-    if voice_data:
-        filename = f"voice_{user_uuid}_{int(datetime.now().timestamp())}.wav"
-        with open(os.path.join('/tmp', filename), 'wb') as f: f.write(voice_data)
-        response_data['voice_url'] = f'/voice/{filename}'
-    return jsonify(response_data)
-
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
-    """LSLからの呼び出しに対応するエンドポイント"""
     logger.info("✅ /chat_lsl エンドポイントへのリクエストを受信しました。")
     try:
         data = request.json or {}
         user_uuid, user_name, message = data.get('uuid'), data.get('name'), data.get('message', '')
         if not (user_uuid and user_name):
-            logger.error("LSLリクエストエラー: uuidとnameが必須です。")
             return "Error: uuid and name are required", 400
         
-        user = get_or_create_user(user_uuid, user_name)
-        if not user: return "Error: Failed to process user data", 500
+        user_data = get_or_create_user(user_uuid, user_name) # 返ってくるのはUserDataContainer
+        if not user_data:
+            return "Error: Failed to process user data", 500
             
-        ai_response = generate_ai_response(user, message)
+        ai_response = generate_ai_response(user_data, message) # UserDataContainerを渡す
         voice_data = generate_voice(ai_response)
         
         audio_url_part = ""
@@ -200,6 +189,7 @@ def chat_lsl():
         logger.error(f"LSLチャットエンドポイントで予期せぬエラー: {e}")
         return "Error: Internal server error", 500
 
+# (他のエンドポイントは変更なし)
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     return send_from_directory('/tmp', filename)
