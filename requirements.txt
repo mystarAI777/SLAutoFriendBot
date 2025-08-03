@@ -1,9 +1,7 @@
-flask
-flask-cors
-sqlalchemy
+Flask
+Flask-Cors
+SQLAlchemy
 groq
-openai
-gunicorn
+gTTS
 requests
-psycopg2-binary  # PostgreSQLを使う場合
-pg8000           # PostgreSQLの別ドライバー
+psycopg2-binary
