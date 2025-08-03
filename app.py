@@ -287,6 +287,8 @@ def index():
         }
     })
 
+# chat_lsl エンドポイントの修正版
+
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     """最適化されたLSLチャットエンドポイント"""
@@ -305,21 +307,30 @@ def chat_lsl():
             return "Error: User data failed", 500
         
         # AI応答生成（高速）
-        ai_response = generate_ai_response(user_data, message)
+        ai_text = generate_ai_response(user_data, message)
         
         # 音声生成（並列処理可能）
-        voice_data = generate_voice_fast(ai_response, speaker_id=3)
+        voice_data = generate_voice_fast(ai_text, speaker_id=3)
         
-        audio_url_part = ""
+        audio_url = ""
         if voice_data:
             filename = f"voice_{user_uuid}_{int(time.time() * 1000)}.wav"
             filepath = os.path.join('/tmp', filename)
             with open(filepath, 'wb') as f:
                 f.write(voice_data)
-            audio_url_part = f'/voice/{filename}'
-            logger.debug(f"音声ファイル保存: {audio_url_part}")
+            audio_url = f'/voice/{filename}'
+            logger.debug(f"音声ファイル保存: {audio_url}")
         
-        response_text = f"{ai_response}|{audio_url_part}"
+        # 修正：変数名を明確にし、フォーマットを改善
+        response_text = f"{ai_text}|{audio_url}"
+        
+        # または、より明確なJSON形式で返す場合：
+        # return jsonify({
+        #     'text': ai_text,
+        #     'audio_url': audio_url,
+        #     'user_interaction_count': user_data.interaction_count
+        # })
+        
         return app.response_class(
             response=response_text, 
             status=200, 
