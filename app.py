@@ -565,6 +565,77 @@ def voicevox_status():
                     'synthesis_test': synthesis_test,
                     'configured_url': VOICEVOX_URL,
                     'tested_urls': VOICEVOX_URLS
+            })
+    
+    return jsonify({
+        'status': 'unavailable',
+        'url': None,
+        'error': 'VOICEVOX engine not found',
+        'configured_url': VOICEVOX_URL,
+        'tested_urls': VOICEVOX_URLS,
+        'troubleshooting': {
+            'recommendations': RECOMMENDED_VOICEVOX_IMAGES,
+            'common_issues': [
+                'VOICEVOX engine not running',
+                'Port 50021 not accessible',
+                'Docker networking issues',
+                'Outdated VOICEVOX image'
+            ]
+        }
+    })
+
+@app.route('/health')
+def health_check():
+    """アプリケーションのヘルスチェック"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'database': 'connected' if DATABASE_URL else 'not configured',
+        'groq_api': 'available' if groq_client else 'unavailable',
+        'voicevox': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
+        'voicevox_url': WORKING_VOICEVOX_URL
+    })
+
+@app.route('/')
+def index():
+    """ルートエンドポイント - API情報を表示"""
+    return jsonify({
+        'message': 'もちこ AI Assistant API',
+        'version': 'v6',
+        'endpoints': {
+            '/chat': 'POST - Main chat endpoint (JSON response)',
+            '/chat_lsl': 'POST - LSL-compatible chat endpoint (plain text)',
+            '/voice/<filename>': 'GET - Serve voice files',
+            '/voicevox_status': 'GET - Check VOICEVOX engine status',
+            '/health': 'GET - Application health check'
+        },
+        'status': {
+            'database': 'connected' if DATABASE_URL else 'not configured',
+            'groq_api': 'available' if groq_client else 'unavailable',
+            'voicevox': 'available' if WORKING_VOICEVOX_URL else 'unavailable'
+        }
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    host = os.environ.get('HOST', '0.0.0.0')
+    
+    logger.info(f"🚀 Flask アプリケーションを開始します")
+    logger.info(f"📍 Host: {host}:{port}")
+    logger.info(f"🗄️ Database: {'接続済み' if DATABASE_URL else '未設定'}")
+    logger.info(f"🤖 Groq API: {'利用可能' if groq_client else '利用不可'}")
+    logger.info(f"🎵 VOICEVOX: {'利用可能' if WORKING_VOICEVOX_URL else '利用不可'}")
+    
+    if WORKING_VOICEVOX_URL:
+        logger.info(f"🎙️ VOICEVOX URL: {WORKING_VOICEVOX_URL}")
+    else:
+        logger.warning("⚠️ VOICEVOXエンジンが利用できません。音声合成機能は無効です。")
+        logger.info("💡 トラブルシューティング:")
+        logger.info("   - VOICEVOXエンジンが起動しているか確認")
+        logger.info("   - ポート50021が利用可能か確認")
+        logger.info("   - 推奨Dockerイメージを使用")
+    
+    app.run(host=host, port=port, debug=False)URLS
                 })
         except Exception as e:
             logger.error(f"VOICEVOX状態確認エラー: {e}")
@@ -573,8 +644,4 @@ def voicevox_status():
                 'url': WORKING_VOICEVOX_URL,
                 'error': str(e),
                 'configured_url': VOICEVOX_URL,
-                'tested_urls': VOICEVOX_URLS
-            })
-    
-    return jsonify({
-        'status': 'unavailable',
+                'tested_urls': VOICEVOX_
