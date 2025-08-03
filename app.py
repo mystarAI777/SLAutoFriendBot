@@ -1,5 +1,5 @@
 # ======================================================================= #
-#                           Application v5.3 (Session Fix)                  #
+#                           Application v5.4 (Timeout Fix)                  #
 # ======================================================================= #
 
 import os
@@ -96,28 +96,22 @@ except Exception as e:
     logger.critical(f"FATAL: データベース接続に失敗: {e}")
     sys.exit(1)
 
-# ▼▼▼【ここからが修正の核心】▼▼▼
-
 class UserDataContainer:
-    """データベースセッションから独立した、安全なデータコンテナ"""
     def __init__(self, user_uuid, user_name, interaction_count):
         self.user_uuid = user_uuid
         self.user_name = user_name
         self.interaction_count = interaction_count
 
 def get_or_create_user(user_uuid, user_name):
-    """ユーザー情報を取得/作成し、安全なデータコンテナとして返す"""
     session = Session()
     try:
         user_memory = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-        if user_memory:
-            user_memory.interaction_count += 1
+        if user_memory: user_memory.interaction_count += 1
         else:
             logger.info(f"新規ユーザーを作成: {user_name} ({user_uuid})")
             user_memory = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
             session.add(user_memory)
         session.commit()
-        # SQLAlchemyオブジェクトではなく、UserDataContainerを返す
         return UserDataContainer(
             user_uuid=user_memory.user_uuid,
             user_name=user_memory.user_name,
@@ -128,14 +122,12 @@ def get_or_create_user(user_uuid, user_name):
         session.rollback()
         return None
     finally:
-        session.close() # セッションはここで閉じる
-
-# ▲▲▲【ここまでが修正の核心】▲▲▲
+        session.close()
 
 # --- ビジネスロジック ---
-def generate_ai_response(user_data, message): # 引数がuser_dataコンテナになる
+def generate_ai_response(user_data, message):
     if not groq_client: return f"{user_data.user_name}さん、こんにちは！"
-    system_prompt = f"あなたは「もちこ」というAIです。親友の{user_data.user_name}さんとタメ口で話します。"
+    system_prompt = f"あなたは「もちこ」というAIです。親友の{user_data.user_name}さんと丁寧な言葉でで話します。日本語でフレンドリーな返事を60文字程度で生成してください。語尾は「ですわ」「ますわ」、一人称は「あてぃし」"
     try:
         completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "元気？"}], model="llama3-8b-8192")
         return completion.choices[0].message.content.strip()
@@ -143,17 +135,40 @@ def generate_ai_response(user_data, message): # 引数がuser_dataコンテナ�
         logger.error(f"AI応答生成エラー: {e}")
         return "ごめん、ちょっと考え事してた！"
 
+# ▼▼▼【ここが修正点】▼▼▼
 def generate_voice(text, speaker_id=3):
-    if not WORKING_VOICEVOX_URL: return None
-    try:
-        res_query = requests.post(f"{WORKING_VOICEVOX_URL}/audio_query", params={'text': text, 'speaker': speaker_id}, timeout=5)
-        res_query.raise_for_status()
-        res_synth = requests.post(f"{WORKING_VOICEVOX_URL}/synthesis", params={'speaker': speaker_id}, json=res_query.json(), timeout=10)
-        res_synth.raise_for_status()
-        return res_synth.content
-    except Exception as e:
-        logger.error(f"VOICEVOX音声合成エラー: {e}")
+    """テキストから音声を生成します。タイムアウト値を延長。"""
+    if not WORKING_VOICEVOX_URL:
         return None
+    try:
+        # audio_queryのタイムアウトを15秒に延長
+        res_query = requests.post(
+            f"{WORKING_VOICEVOX_URL}/audio_query",
+            params={'text': text, 'speaker': speaker_id},
+            timeout=15
+        )
+        res_query.raise_for_status()
+        
+        # synthesisのタイムアウトも15秒に延長
+        res_synth = requests.post(
+            f"{WORKING_VOICEVOX_URL}/synthesis",
+            params={'speaker': speaker_id},
+            json=res_query.json(),
+            timeout=15
+        )
+        res_synth.raise_for_status()
+        
+        logger.info(f"✅ 音声合成成功: '{text[:20]}...'")
+        return res_synth.content
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"⏰ VOICEVOX音声合成がタイムアウトしました（{15}秒）。")
+        return None
+    except Exception as e:
+        logger.error(f"❌ VOICEVOX音声合成で予期せぬエラー: {e}")
+        return None
+# ▲▲▲【修正はここまで】▲▲▲
+
 
 # --- APIエンドポイント ---
 @app.route('/')
@@ -166,30 +181,23 @@ def chat_lsl():
     try:
         data = request.json or {}
         user_uuid, user_name, message = data.get('uuid'), data.get('name'), data.get('message', '')
-        if not (user_uuid and user_name):
-            return "Error: uuid and name are required", 400
-        
-        user_data = get_or_create_user(user_uuid, user_name) # 返ってくるのはUserDataContainer
-        if not user_data:
-            return "Error: Failed to process user data", 500
-            
-        ai_response = generate_ai_response(user_data, message) # UserDataContainerを渡す
+        if not (user_uuid and user_name): return "Error: uuid and name are required", 400
+        user_data = get_or_create_user(user_uuid, user_name)
+        if not user_data: return "Error: Failed to process user data", 500
+        ai_response = generate_ai_response(user_data, message)
         voice_data = generate_voice(ai_response)
-        
         audio_url_part = ""
         if voice_data:
             filename = f"voice_{user_uuid}_{int(datetime.now().timestamp())}.wav"
             with open(os.path.join('/tmp', filename), 'wb') as f: f.write(voice_data)
             audio_url_part = f'/voice/{filename}'
             logger.info(f"音声ファイル生成成功: {audio_url_part}")
-        
         response_text = f"{ai_response}|{audio_url_part}"
         return app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
     except Exception as e:
         logger.error(f"LSLチャットエンドポイントで予期せぬエラー: {e}")
         return "Error: Internal server error", 500
 
-# (他のエンドポイントは変更なし)
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     return send_from_directory('/tmp', filename)
