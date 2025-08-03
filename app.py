@@ -204,7 +204,6 @@ def test_dns_resolution():
             logger.debug(f"DNS解決失敗: {hostname} -> {e}")
 
 test_dns_resolution()
-# ▲▲▲【修正はここまで】▲▲▲
 
 # --- 必須変数のチェック ---
 if not DATABASE_URL:
@@ -276,12 +275,32 @@ def get_or_create_user(user_uuid, user_name):
             user_memory.interaction_count += 1
             user_memory.last_interaction = datetime.utcnow()
             session.commit()
-            return UserDataContainer(user_uuid=user_memory.user_uuid, user_name=user_memory.user_name, personality_notes=user_memory.personality_notes or '', favorite_topics=user_memory.favorite_topics or '', interaction_count=user_memory.interaction_count, created_at=user_memory.created_at, last_interaction=user_memory.last_interaction)
+            return UserDataContainer(
+                user_uuid=user_memory.user_uuid, 
+                user_name=user_memory.user_name, 
+                personality_notes=user_memory.personality_notes or '', 
+                favorite_topics=user_memory.favorite_topics or '', 
+                interaction_count=user_memory.interaction_count, 
+                created_at=user_memory.created_at, 
+                last_interaction=user_memory.last_interaction
+            )
         else:
-            new_user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1, created_at=datetime.utcnow(), last_interaction=datetime.utcnow())
+            new_user = UserMemory(
+                user_uuid=user_uuid, 
+                user_name=user_name, 
+                interaction_count=1, 
+                created_at=datetime.utcnow(), 
+                last_interaction=datetime.utcnow()
+            )
             session.add(new_user)
             session.commit()
-            return UserDataContainer(user_uuid=new_user.user_uuid, user_name=new_user.user_name, interaction_count=1, created_at=new_user.created_at, last_interaction=new_user.last_interaction)
+            return UserDataContainer(
+                user_uuid=new_user.user_uuid, 
+                user_name=new_user.user_name, 
+                interaction_count=1, 
+                created_at=new_user.created_at, 
+                last_interaction=new_user.last_interaction
+            )
     except Exception as e:
         logger.error(f"ユーザーデータの取得/作成エラー: {e}")
         session.rollback()
@@ -290,7 +309,9 @@ def get_or_create_user(user_uuid, user_name):
         session.close()
 
 def generate_ai_response(user_data, message=""):
-    if groq_client is None: return f"こんにちは、{user_data.user_name}さん！現在システムメンテナンス中ですが、お話しできて嬉しいです。"
+    if groq_client is None: 
+        return f"こんにちは、{user_data.user_name}さん！現在システムメンテナンス中ですが、お話しできて嬉しいです。"
+    
     system_prompt = ""
     if user_data.interaction_count == 1:
         system_prompt = f"あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。今、{user_data.user_name}さんという方に初めてお会いしました。以下のキャラクター設定を厳守して、60文字以内の自然で親しみやすい初対面の挨拶をしてください。\n- 敬語は使わず、親しみやすい「タメ口」で話します。\n- 少し恥ずかしがり屋ですが、フレンドリーです。\n- 相手に興味津々です。"
@@ -298,8 +319,17 @@ def generate_ai_response(user_data, message=""):
         days_since_last = (datetime.utcnow() - user_data.last_interaction).days
         situation = "継続的な会話" if days_since_last <= 1 else ("数日ぶりの再会" if days_since_last <= 7 else "久しぶりの再会")
         system_prompt = f"あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。{user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。\n状況: {situation}。\n過去のメモ: {user_data.personality_notes}\n好きな話題: {user_data.favorite_topics}\n以下のキャラクター設定を厳守し、この状況にふさわしい返事を60文字以内で作成してください。\n- 敬語は使わず、親しみやすい「タメ口」で話します。\n- 過去の会話を覚えている、親しい友人として振る舞います。"
+    
     try:
-        chat_completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "こんにちは"}], model="llama3-8b-8192", temperature=0.7, max_tokens=150)
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt}, 
+                {"role": "user", "content": message or "こんにちは"}
+            ], 
+            model="llama3-8b-8192", 
+            temperature=0.7, 
+            max_tokens=150
+        )
         return chat_completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
@@ -401,26 +431,39 @@ def generate_voice(text, speaker_id=1, retry_count=2):
     
     logger.error(f"❌ VOICEVOX音声合成が{retry_count + 1}回の試行で失敗しました")
     return None
-# ▲▲▲【改良版はここまで】▲▲▲
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
-    if request.method == 'OPTIONS': return jsonify(status='ok')
+    if request.method == 'OPTIONS': 
+        return jsonify(status='ok')
+    
     try:
         data = request.json
         user_uuid = data.get('user_uuid') or data.get('uuid')
         user_name = data.get('user_name') or data.get('name')
-        if not user_uuid or not user_name: return jsonify(error='user_uuid and user_name are required'), 400
+        
+        if not user_uuid or not user_name: 
+            return jsonify(error='user_uuid and user_name are required'), 400
+        
         user_data = get_or_create_user(user_uuid, user_name)
         ai_response = generate_ai_response(user_data, data.get('message', ''))
         voice_data = generate_voice(ai_response)
-        response_data = {'text': ai_response, 'response': ai_response, 'interaction_count': user_data.interaction_count, 'has_voice': voice_data is not None}
+        
+        response_data = {
+            'text': ai_response, 
+            'response': ai_response, 
+            'interaction_count': user_data.interaction_count, 
+            'has_voice': voice_data is not None
+        }
+        
         if voice_data:
             voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
             voice_path = os.path.join('/tmp', voice_filename)
-            with open(voice_path, 'wb') as f: f.write(voice_data)
+            with open(voice_path, 'wb') as f: 
+                f.write(voice_data)
             response_data['voice_url'] = f'/voice/{voice_filename}'
             response_data['audio_url'] = f'/voice/{voice_filename}'
+        
         return jsonify(response_data)
     except Exception as e:
         logger.error(f"チャットエラー: {e}")
@@ -433,22 +476,34 @@ def chat_lsl():
         user_uuid = data.get('uuid')
         user_name = data.get('name')
         message = data.get('message', '')
-        if not user_uuid or not user_name: return "Error: user_uuid and user_name are required", 400
+        
+        if not user_uuid or not user_name: 
+            return "Error: user_uuid and user_name are required", 400
+        
         user_data = get_or_create_user(user_uuid, user_name)
-        if not user_data: return "Error: Failed to get user data", 500
+        if not user_data: 
+            return "Error: Failed to get user data", 500
+        
         ai_response = generate_ai_response(user_data, message)
         voice_data = generate_voice(ai_response)
+        
         audio_url_part = ""
         if voice_data:
             voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
             voice_path = os.path.join('/tmp', voice_filename)
-            with open(voice_path, 'wb') as f: f.write(voice_data)
+            with open(voice_path, 'wb') as f: 
+                f.write(voice_data)
             audio_url_part = f'/voice/{voice_filename}'
             logger.info(f"音声ファイル生成成功: {audio_url_part}")
         else:
             logger.warning("音声データの生成に失敗しました")
+        
         response_text = f"{ai_response}|{audio_url_part}"
-        response = app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
+        response = app.response_class(
+            response=response_text, 
+            status=200, 
+            mimetype='text/plain; charset=utf-8'
+        )
         return response
     except Exception as e:
         logger.error(f"LSLチャットエラー: {e}")
@@ -523,14 +578,3 @@ def voicevox_status():
     
     return jsonify({
         'status': 'unavailable',
-        'url': WORKING_VOICEVOX_URL,
-        'message': 'VOICEVOXエンジンに接続できません',
-        'configured_url': VOICEVOX_URL,
-        'tested_urls': VOICEVOX_URLS,
-        'troubleshooting_steps': [
-            '1. VOICEVOXエンジンが起動しているか確認',
-            '2. Docker: docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-ubuntu20.04-latest',
-            '3. ポート50021の利用可能性確認',
-            '4. ファイアウォール設定確認',
-            '5. ネットワーク接続確認'
-        ]
