@@ -1,5 +1,5 @@
 # ======================================================================= #
-#                           Application v5.4 (Timeout Fix)                  #
+#                           Application v5.5 (Final Timeout)                #
 # ======================================================================= #
 
 import os
@@ -59,16 +59,13 @@ def find_working_voicevox_url():
     return None
 WORKING_VOICEVOX_URL = find_working_voicevox_url()
 
-# --- 必須変数のチェック ---
+# (必須変数のチェック、Flask初期化、サービス初期化、DB設定、UserDataContainer、get_or_create_userは変更なし)
+# ... (前と同じコード) ...
 if not DATABASE_URL or not GROQ_API_KEY:
     logger.critical("FATAL: DATABASE_URLまたはGROQ_API_KEYが設定されていません。終了します。")
     sys.exit(1)
-
-# --- Flaskアプリケーションの初期化 ---
 app = Flask(__name__)
 CORS(app)
-
-# --- サービス初期化 ---
 groq_client = None
 try:
     groq_client = Groq(api_key=GROQ_API_KEY)
@@ -76,7 +73,6 @@ try:
     logger.info("✅ Groq APIクライアントの初期化に成功しました。")
 except Exception as e:
     logger.error(f"❌ Groq APIクライアントの初期化に失敗: {e}")
-
 engine = None
 Session = None
 Base = declarative_base()
@@ -86,7 +82,6 @@ class UserMemory(Base):
     user_uuid = Column(String(255), unique=True, nullable=False, index=True)
     user_name = Column(String(255), nullable=False)
     interaction_count = Column(Integer, default=0)
-
 try:
     engine = create_engine(DATABASE_URL)
     Base.metadata.create_all(engine)
@@ -95,13 +90,9 @@ try:
 except Exception as e:
     logger.critical(f"FATAL: データベース接続に失敗: {e}")
     sys.exit(1)
-
 class UserDataContainer:
     def __init__(self, user_uuid, user_name, interaction_count):
-        self.user_uuid = user_uuid
-        self.user_name = user_name
-        self.interaction_count = interaction_count
-
+        self.user_uuid, self.user_name, self.interaction_count = user_uuid, user_name, interaction_count
 def get_or_create_user(user_uuid, user_name):
     session = Session()
     try:
@@ -112,11 +103,7 @@ def get_or_create_user(user_uuid, user_name):
             user_memory = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
             session.add(user_memory)
         session.commit()
-        return UserDataContainer(
-            user_uuid=user_memory.user_uuid,
-            user_name=user_memory.user_name,
-            interaction_count=user_memory.interaction_count
-        )
+        return UserDataContainer(user_uuid=user_memory.user_uuid, user_name=user_memory.user_name, interaction_count=user_memory.interaction_count)
     except Exception as e:
         logger.error(f"ユーザーデータ処理エラー: {e}")
         session.rollback()
@@ -126,55 +113,58 @@ def get_or_create_user(user_uuid, user_name):
 
 # --- ビジネスロジック ---
 def generate_ai_response(user_data, message):
-    if not groq_client: return f"{user_data.user_name}さん、こんにちは！"
-    system_prompt = f"あなたは「もちこ」というAIです。親友の{user_data.user_name}さんと丁寧な言葉でで話します。日本語でフレンドリーな返事を60文字程度で生成してください。語尾は「ですわ」「ますわ」、一人称は「あてぃし」"
+    if not groq_client: return f"{user_data.user_name}さん、こんにちはですよ！"
+    system_prompt = f"あなたは「もちこ」というAIです。親友の{user_data.user_name}さんとお嬢様言葉で話します。日本語でフレンドリーな返事を60文字程度で生成してください。語尾は「ですよ」「ますよ」、一人称は「あてぃし」"
     try:
-        completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "元気？"}], model="llama3-8b-8192")
+        completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "ごきげんよう"}], model="llama3-8b-8192")
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
-        return "ごめん、ちょっと考え事してた！"
+        return "ごめんなさいまし、今少し考えがまとまりませんの…。"
 
-# ▼▼▼【ここが修正点】▼▼▼
+# ▼▼▼【ここが最後の修正点】▼▼▼
 def generate_voice(text, speaker_id=3):
-    """テキストから音声を生成します。タイムアウト値を延長。"""
+    """テキストから音声を生成します。タイムアウトを30秒に延長し、ロギングを強化。"""
     if not WORKING_VOICEVOX_URL:
         return None
+    
     try:
-        # audio_queryのタイムアウトを15秒に延長
+        # ステップ1: audio_query
+        logger.info(f"🔄 audio_queryリクエスト開始: '{text[:20]}...'")
         res_query = requests.post(
             f"{WORKING_VOICEVOX_URL}/audio_query",
             params={'text': text, 'speaker': speaker_id},
-            timeout=15
+            timeout=30  # タイムアウトを30秒に延長
         )
         res_query.raise_for_status()
+        logger.info("✅ audio_queryリクエスト成功！")
         
-        # synthesisのタイムアウトも15秒に延長
+        # ステップ2: synthesis
+        logger.info("🔄 synthesisリクエスト開始...")
         res_synth = requests.post(
             f"{WORKING_VOICEVOX_URL}/synthesis",
             params={'speaker': speaker_id},
             json=res_query.json(),
-            timeout=15
+            timeout=30  # タイムアウトを30秒に延長
         )
         res_synth.raise_for_status()
+        logger.info("✅ synthesisリクエスト成功！音声データを返します。")
         
-        logger.info(f"✅ 音声合成成功: '{text[:20]}...'")
         return res_synth.content
         
     except requests.exceptions.Timeout:
-        logger.error(f"⏰ VOICEVOX音声合成がタイムアウトしました（{15}秒）。")
+        logger.error(f"⏰ VOICEVOX音声合成がタイムアウトしました（30秒）。Renderのインスタンス性能が原因の可能性があります。")
         return None
     except Exception as e:
         logger.error(f"❌ VOICEVOX音声合成で予期せぬエラー: {e}")
         return None
 # ▲▲▲【修正はここまで】▲▲▲
 
-
-# --- APIエンドポイント ---
+# (APIエンドポイントは変更なし)
+# ... (前と同じコード) ...
 @app.route('/')
 def index():
     return "<h1>AI Chat API</h1><p>Service is running.</p>"
-
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     logger.info("✅ /chat_lsl エンドポイントへのリクエストを受信しました。")
@@ -197,16 +187,12 @@ def chat_lsl():
     except Exception as e:
         logger.error(f"LSLチャットエンドポイントで予期せぬエラー: {e}")
         return "Error: Internal server error", 500
-
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     return send_from_directory('/tmp', filename)
-
 @app.route('/health')
 def health_check():
     return jsonify({'status': 'healthy', 'voicevox': 'available' if WORKING_VOICEVOX_URL else 'unavailable'})
-
-# --- アプリケーションの実行 ---
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🚀 Flaskアプリケーションをポート {port} で起動します...")
