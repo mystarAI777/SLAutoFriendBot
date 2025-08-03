@@ -3,7 +3,7 @@ import requests
 import logging
 import sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, safe_join
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -15,7 +15,9 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Secret Fileからの設定読み込み ---
+# --- ▼▼▼ Secret Fileからの設定読み込み ▼▼▼ ---
+
+# --- DATABASE_URL ---
 DATABASE_URL = None
 DATABASE_URL_SECRET_FILE = '/etc/secrets/DATABASE_URL'
 try:
@@ -23,8 +25,10 @@ try:
         DATABASE_URL = f.read().strip()
     logger.info("Secret FileからDATABASE_URLを読み込みました。")
 except FileNotFoundError:
+    logger.warning(f"Secret File '{DATABASE_URL_SECRET_FILE}' が見つかりません。環境変数を試します。")
     DATABASE_URL = os.environ.get('DATABASE_URL')
 
+# --- GROQ_API_KEY ---
 GROQ_API_KEY = None
 GROQ_API_KEY_SECRET_FILE = '/etc/secrets/GROQ_API_KEY'
 try:
@@ -36,7 +40,21 @@ except FileNotFoundError:
 except Exception as e:
     logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
 
-VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
+# --- 【修正箇所】VOICEVOX_URL ---
+VOICEVOX_URL = 'http://localhost:50021' # デフォルト値を設定
+VOICEVOX_URL_SECRET_FILE = '/etc/secrets/VOICEVOX_URL'
+try:
+    with open(VOICEVOX_URL_SECRET_FILE, 'r') as f:
+        VOICEVOX_URL = f.read().strip()
+    logger.info("Secret FileからVOICEVOX_URLを読み込みました。")
+except FileNotFoundError:
+    logger.warning(f"Secret File '{VOICEVOX_URL_SECRET_FILE}' が見つかりません。環境変数またはデフォルト値を使用します。")
+    VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
+except Exception as e:
+    logger.error(f"VOICEVOX_URLの読み込み中に予期せぬエラー: {e}")
+
+# --- ▲▲▲ 設定読み込みはここまで ▲▲▲ ---
+
 
 # --- 必須変数のチェック ---
 if not DATABASE_URL:
@@ -89,7 +107,6 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 logger.info(f"データベース接続が完了しました。URL: {DATABASE_URL[:20]}...")
 
-# (UserDataContainer, get_or_create_user, generate_ai_response, generate_voice などの関数定義は省略...内容は変更なし)
 class UserDataContainer:
     def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='',
                  interaction_count=0, created_at=None, last_interaction=None):
@@ -172,55 +189,44 @@ def chat():
         logger.error(f"チャットエラー: {e}")
         return jsonify(error='Internal server error'), 500
 
-# --- ▼▼▼ 【ここからが追加した修正箇所です】 ▼▼▼ ---
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
-    """LSLクライアント専用の、シンプルなテキスト形式で応答を返すエンドポイント"""
     try:
         data = request.json
-        # LSL script v4.1 からは 'uuid' と 'name' で送られてくる
         user_uuid = data.get('uuid')
         user_name = data.get('name')
         message = data.get('message', '')
-
-        if not user_uuid or not user_name:
-            return "Error: user_uuid and user_name are required", 400
-
+        if not user_uuid or not user_name: return "Error: user_uuid and user_name are required", 400
         user_data = get_or_create_user(user_uuid, user_name)
-        if not user_data:
-            return "Error: Failed to get user data", 500
-
+        if not user_data: return "Error: Failed to get user data", 500
         ai_response = generate_ai_response(user_data, message)
         voice_data = generate_voice(ai_response)
-
-        audio_url_part = "" # デフォルトは空文字列
+        audio_url_part = ""
         if voice_data:
             voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
             voice_path = os.path.join('/tmp', voice_filename)
-            with open(voice_path, 'wb') as f:
-                f.write(voice_data)
+            with open(voice_path, 'wb') as f: f.write(voice_data)
             audio_url_part = f'/voice/{voice_filename}'
-
-        # JSONではなく、パイプ区切りの単純な文字列を返す
-        # 形式: "応答テキスト|音声URL"
         response_text = f"{ai_response}|{audio_url_part}"
-        
-        # レスポンスのヘッダーを text/plain; charset=utf-8 に設定
-        response = app.response_class(
-            response=response_text,
-            status=200,
-            mimetype='text/plain; charset=utf-8'
-        )
+        response = app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
         return response
-
     except Exception as e:
         logger.error(f"LSLチャットエラー: {e}")
         return "Error: Internal server error", 500
-# --- ▲▲▲ 修正はここまでです ▲▲▲ ---
 
 @app.route('/voice/<filename>')
 def serve_voice(filename):
-    return send_from_directory('/tmp', filename)
+    directory = '/tmp'
+    try:
+        safe_path = safe_join(directory, filename)
+        if os.path.exists(safe_path):
+            return send_from_directory(directory, filename)
+        else:
+            logger.error(f"音声ファイルが見つかりません: {safe_path}")
+            return "File not found", 404
+    except Exception as e:
+        logger.error(f"音声ファイル提供エラー: {e}")
+        return "Server error", 500
 
 @app.route('/health')
 def health_check():
