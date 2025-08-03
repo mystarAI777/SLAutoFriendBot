@@ -19,30 +19,36 @@ set -e\n\
 URLS=(\n\
     "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.1/linux-cpu.zip"\n\
     "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.0/linux-cpu.zip"\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.3/linux-cpu.zip"\n\
     "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.2/linux-cpu.zip"\n\
     "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.1/linux-cpu.zip"\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.0/linux-cpu.zip"\n\
 )\n\
 \n\
 for url in "${URLS[@]}"; do\n\
-    echo "Trying to download from: $url"\n\
-    if wget -O voicevox-engine.zip "$url"; then\n\
+    echo "🔄 Trying to download from: $url"\n\
+    if wget -q --timeout=30 --tries=2 -O voicevox-engine.zip "$url" 2>/dev/null; then\n\
         echo "✅ Download successful from: $url"\n\
-        unzip voicevox-engine.zip\n\
-        rm voicevox-engine.zip\n\
-        mv linux-cpu voicevox-engine\n\
-        chmod +x voicevox-engine/run\n\
-        echo "✅ VOICEVOX engine setup complete"\n\
-        exit 0\n\
-    else\n\
-        echo "❌ Failed to download from: $url"\n\
-        rm -f voicevox-engine.zip\n\
+        if unzip -q voicevox-engine.zip; then\n\
+            rm voicevox-engine.zip\n\
+            if [ -d "linux-cpu" ]; then\n\
+                mv linux-cpu voicevox-engine\n\
+                chmod +x voicevox-engine/run\n\
+                echo "✅ VOICEVOX engine setup complete"\n\
+                ls -la voicevox-engine/\n\
+                exit 0\n\
+            fi\n\
+        fi\n\
     fi\n\
+    echo "❌ Failed to download/extract from: $url"\n\
+    rm -f voicevox-engine.zip\n\
+    rm -rf linux-cpu\n\
 done\n\
 \n\
-echo "❌ All download attempts failed. Creating dummy engine..."\n\
+echo "❌ All download attempts failed. App will run without voice support."\n\
 mkdir -p voicevox-engine\n\
 echo "#!/bin/bash" > voicevox-engine/run\n\
-echo "echo \"VOICEVOX engine not available - running in no-voice mode\"" >> voicevox-engine/run\n\
+echo "echo \\"VOICEVOX engine not available\\"" >> voicevox-engine/run\n\
 echo "exit 1" >> voicevox-engine/run\n\
 chmod +x voicevox-engine/run\n\
 exit 0\n\
