@@ -3,12 +3,10 @@ import requests
 import logging
 import sys
 from datetime import datetime
-# ▼▼▼【修正点1】safe_joinを削除 ▼▼▼
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
+from sqlalchemy import create_engine, Column, String, DateTime, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.pool import StaticPool
 from groq import Groq
 from openai import OpenAI
 
@@ -42,18 +40,52 @@ except Exception as e:
     logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
 
 # --- VOICEVOX_URL ---
-VOICEVOX_URL = 'http://localhost:50021' # デフォルト値を設定
+# ▼▼▼【修正点】複数のVOICEVOX URLを試行する設定 ▼▼▼
+VOICEVOX_URLS = [
+    'http://localhost:50021',        # ローカル環境
+    'http://voicevox-engine:50021',  # Docker Compose環境
+    'http://voicevox:50021',         # 別のDocker名
+    'http://127.0.0.1:50021'         # ローカルループバック
+]
+
+VOICEVOX_URL = None
 VOICEVOX_URL_SECRET_FILE = '/etc/secrets/VOICEVOX_URL'
 try:
     with open(VOICEVOX_URL_SECRET_FILE, 'r') as f:
         VOICEVOX_URL = f.read().strip()
     logger.info("Secret FileからVOICEVOX_URLを読み込みました。")
 except FileNotFoundError:
-    logger.warning(f"Secret File '{VOICEVOX_URL_SECRET_FILE}' が見つかりません。環境変数またはデフォルト値を使用します。")
-    VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
-except Exception as e:
-    logger.error(f"VOICEVOX_URLの読み込み中に予期せぬエラー: {e}")
+    logger.warning(f"Secret File '{VOICEVOX_URL_SECRET_FILE}' が見つかりません。環境変数を試します。")
+    VOICEVOX_URL = os.environ.get('VOICEVOX_URL')
 
+# VOICEVOX接続テスト
+def find_working_voicevox_url():
+    """利用可能なVOICEVOX URLを見つける"""
+    urls_to_test = []
+    
+    # Secret Fileまたは環境変数で指定されたURLがあれば最初に試す
+    if VOICEVOX_URL:
+        urls_to_test.append(VOICEVOX_URL)
+    
+    # その後、デフォルトのURLリストを試す
+    urls_to_test.extend([url for url in VOICEVOX_URLS if url != VOICEVOX_URL])
+    
+    for url in urls_to_test:
+        try:
+            response = requests.get(f"{url}/version", timeout=3)
+            if response.status_code == 200:
+                logger.info(f"VOICEVOX接続成功: {url}")
+                return url
+        except Exception as e:
+            logger.debug(f"VOICEVOX接続失敗: {url} - {e}")
+            continue
+    
+    logger.warning("利用可能なVOICEVOXエンジンが見つかりませんでした。音声機能は無効になります。")
+    return None
+
+# 起動時にVOICEVOX接続をテスト
+WORKING_VOICEVOX_URL = find_working_voicevox_url()
+# ▲▲▲【修正はここまで】▲▲▲
 
 # --- 必須変数のチェック ---
 if not DATABASE_URL:
@@ -154,16 +186,44 @@ def generate_ai_response(user_data, message=""):
         logger.error(f"AI応答生成エラー: {e}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 
+# ▼▼▼【修正点】VOICEVOX接続の改善 ▼▼▼
 def generate_voice(text, speaker_id=1):
+    """音声を生成する（改善版）"""
+    if not WORKING_VOICEVOX_URL:
+        logger.warning("VOICEVOXエンジンが利用できないため、音声生成をスキップします。")
+        return None
+    
     try:
-        audio_query_response = requests.post(f"{VOICEVOX_URL}/audio_query", params={"text": text, "speaker": speaker_id})
+        # タイムアウトを短くしてレスポンスを改善
+        audio_query_response = requests.post(
+            f"{WORKING_VOICEVOX_URL}/audio_query", 
+            params={"text": text, "speaker": speaker_id},
+            timeout=10  # 10秒でタイムアウト
+        )
         audio_query_response.raise_for_status()
-        synthesis_response = requests.post(f"{VOICEVOX_URL}/synthesis", headers={"Content-Type": "application/json"}, params={"speaker": speaker_id}, json=audio_query_response.json())
+        
+        synthesis_response = requests.post(
+            f"{WORKING_VOICEVOX_URL}/synthesis", 
+            headers={"Content-Type": "application/json"}, 
+            params={"speaker": speaker_id}, 
+            json=audio_query_response.json(),
+            timeout=10  # 10秒でタイムアウト
+        )
         synthesis_response.raise_for_status()
+        
+        logger.info(f"音声生成成功: テキスト長={len(text)}, 音声データサイズ={len(synthesis_response.content)}")
         return synthesis_response.content
+        
+    except requests.exceptions.ConnectTimeout:
+        logger.error(f"VOICEVOX接続タイムアウト: {WORKING_VOICEVOX_URL}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"VOICEVOX接続エラー: {e}")
+        return None
     except Exception as e:
         logger.error(f"音声生成エラー: {e}")
         return None
+# ▲▲▲【修正はここまで】▲▲▲
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
@@ -206,6 +266,9 @@ def chat_lsl():
             voice_path = os.path.join('/tmp', voice_filename)
             with open(voice_path, 'wb') as f: f.write(voice_data)
             audio_url_part = f'/voice/{voice_filename}'
+            logger.info(f"音声ファイル生成成功: {audio_url_part}")
+        else:
+            logger.warning("音声データの生成に失敗しました")
         response_text = f"{ai_response}|{audio_url_part}"
         response = app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
         return response
@@ -213,14 +276,11 @@ def chat_lsl():
         logger.error(f"LSLチャットエラー: {e}")
         return "Error: Internal server error", 500
 
-# ▼▼▼【修正点2】safe_join を使わない形に修正 ▼▼▼
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     directory = '/tmp'
-    # send_from_directoryはセキュリティ機能を含むため、これで安全
     try:
         filepath = os.path.join(directory, filename)
-        # ファイルの存在を確認してから送信する
         if os.path.exists(filepath):
             return send_from_directory(directory, filename)
         else:
@@ -229,11 +289,38 @@ def serve_voice(filename):
     except Exception as e:
         logger.error(f"音声ファイル提供エラー: {e}")
         return "Server error", 500
-# ▲▲▲ 修正はここまで ▲▲▲
+
+# ▼▼▼【追加】VOICEVOX状態確認エンドポイント ▼▼▼
+@app.route('/voicevox_status')
+def voicevox_status():
+    """VOICEVOXエンジンの状態を確認する"""
+    if WORKING_VOICEVOX_URL:
+        try:
+            response = requests.get(f"{WORKING_VOICEVOX_URL}/version", timeout=5)
+            if response.status_code == 200:
+                return jsonify({
+                    'status': 'available',
+                    'url': WORKING_VOICEVOX_URL,
+                    'version': response.json()
+                })
+        except Exception as e:
+            logger.error(f"VOICEVOX状態確認エラー: {e}")
+    
+    return jsonify({
+        'status': 'unavailable',
+        'url': WORKING_VOICEVOX_URL,
+        'message': 'VOICEVOXエンジンに接続できません'
+    })
+# ▲▲▲【追加はここまで】▲▲▲
 
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.utcnow().isoformat(),
+        'voicevox_available': WORKING_VOICEVOX_URL is not None,
+        'voicevox_url': WORKING_VOICEVOX_URL
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
