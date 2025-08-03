@@ -8,8 +8,7 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
-from groq import Groq # <-- Geminiの代わりにGroqをインポート
-# OpenAIクライアントも併用（バックアップ用）
+from groq import Groq
 from openai import OpenAI
 
 # ログ設定
@@ -26,35 +25,32 @@ try:
 except FileNotFoundError:
     DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# --- ▼▼▼ 【最重要修正箇所】GroqのAPIキーを読み込む ▼▼▼ ---
-raw_groq_key = os.environ.get('GROQ_API_KEY')
+# --- ▼▼▼ 【最重要修正箇所】GroqのAPIキーを Secret File から読み込むように変更 ▼▼▼ ---
+raw_groq_key = None
+GROQ_API_KEY_SECRET_FILE = '/etc/secrets/GROQ_API_KEY' # RenderのSecret Fileのパス
 
-# =======================================================
-# ▼▼▼【ここからが追加したデバッグコードです】▼▼▼
-if raw_groq_key:
-    # 取得したキーの長さと、先頭・末尾の数文字をログに出力してみる
-    logger.info("環境変数からGROQ_API_KEYを読み込みました。")
-    logger.info(f"キーの長さ: {len(raw_groq_key)}")
-    logger.info(f"キーの先頭: '{raw_groq_key[:5]}'") # シングルクォートで囲む
-    logger.info(f"キーの末尾: '{raw_groq_key[-4:]}'") # シングルクォートで囲む
-    
-    # .strip()の効果を確認する
-    stripped_key = raw_groq_key.strip()
-    if len(raw_groq_key) != len(stripped_key):
-        logger.warning("キーの前後に空白文字がありました！ .strip()で除去します。")
-        logger.info(f"除去後のキーの長さ: {len(stripped_key)}")
+try:
+    # まずSecret Fileを試す
+    with open(GROQ_API_KEY_SECRET_FILE, 'r') as f:
+        raw_groq_key = f.read().strip()
+    logger.info("Secret FileからGROQ_API_KEYを読み込みました。")
 
-else:
-    logger.error("環境変数'GROQ_API_KEY'が見つかりませんでした。")
-# ▲▲▲【デバッグコードはここまでです】▲▲▲
-# =======================================================
+except FileNotFoundError:
+    # Secret Fileがなければ、念のため環境変数をフォールバックで試す
+    logger.warning("Secret Fileが見つかりません。環境変数GROQ_API_KEYを試します。")
+    raw_groq_key = os.environ.get('GROQ_API_KEY')
+
+except Exception as e:
+    logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
+
 
 if raw_groq_key:
     GROQ_API_KEY = raw_groq_key.strip()
-    logger.info(f"GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}...")
+    # キーが読み込めたことを確認するログ
+    logger.info(f"GROQ_API_KEYの読み込みに成功しました。長さ: {len(GROQ_API_KEY)}")
 else:
     GROQ_API_KEY = None
-    logger.error("GROQ_API_KEY環境変数が見つかりません")
+    logger.error("GROQ_API_KEYをSecret Fileまたは環境変数から読み込めませんでした。")
 # --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
@@ -71,7 +67,7 @@ if not GROQ_API_KEY:
 app = Flask(__name__)
 
 # CORS設定を追加
-CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"], 
+CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization"])
 
 # --- ▼▼▼ Groqクライアントの初期設定 ▼▼▼ ---
@@ -82,7 +78,7 @@ try:
     )
     use_openai_compatible = False
     logger.info("Groq native クライアントの初期設定が完了しました。")
-    
+
     # APIキーの簡単な検証
     try:
         test_response = groq_client.chat.completions.create(
@@ -94,7 +90,7 @@ try:
     except Exception as auth_error:
         logger.error(f"Groq APIキーの検証に失敗: {auth_error}")
         raise auth_error
-        
+
 except Exception as groq_error:
     logger.warning(f"Groq nativeクライアントでエラー: {groq_error}")
     try:
@@ -105,7 +101,7 @@ except Exception as groq_error:
         )
         use_openai_compatible = True
         logger.info("Groq OpenAI互換クライアントの初期設定が完了しました。")
-        
+
         # APIキーの検証
         try:
             test_response = groq_client.chat.completions.create(
@@ -117,7 +113,7 @@ except Exception as groq_error:
         except Exception as auth_error:
             logger.error(f"Groq OpenAI互換APIキーの検証に失敗: {auth_error}")
             raise auth_error
-            
+
     except Exception as openai_error:
         logger.error(f"OpenAI互換クライアントでもエラー: {openai_error}")
         logger.error("APIキーを確認してください。フォールバックモードで起動します。")
@@ -129,7 +125,7 @@ Base = declarative_base()
 
 class UserMemory(Base):
     __tablename__ = 'user_memories'
-    
+
     id = Column(Integer, primary_key=True)
     user_uuid = Column(String(255), unique=True, nullable=False)
     user_name = Column(String(255), nullable=False)
@@ -155,9 +151,9 @@ try:
         except ImportError:
             logger.error("PostgreSQLドライバーが見つかりません。SQLiteにフォールバックします。")
             DATABASE_URL = 'sqlite:///./app.db'
-    
+
     engine = create_engine(DATABASE_URL)
-    
+
     # データベースマイグレーション処理
     def migrate_database():
         logger.info("データベースマイグレーションを開始します...")
@@ -167,13 +163,13 @@ try:
                 result = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name = 'user_memories'"))
                 existing_columns = [row[0] for row in result.fetchall()]
                 logger.info(f"既存のカラム: {existing_columns}")
-                
+
                 # 必要なカラムを追加
                 required_columns = {
                     'created_at': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
                     'last_interaction': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
                 }
-                
+
                 for column_name, column_def in required_columns.items():
                     if column_name not in existing_columns:
                         try:
@@ -182,9 +178,9 @@ try:
                             logger.info(f"カラム '{column_name}' を追加しました。")
                         except Exception as e:
                             logger.warning(f"カラム '{column_name}' の追加でエラー: {e}")
-                
+
                 logger.info("データベースマイグレーションが完了しました。")
-                
+
             except Exception as e:
                 logger.warning(f"PostgreSQLのマイグレーションでエラー: {e}")
                 # SQLiteの場合の処理
@@ -193,19 +189,19 @@ try:
                     logger.info("SQLiteテーブルの確認完了")
                 except Exception as sqlite_error:
                     logger.warning(f"SQLiteでもエラー: {sqlite_error}")
-    
+
     # まずテーブルを作成
     Base.metadata.create_all(engine)
-    
+
     # 既存テーブルがある場合はマイグレーションを実行
     try:
         migrate_database()
     except Exception as migration_error:
         logger.warning(f"マイグレーション処理をスキップ: {migration_error}")
-    
+
     Session = sessionmaker(bind=engine)
     logger.info(f"データベース接続が完了しました。URL: {DATABASE_URL[:20]}...")
-    
+
 except Exception as e:
     logger.error(f"データベース接続エラー: {e}")
     logger.error("SQLiteにフォールバックします。")
@@ -220,7 +216,7 @@ except Exception as e:
         sys.exit(1)
 
 class UserDataContainer:
-    def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='', 
+    def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='',
                  interaction_count=0, created_at=None, last_interaction=None):
         self.user_uuid = user_uuid
         self.user_name = user_name
@@ -234,13 +230,13 @@ def get_or_create_user(user_uuid, user_name):
     session = Session()
     try:
         user_memory = session.query(UserMemory).filter(UserMemory.user_uuid == user_uuid).first()
-        
+
         if user_memory:
             # 既存ユーザーの場合、交流回数を増やして最終交流日時を更新
             user_memory.interaction_count += 1
             user_memory.last_interaction = datetime.utcnow()
             session.commit()
-            
+
             user_data = UserDataContainer(
                 user_uuid=user_memory.user_uuid,
                 user_name=user_memory.user_name,
@@ -263,7 +259,7 @@ def get_or_create_user(user_uuid, user_name):
             )
             session.add(new_user)
             session.commit()
-            
+
             user_data = UserDataContainer(
                 user_uuid=user_uuid,
                 user_name=user_name,
@@ -273,13 +269,13 @@ def get_or_create_user(user_uuid, user_name):
                 created_at=new_user.created_at,
                 last_interaction=new_user.last_interaction
             )
-        
+
         return user_data
-        
+
     except Exception as e:
         logger.error(f"ユーザーデータの取得/作成エラー: {e}")
         session.rollback()
-        
+
         # データベースエラーの場合、一時的なユーザーデータを作成
         fallback_user_data = UserDataContainer(
             user_uuid=user_uuid,
@@ -292,18 +288,17 @@ def get_or_create_user(user_uuid, user_name):
         )
         logger.warning(f"フォールバックユーザーデータを作成: {user_name}")
         return fallback_user_data
-        
+
     finally:
         session.close()
 
-# --- ▼▼▼ 【最重要修正箇所】AI応答生成をGroqで行う ▼▼▼ ---
 def generate_ai_response(user_data, message=""):
     """Groq AI (Llama 3)を使って応答を生成"""
-    
+
     # Groqクライアントが利用できない場合のフォールバック
     if groq_client is None:
         return f"こんにちは、{user_data.user_name}さん！現在システムメンテナンス中ですが、お話しできて嬉しいです。"
-    
+
     # AIに渡す「役割設定」と「過去の状況」
     system_prompt = ""
     if user_data.interaction_count == 1:
@@ -319,7 +314,7 @@ def generate_ai_response(user_data, message=""):
         situation = "継続的な会話"
         if days_since_last > 7: situation = "久しぶりの再会"
         elif days_since_last > 1: situation = "数日ぶりの再会"
-        
+
         system_prompt = f"""
 あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。{user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。
 状況: {situation}。
@@ -329,11 +324,11 @@ def generate_ai_response(user_data, message=""):
 - 敬語は使わず、親しみやすい「タメ口」で話します。
 - 過去の会話を覚えている、親しい友人として振る舞います。
 """
-    
+
     try:
         # Groq API呼び出しの詳細ログ
         logger.info(f"Groq API呼び出し開始 - User: {user_data.user_name}, Model: llama3-8b-8192")
-        
+
         # クライアントの種類に応じて適切なメソッドを使用
         if use_openai_compatible:
             # OpenAI互換クライアント使用
@@ -344,7 +339,7 @@ def generate_ai_response(user_data, message=""):
                         "content": system_prompt,
                     },
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": message or "こんにちは",
                     }
                 ],
@@ -361,7 +356,7 @@ def generate_ai_response(user_data, message=""):
                         "content": system_prompt,
                     },
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": message or "こんにちは",
                     }
                 ],
@@ -369,22 +364,21 @@ def generate_ai_response(user_data, message=""):
                 temperature=0.7,
                 max_tokens=150,
             )
-        
+
         response_text = chat_completion.choices[0].message.content
         logger.info(f"Groq API呼び出し成功 - Response length: {len(response_text)}")
         return response_text.strip()
-        
+
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
         logger.error(f"エラータイプ: {type(e).__name__}")
         logger.error(f"エラー詳細: {str(e)}")
-        
+
         # エラータイプに応じたフォールバック応答
         if "401" in str(e) or "Invalid API Key" in str(e):
             return f"{user_data.user_name}さん、こんにちは！今ちょっとシステムの調子が悪いみたい。でもお話しできて嬉しいよ！"
         else:
             return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
-# --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 def generate_voice(text, speaker_id=1):
     """VOICEVOX APIを使って音声を生成する"""
@@ -396,16 +390,16 @@ def generate_voice(text, speaker_id=1):
         )
         audio_query_response.raise_for_status()
         audio_query = audio_query_response.json()
-        
+
         # 音声を合成
         synthesis_response = requests.post(
-            f"{VOICEVOX_URL}/synthesis", 
+            f"{VOICEVOX_URL}/synthesis",
             headers={"Content-Type": "application/json"},
             params={"speaker": speaker_id},
             json=audio_query
         )
         synthesis_response.raise_for_status()
-        
+
         return synthesis_response.content
     except Exception as e:
         logger.error(f"音声生成エラー: {e}")
@@ -420,7 +414,7 @@ def chat():
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
         return response
-    
+
     try:
         data = request.json
         if not data:
@@ -428,53 +422,52 @@ def chat():
             response = jsonify({'error': 'JSON data is required'})
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response, 400
-        
+
         # LSLスクリプトからの古い形式と新しい形式の両方に対応
         user_uuid = data.get('user_uuid') or data.get('uuid')
         user_name = data.get('user_name') or data.get('name')
         message = data.get('message', '')
-        
+
         logger.info(f"受信データ: user_uuid={user_uuid}, user_name={user_name}, message={message}")
-        
+
         if not user_uuid or not user_name:
             logger.error(f"必須パラメータが不足: user_uuid={user_uuid}, user_name={user_name}")
             response = jsonify({'error': 'user_uuid and user_name are required'})
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response, 400
-            return jsonify({'error': 'user_uuid and user_name are required'}), 400
-        
+
         # ユーザーデータの取得または作成
         user_data = get_or_create_user(user_uuid, user_name)
         if not user_data:
             return jsonify({'error': 'Failed to get user data'}), 500
-        
+
         # AI応答の生成
         ai_response = generate_ai_response(user_data, message)
-        
+
         # 音声生成
         voice_data = generate_voice(ai_response)
-        
+
         # LSL互換の応答形式
         response_data = {
-            'text': ai_response,  # LSLスクリプトが期待する形式
-            'response': ai_response,  # 既存のクライアント用
+            'text': ai_response,
+            'response': ai_response,
             'interaction_count': user_data.interaction_count,
             'has_voice': voice_data is not None
         }
-        
+
         if voice_data:
-            # 音声データを一時的に保存（実際の実装では適切な場所に保存）
+            # 音声データを一時的に保存
             voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
             voice_path = os.path.join('/tmp', voice_filename)
             with open(voice_path, 'wb') as f:
                 f.write(voice_data)
             response_data['voice_url'] = f'/voice/{voice_filename}'
-            response_data['audio_url'] = f'/voice/{voice_filename}'  # LSLスクリプト用
-        
+            response_data['audio_url'] = f'/voice/{voice_filename}'
+
         response = jsonify(response_data)
         response.headers.add('Access-Control-Allow-Origin', '*')
         return response
-        
+
     except Exception as e:
         logger.error(f"チャットエラー: {e}")
         response = jsonify({'error': 'Internal server error'})
