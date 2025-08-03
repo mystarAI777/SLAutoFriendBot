@@ -3,7 +3,7 @@ import requests
 import logging
 import sys
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, safe_join
+from flask import Flask, request, jsonify, send_from_directory # <- safe_join を削除
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -214,19 +214,20 @@ def chat_lsl():
         logger.error(f"LSLチャットエラー: {e}")
         return "Error: Internal server error", 500
 
+# --- ▼▼▼ 修正箇所 ▼▼▼ ---
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     directory = '/tmp'
     try:
-        safe_path = safe_join(directory, filename)
-        if os.path.exists(safe_path):
-            return send_from_directory(directory, filename)
-        else:
-            logger.error(f"音声ファイルが見つかりません: {safe_path}")
-            return "File not found", 404
+        # send_from_directoryが安全なファイル提供を処理してくれる
+        return send_from_directory(directory, filename)
+    except FileNotFoundError:
+        logger.error(f"音声ファイルが見つかりません: {os.path.join(directory, filename)}")
+        return "File not found", 404
     except Exception as e:
         logger.error(f"音声ファイル提供エラー: {e}")
         return "Server error", 500
+# --- ▲▲▲ 修正はここまで ▲▲▲ ---
 
 @app.route('/health')
 def health_check():
