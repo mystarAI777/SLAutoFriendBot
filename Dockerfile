@@ -16,9 +16,15 @@ COPY --from=voicevox /opt/voicevox_engine /opt/voicevox_engine
 # アプリケーションディレクトリ
 WORKDIR /app
 
+# ▼▼▼【ここから修正】▼▼▼
 # Python依存関係をインストール
+# ビルドに必要なライブラリを一時的にインストールし、完了後に削除する
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc libmariadb-dev && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apt-get purge -y --auto-remove gcc libmariadb-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # アプリケーションファイルをコピー
 COPY . .
