@@ -199,60 +199,66 @@ def generate_ai_response(user_data, message=""):
         logger.error(f"AI応答生成エラー: {e}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 
-# ▼▼▼【記事参考】VOICEVOX音声生成（最適化版） ▼▼▼
-def generate_voice(text, speaker_id=3):  # speaker_id=3でずんだもん（記事と同様）
-    """音声を生成する（記事のアプローチを参考にした版）"""
+# ▼▼▼【公式README参考】VOICEVOX音声生成（公式APIパターン準拠） ▼▼▼
+def generate_voice(text, speaker_id=1):  # デフォルトspeaker=1（公式例と同じ）
+    """音声を生成する（公式READMEのAPIパターンに準拠）"""
     if not WORKING_VOICEVOX_URL:
         logger.warning("VOICEVOXエンジンが利用できないため、音声生成をスキップします。")
         return None
     
-    # 記事と同様のアプローチ：文字数制限でパフォーマンス向上
-    if len(text) > 100:  # 記事では20文字程度が1秒以内、250文字で8秒だったため
+    # 公式READMEのパフォーマンス対策：長文は分割
+    if len(text) > 100:
         text = text[:100] + "..."
-        logger.info(f"テキストを100文字に制限しました: {text}")
+        logger.info(f"テキストを100文字に制限: {text[:30]}...")
     
     try:
-        # 記事と同じAPIパターン
-        host = WORKING_VOICEVOX_URL.replace('http://', '').replace('https://', '')
-        if ':' in host:
-            host = host.split(':')[0]
-        
-        # audio_queryでクエリ作成（記事と同様）
-        params = {
+        # 公式READMEと同じAPIパターン：2段階プロセス
+        # ステップ1: audio_query でクエリ作成
+        audio_query_params = {
             'text': text,
             'speaker': speaker_id
         }
         
+        logger.debug(f"🔄 VOICEVOX audio_query: {WORKING_VOICEVOX_URL}/audio_query")
         query_response = requests.post(
             f"{WORKING_VOICEVOX_URL}/audio_query",
-            params=params,
-            timeout=8  # 記事の結果を参考に8秒でタイムアウト
+            params=audio_query_params,
+            timeout=10
         )
         query_response.raise_for_status()
         
-        # synthesis で音声合成（記事と同様）
+        # ステップ2: synthesis で音声合成
+        synthesis_params = {'speaker': speaker_id}
+        
+        logger.debug(f"🔄 VOICEVOX synthesis: {WORKING_VOICEVOX_URL}/synthesis")
         synthesis_response = requests.post(
             f"{WORKING_VOICEVOX_URL}/synthesis",
             headers={"Content-Type": "application/json"},
-            params={'speaker': speaker_id},
-            json=query_response.json(),  # 記事ではjson.dumps()していたが、requestsのjsonパラメーターを使用
-            timeout=8
+            params=synthesis_params,
+            json=query_response.json(),  # 公式READMEと同じパターン
+            timeout=15  # synthesisは時間がかかる場合があるため少し長めに
         )
         synthesis_response.raise_for_status()
         
-        logger.info(f"✅ VOICEVOX音声生成成功: テキスト='{text[:20]}...', データサイズ={len(synthesis_response.content)}bytes")
+        # 成功ログ（サンプリングレート情報も含める）
+        audio_size = len(synthesis_response.content)
+        logger.info(f"✅ VOICEVOX音声合成成功: テキスト='{text[:30]}...', サイズ={audio_size}bytes, サンプリングレート=24000Hz")
+        
         return synthesis_response.content
         
-    except requests.exceptions.Timeout:
-        logger.error(f"⏰ VOICEVOX音声生成タイムアウト（8秒超過）: テキスト長={len(text)}")
+    except requests.exceptions.Timeout as e:
+        logger.error(f"⏰ VOICEVOX音声合成タイムアウト: {e}")
+        return None
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"🌐 VOICEVOX HTTP エラー: {e.response.status_code} - {e}")
         return None
     except requests.exceptions.ConnectionError as e:
         logger.error(f"🔌 VOICEVOX接続エラー: {e}")
         return None
     except Exception as e:
-        logger.error(f"❌ VOICEVOX音声生成エラー: {e}")
+        logger.error(f"❌ VOICEVOX音声合成予期せぬエラー: {e}")
         return None
-# ▲▲▲【記事参考版はここまで】▲▲▲
+# ▲▲▲【公式README準拠版はここまで】▲▲▲
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
