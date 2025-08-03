@@ -2,6 +2,7 @@ import os
 import requests
 import logging
 import sys
+import time
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -40,12 +41,14 @@ except Exception as e:
     logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
 
 # --- VOICEVOX_URL ---
-# ▼▼▼【修正点】複数のVOICEVOX URLを試行する設定 ▼▼▼
+# ▼▼▼【修正点】より包括的なVOICEVOX URL候補と接続改善 ▼▼▼
 VOICEVOX_URLS = [
     'http://localhost:50021',        # ローカル環境
+    'http://127.0.0.1:50021',        # ローカルループバック
+    'http://0.0.0.0:50021',          # 全インターフェース
     'http://voicevox-engine:50021',  # Docker Compose環境
     'http://voicevox:50021',         # 別のDocker名
-    'http://127.0.0.1:50021'         # ローカルループバック
+    'http://host.docker.internal:50021',  # Docker Desktop環境
 ]
 
 VOICEVOX_URL = None
@@ -58,9 +61,9 @@ except FileNotFoundError:
     logger.warning(f"Secret File '{VOICEVOX_URL_SECRET_FILE}' が見つかりません。環境変数を試します。")
     VOICEVOX_URL = os.environ.get('VOICEVOX_URL')
 
-# VOICEVOX接続テスト
+# VOICEVOX接続テスト（改善版）
 def find_working_voicevox_url():
-    """利用可能なVOICEVOX URLを見つける（公式README準拠のテスト）"""
+    """利用可能なVOICEVOX URLを見つける（接続テスト強化版）"""
     urls_to_test = []
     
     # Secret Fileまたは環境変数で指定されたURLがあれば最初に試す
@@ -72,50 +75,114 @@ def find_working_voicevox_url():
     
     for url in urls_to_test:
         try:
-            # 公式READMEに従って /version エンドポイントをテスト
-            logger.debug(f"🔍 Testing VOICEVOX at: {url}")
-            version_response = requests.get(f"{url}/version", timeout=5)
+            logger.info(f"🔍 Testing VOICEVOX at: {url}")
+            
+            # ステップ1: バージョン確認（タイムアウト短縮）
+            version_response = requests.get(f"{url}/version", timeout=3)
             if version_response.status_code == 200:
                 version_info = version_response.json()
-                logger.info(f"✅ VOICEVOX接続成功: {url}")
+                logger.info(f"✅ VOICEVOX version確認成功: {url}")
                 logger.info(f"📋 Engine version: {version_info.get('version', 'unknown')}")
                 
-                # 追加テスト：公式READMEの /speakers エンドポイント
+                # ステップ2: スピーカー情報取得テスト
                 try:
                     speakers_response = requests.get(f"{url}/speakers", timeout=3)
                     if speakers_response.status_code == 200:
                         speakers = speakers_response.json()
                         speaker_count = len(speakers) if isinstance(speakers, list) else "unknown"
                         logger.info(f"📢 Available speakers: {speaker_count}")
+                        
+                        # ステップ3: 実際の音声合成テスト
+                        test_text = "テスト"
+                        try:
+                            # audio_queryテスト
+                            query_response = requests.post(
+                                f"{url}/audio_query",
+                                params={'text': test_text, 'speaker': 1},
+                                timeout=5
+                            )
+                            if query_response.status_code == 200:
+                                # synthesisテスト
+                                synthesis_response = requests.post(
+                                    f"{url}/synthesis",
+                                    headers={"Content-Type": "application/json"},
+                                    params={'speaker': 1},
+                                    json=query_response.json(),
+                                    timeout=10
+                                )
+                                if synthesis_response.status_code == 200:
+                                    audio_size = len(synthesis_response.content)
+                                    logger.info(f"🎵 音声合成テスト成功: {audio_size}bytes")
+                                    return url
+                                else:
+                                    logger.warning(f"⚠️ Synthesis failed: {synthesis_response.status_code}")
+                            else:
+                                logger.warning(f"⚠️ Audio query failed: {query_response.status_code}")
+                        except Exception as synthesis_error:
+                            logger.warning(f"⚠️ Synthesis test failed: {synthesis_error}")
+                            # バージョン確認が成功していればURLを返す（基本的な接続は可能）
+                            return url
                     else:
-                        logger.warning(f"⚠️  Speakers endpoint failed: {speakers_response.status_code}")
-                except Exception as e:
-                    logger.warning(f"⚠️  Speaker test failed: {e}")
+                        logger.warning(f"⚠️ Speakers endpoint failed: {speakers_response.status_code}")
+                        # バージョン確認が成功していればURLを返す
+                        return url
+                except Exception as speakers_error:
+                    logger.warning(f"⚠️ Speakers test failed: {speakers_error}")
+                    # バージョン確認が成功していればURLを返す
+                    return url
                 
-                return url
-                
+        except requests.exceptions.Timeout as e:
+            logger.debug(f"⏰ VOICEVOX接続タイムアウト: {url} - {e}")
+            continue
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"🔌 VOICEVOX接続エラー: {url} - {e}")
+            continue
         except Exception as e:
             logger.debug(f"❌ VOICEVOX接続失敗: {url} - {e}")
             continue
     
-    logger.warning("❌ 利用可能なVOICEVOXエンジンが見つかりませんでした。音声機能は無効になります。")
+    logger.error("❌ 利用可能なVOICEVOXエンジンが見つかりませんでした。")
+    logger.error("💡 解決方法:")
+    logger.error("1. VOICEVOXエンジンが起動しているか確認してください")
+    logger.error("2. Dockerで起動する場合: docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-ubuntu20.04-latest")
+    logger.error("3. ポート50021が利用可能か確認してください")
+    logger.error("4. ファイアウォールの設定を確認してください")
     return None
 
-# 起動時にVOICEVOX接続をテスト
-WORKING_VOICEVOX_URL = find_working_voicevox_url()
+# 起動時にVOICEVOX接続をテスト（リトライ機能付き）
+def initialize_voicevox_with_retry(max_retries=3, retry_delay=5):
+    """VOICEVOXの初期化をリトライ機能付きで実行"""
+    for attempt in range(max_retries):
+        logger.info(f"VOICEVOX初期化試行 {attempt + 1}/{max_retries}")
+        working_url = find_working_voicevox_url()
+        if working_url:
+            return working_url
+        
+        if attempt < max_retries - 1:
+            logger.info(f"⏳ {retry_delay}秒後にリトライします...")
+            time.sleep(retry_delay)
+    
+    return None
+
+WORKING_VOICEVOX_URL = initialize_voicevox_with_retry()
 
 # デバッグ情報をログに出力
 logger.info(f"設定されたVOICEVOX_URL: {VOICEVOX_URL}")
 logger.info(f"動作するVOICEVOX_URL: {WORKING_VOICEVOX_URL}")
 
-# DNS解決テスト
+# DNS解決テスト（強化版）
 import socket
-if VOICEVOX_URL and 'voicevox-engine' in VOICEVOX_URL:
-    try:
-        ip = socket.gethostbyname('voicevox-engine')
-        logger.info(f"DNS解決成功: voicevox-engine -> {ip}")
-    except socket.gaierror as e:
-        logger.error(f"DNS解決失敗: voicevox-engine -> {e}")
+def test_dns_resolution():
+    """DNS解決テスト"""
+    hostnames_to_test = ['voicevox-engine', 'voicevox', 'localhost', 'host.docker.internal']
+    for hostname in hostnames_to_test:
+        try:
+            ip = socket.gethostbyname(hostname)
+            logger.info(f"DNS解決成功: {hostname} -> {ip}")
+        except socket.gaierror as e:
+            logger.debug(f"DNS解決失敗: {hostname} -> {e}")
+
+test_dns_resolution()
 # ▲▲▲【修正はここまで】▲▲▲
 
 # --- 必須変数のチェック ---
@@ -217,66 +284,103 @@ def generate_ai_response(user_data, message=""):
         logger.error(f"AI応答生成エラー: {e}")
         return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 
-# ▼▼▼【公式README参考】VOICEVOX音声生成（公式APIパターン準拠） ▼▼▼
-def generate_voice(text, speaker_id=1):  # デフォルトspeaker=1（公式例と同じ）
-    """音声を生成する（公式READMEのAPIパターンに準拠）"""
+# ▼▼▼【改良版】VOICEVOX音声生成（エラーハンドリング強化） ▼▼▼
+def generate_voice(text, speaker_id=1, retry_count=2):
+    """音声を生成する（エラーハンドリング強化版）"""
     if not WORKING_VOICEVOX_URL:
         logger.warning("VOICEVOXエンジンが利用できないため、音声生成をスキップします。")
         return None
     
-    # 公式READMEのパフォーマンス対策：長文は分割
+    # 長文は分割（公式READMEのパフォーマンス対策）
+    original_text = text
     if len(text) > 100:
         text = text[:100] + "..."
-        logger.info(f"テキストを100文字に制限: {text[:30]}...")
+        logger.info(f"テキストを100文字に制限: {original_text[:30]}... -> {text[:30]}...")
     
-    try:
-        # 公式READMEと同じAPIパターン：2段階プロセス
-        # ステップ1: audio_query でクエリ作成
-        audio_query_params = {
-            'text': text,
-            'speaker': speaker_id
-        }
-        
-        logger.debug(f"🔄 VOICEVOX audio_query: {WORKING_VOICEVOX_URL}/audio_query")
-        query_response = requests.post(
-            f"{WORKING_VOICEVOX_URL}/audio_query",
-            params=audio_query_params,
-            timeout=10
-        )
-        query_response.raise_for_status()
-        
-        # ステップ2: synthesis で音声合成
-        synthesis_params = {'speaker': speaker_id}
-        
-        logger.debug(f"🔄 VOICEVOX synthesis: {WORKING_VOICEVOX_URL}/synthesis")
-        synthesis_response = requests.post(
-            f"{WORKING_VOICEVOX_URL}/synthesis",
-            headers={"Content-Type": "application/json"},
-            params=synthesis_params,
-            json=query_response.json(),  # 公式READMEと同じパターン
-            timeout=15  # synthesisは時間がかかる場合があるため少し長めに
-        )
-        synthesis_response.raise_for_status()
-        
-        # 成功ログ（サンプリングレート情報も含める）
-        audio_size = len(synthesis_response.content)
-        logger.info(f"✅ VOICEVOX音声合成成功: テキスト='{text[:30]}...', サイズ={audio_size}bytes, サンプリングレート=24000Hz")
-        
-        return synthesis_response.content
-        
-    except requests.exceptions.Timeout as e:
-        logger.error(f"⏰ VOICEVOX音声合成タイムアウト: {e}")
-        return None
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"🌐 VOICEVOX HTTP エラー: {e.response.status_code} - {e}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"🔌 VOICEVOX接続エラー: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ VOICEVOX音声合成予期せぬエラー: {e}")
-        return None
-# ▲▲▲【公式README準拠版はここまで】▲▲▲
+    for attempt in range(retry_count + 1):
+        try:
+            if attempt > 0:
+                logger.info(f"🔄 VOICEVOX音声生成リトライ {attempt}/{retry_count}")
+            
+            # ステップ1: audio_query でクエリ作成（タイムアウト短縮）
+            audio_query_params = {
+                'text': text,
+                'speaker': speaker_id
+            }
+            
+            logger.debug(f"🔄 VOICEVOX audio_query: {WORKING_VOICEVOX_URL}/audio_query")
+            query_response = requests.post(
+                f"{WORKING_VOICEVOX_URL}/audio_query",
+                params=audio_query_params,
+                timeout=8  # タイムアウト短縮
+            )
+            query_response.raise_for_status()
+            
+            # レスポンスが空でないことを確認
+            if not query_response.content:
+                raise ValueError("Audio query returned empty response")
+            
+            query_data = query_response.json()
+            if not query_data:
+                raise ValueError("Audio query returned invalid JSON")
+            
+            # ステップ2: synthesis で音声合成
+            synthesis_params = {'speaker': speaker_id}
+            
+            logger.debug(f"🔄 VOICEVOX synthesis: {WORKING_VOICEVOX_URL}/synthesis")
+            synthesis_response = requests.post(
+                f"{WORKING_VOICEVOX_URL}/synthesis",
+                headers={"Content-Type": "application/json"},
+                params=synthesis_params,
+                json=query_data,
+                timeout=12  # synthesisは少し長めに
+            )
+            synthesis_response.raise_for_status()
+            
+            # 音声データが有効であることを確認
+            if not synthesis_response.content or len(synthesis_response.content) < 1000:
+                raise ValueError(f"Invalid audio data: size={len(synthesis_response.content) if synthesis_response.content else 0}")
+            
+            # 成功ログ
+            audio_size = len(synthesis_response.content)
+            logger.info(f"✅ VOICEVOX音声合成成功: テキスト='{text[:30]}...', サイズ={audio_size}bytes")
+            
+            return synthesis_response.content
+            
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"⏰ VOICEVOX音声合成タイムアウト (試行{attempt+1}): {e}")
+            if attempt < retry_count:
+                time.sleep(1)  # 短い待機時間
+                continue
+        except requests.exceptions.HTTPError as e:
+            error_detail = ""
+            try:
+                if e.response.content:
+                    error_detail = e.response.text[:200]
+            except:
+                pass
+            logger.error(f"🌐 VOICEVOX HTTP エラー (試行{attempt+1}): {e.response.status_code} - {error_detail}")
+            if attempt < retry_count and e.response.status_code >= 500:
+                time.sleep(2)  # サーバーエラーの場合は少し長めに待機
+                continue
+            break  # クライアントエラー（4xx）の場合はリトライしない
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"🔌 VOICEVOX接続エラー (試行{attempt+1}): {e}")
+            if attempt < retry_count:
+                time.sleep(2)
+                continue
+        except ValueError as e:
+            logger.error(f"📊 VOICEVOX データエラー: {e}")
+            break  # データエラーはリトライしても意味がない
+        except Exception as e:
+            logger.error(f"❌ VOICEVOX音声合成予期せぬエラー (試行{attempt+1}): {e}")
+            if attempt < retry_count:
+                time.sleep(1)
+                continue
+    
+    logger.error(f"❌ VOICEVOX音声合成が{retry_count + 1}回の試行で失敗しました")
+    return None
+# ▲▲▲【改良版はここまで】▲▲▲
 
 @app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
@@ -343,38 +447,69 @@ def serve_voice(filename):
         logger.error(f"音声ファイル提供エラー: {e}")
         return "Server error", 500
 
-# ▼▼▼【追加】VOICEVOX状態確認エンドポイント ▼▼▼
+# ▼▼▼【強化版】VOICEVOX状態確認エンドポイント ▼▼▼
 @app.route('/voicevox_status')
 def voicevox_status():
-    """VOICEVOXエンジンの状態を確認する"""
+    """VOICEVOXエンジンの詳細状態を確認する"""
     if WORKING_VOICEVOX_URL:
         try:
-            response = requests.get(f"{WORKING_VOICEVOX_URL}/version", timeout=5)
-            if response.status_code == 200:
+            # バージョン情報取得
+            version_response = requests.get(f"{WORKING_VOICEVOX_URL}/version", timeout=5)
+            if version_response.status_code == 200:
+                version_info = version_response.json()
+                
+                # スピーカー情報取得
+                speakers_response = requests.get(f"{WORKING_VOICEVOX_URL}/speakers", timeout=3)
+                speakers_info = None
+                if speakers_response.status_code == 200:
+                    speakers_data = speakers_response.json()
+                    speakers_info = {
+                        'count': len(speakers_data) if isinstance(speakers_data, list) else 0,
+                        'available': True
+                    }
+                
+                # 音声合成テスト
+                synthesis_test = False
+                try:
+                    test_query = requests.post(
+                        f"{WORKING_VOICEVOX_URL}/audio_query",
+                        params={'text': 'テスト', 'speaker': 1},
+                        timeout=3
+                    )
+                    if test_query.status_code == 200:
+                        synthesis_test = True
+                except:
+                    pass
+                
                 return jsonify({
                     'status': 'available',
                     'url': WORKING_VOICEVOX_URL,
-                    'version': response.json()
+                    'version': version_info,
+                    'speakers': speakers_info,
+                    'synthesis_test': synthesis_test,
+                    'configured_url': VOICEVOX_URL,
+                    'tested_urls': VOICEVOX_URLS
                 })
         except Exception as e:
             logger.error(f"VOICEVOX状態確認エラー: {e}")
+            return jsonify({
+                'status': 'error',
+                'url': WORKING_VOICEVOX_URL,
+                'error': str(e),
+                'configured_url': VOICEVOX_URL,
+                'tested_urls': VOICEVOX_URLS
+            })
     
     return jsonify({
         'status': 'unavailable',
         'url': WORKING_VOICEVOX_URL,
-        'message': 'VOICEVOXエンジンに接続できません'
-    })
-# ▲▲▲【追加はここまで】▲▲▲
-
-@app.route('/health')
-def health_check():
-    return jsonify({
-        'status': 'healthy', 
-        'timestamp': datetime.utcnow().isoformat(),
-        'voicevox_available': WORKING_VOICEVOX_URL is not None,
-        'voicevox_url': WORKING_VOICEVOX_URL
-    })
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+        'message': 'VOICEVOXエンジンに接続できません',
+        'configured_url': VOICEVOX_URL,
+        'tested_urls': VOICEVOX_URLS,
+        'troubleshooting_steps': [
+            '1. VOICEVOXエンジンが起動しているか確認',
+            '2. Docker: docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-ubuntu20.04-latest',
+            '3. ポート50021の利用可能性確認',
+            '4. ファイアウォール設定確認',
+            '5. ネットワーク接続確認'
+        ]
