@@ -8,13 +8,48 @@ RUN apt-get update && apt-get install -y \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# VOICEVOXエンジン（Linux CPU版）をダウンロード - 正しいURL使用
+# VOICEVOXエンジンのダウンロード（複数のURLを試行）
 WORKDIR /opt
-RUN wget -O voicevox-engine.zip https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.1/linux-cpu.zip \
-    && unzip voicevox-engine.zip \
-    && rm voicevox-engine.zip \
-    && mv linux-cpu voicevox-engine \
-    && chmod +x voicevox-engine/run
+
+# 複数のダウンロードURLを試行するスクリプト
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+# 試行するURL一覧（最新版から古い版まで）\n\
+URLS=(\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.1/linux-cpu.zip"\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.23.0/linux-cpu.zip"\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.2/linux-cpu.zip"\n\
+    "https://github.com/VOICEVOX/voicevox_engine/releases/download/0.22.1/linux-cpu.zip"\n\
+)\n\
+\n\
+for url in "${URLS[@]}"; do\n\
+    echo "Trying to download from: $url"\n\
+    if wget -O voicevox-engine.zip "$url"; then\n\
+        echo "✅ Download successful from: $url"\n\
+        unzip voicevox-engine.zip\n\
+        rm voicevox-engine.zip\n\
+        mv linux-cpu voicevox-engine\n\
+        chmod +x voicevox-engine/run\n\
+        echo "✅ VOICEVOX engine setup complete"\n\
+        exit 0\n\
+    else\n\
+        echo "❌ Failed to download from: $url"\n\
+        rm -f voicevox-engine.zip\n\
+    fi\n\
+done\n\
+\n\
+echo "❌ All download attempts failed. Creating dummy engine..."\n\
+mkdir -p voicevox-engine\n\
+echo "#!/bin/bash" > voicevox-engine/run\n\
+echo "echo \"VOICEVOX engine not available - running in no-voice mode\"" >> voicevox-engine/run\n\
+echo "exit 1" >> voicevox-engine/run\n\
+chmod +x voicevox-engine/run\n\
+exit 0\n\
+' > /download_voicevox.sh && chmod +x /download_voicevox.sh
+
+# スクリプトを実行してVOICEVOXをダウンロード
+RUN /download_voicevox.sh
 
 # アプリケーションディレクトリ
 WORKDIR /app
@@ -26,38 +61,45 @@ RUN pip install --no-cache-dir -r requirements.txt
 # アプリケーションファイルをコピー
 COPY . .
 
-# 起動スクリプトを作成（記事のアプローチを参考）
+# 堅牢な起動スクリプトを作成
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
-echo "=== Starting VOICEVOX Engine ==="\n\
-# VOICEVOXエンジンをバックグラウンドで起動\n\
-cd /opt/voicevox-engine\n\
-./run --host 0.0.0.0 --port 50021 &\n\
-VOICEVOX_PID=$!\n\
+echo "=== VOICEVOX Engine Startup ===" \n\
 \n\
-# VOICEVOXの起動を待つ（記事と同様のアプローチ）\n\
-echo "Waiting for VOICEVOX engine to be ready..."\n\
-for i in {1..30}; do\n\
-    if curl -s http://localhost:50021/version > /dev/null 2>&1; then\n\
-        echo "✅ VOICEVOX engine is ready!"\n\
-        curl -s http://localhost:50021/version | head -1\n\
-        break\n\
-    fi\n\
-    echo "⏳ Waiting... ($i/30)"\n\
-    sleep 2\n\
-done\n\
-\n\
-# 簡単な動作テスト（記事のAPIパターンに従う）\n\
-echo "=== Testing VOICEVOX API ==="\n\
-if curl -s "http://localhost:50021/audio_query?text=テスト&speaker=3" > /dev/null 2>&1; then\n\
-    echo "✅ VOICEVOX API test successful"\n\
+# VOICEVOXエンジンの存在確認\n\
+if [ -f "/opt/voicevox-engine/run" ]; then\n\
+    echo "📁 VOICEVOX engine binary found"\n\
+    \n\
+    # VOICEVOXエンジンをバックグラウンドで起動\n\
+    cd /opt/voicevox-engine\n\
+    echo "🚀 Starting VOICEVOX engine..."\n\
+    ./run --host 0.0.0.0 --port 50021 &\n\
+    VOICEVOX_PID=$!\n\
+    \n\
+    # VOICEVOXの起動を待つ（最大60秒）\n\
+    echo "⏳ Waiting for VOICEVOX engine..."\n\
+    for i in {1..30}; do\n\
+        if curl -s -f http://localhost:50021/version > /dev/null 2>&1; then\n\
+            echo "✅ VOICEVOX engine is ready!"\n\
+            curl -s http://localhost:50021/version | head -1\n\
+            break\n\
+        fi\n\
+        if [ $i -eq 30 ]; then\n\
+            echo "⚠️  VOICEVOX engine startup timeout (60s)"\n\
+            echo "🔄 Killing VOICEVOX process and continuing without voice..."\n\
+            kill $VOICEVOX_PID 2>/dev/null || true\n\
+        fi\n\
+        echo "   Attempt $i/30..."\n\
+        sleep 2\n\
+    done\n\
 else\n\
-    echo "⚠️  VOICEVOX API test failed, but continuing..."\n\
+    echo "❌ VOICEVOX engine binary not found - running without voice"\n\
 fi\n\
 \n\
-echo "=== Starting Flask Application ==="\n\
+echo "=== Flask Application Startup ==="\n\
 cd /app\n\
+echo "🌶️  Starting Flask app..."\n\
 exec python app.py\n\
 ' > /start.sh && chmod +x /start.sh
 
