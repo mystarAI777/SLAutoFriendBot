@@ -1,10 +1,8 @@
 # coding: utf-8
 import os
-import requests
 import logging
 import sys
 import time
-import json
 import io
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
@@ -15,7 +13,7 @@ from groq import Groq
 from gtts import gTTS
 
 # --------------------------------------------------------------------------
-# 1. 設定 & 初期化 (変更なし)
+# 1. 設定 & 初期化
 # --------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -69,28 +67,17 @@ def get_or_create_user(session, user_uuid, user_name):
     session.commit()
     return user
 
-# --- ▼▼▼【ここを改良しました】▼▼▼ ---
 def generate_ai_text_response(user, user_message):
-    """
-    AIの応答テキストを生成する。
-    応答スタイルを「丁寧語」「50文字以内」「説明的」に調整。
-    """
     if not groq_client:
         return f"申し訳ありません、{user.user_name}様。現在システムが応答できない状態です。"
 
-    # AIへの指示書(プロンプト)を、ご要望に合わせて全面的に書き換え
     system_prompt = f"""
 あなたは「もちこ」という名の、知的で親切なAIアシスタントです。
-
 # あなたへの指示:
-- ユーザー「{user.user_name}」さんに対し、常に敬意を払い、「ですね・ますわ」調の丁寧な言葉遣いで話してください。
+- ユーザー「{user.user_name}」さんに対し、常に敬意を払い、「です・ます」調の丁寧な言葉遣いで話してください。
 - ユーザーの質問や発言の意図を正確に読み取り、その要点をまとめてください。
 - あなたの回答は、その要点を基に **50文字以内** で、可能な限り分かりやすく説明する形で作成してください。
 - 単なる相槌や短い返事ではなく、必ず何らかの情報や説明を含めるように心がけてください。
-
-例：
-- ユーザー「空はなぜ青いの？」
-- あなた「太陽の光が大気で散乱し、青い光が最も強く目に届くためです。」
 """
     try:
         completion = groq_client.chat.completions.create(
@@ -99,17 +86,15 @@ def generate_ai_text_response(user, user_message):
                 {"role": "user", "content": user_message or "こんにちは"}
             ],
             model="llama3-8b-8192",
-            temperature=0.7, # 少し低めにして、より事実に基づいた応答を促す
-            max_tokens=100,  # 50文字の応答を得るには十分な長さ
+            temperature=0.7,
+            max_tokens=100,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
         return "申し訳ありません、考えがまとまりませんでした。"
-# --- ▲▲▲【改良はここまで】▲▲▲ ---
 
 def generate_voice_gtts(text, lang='ja'):
-    # (変更なし)
     try:
         logger.info(f"gTTSによる音声生成を開始: '{text[:30]}...'")
         mp3_fp = io.BytesIO()
@@ -124,7 +109,7 @@ def generate_voice_gtts(text, lang='ja'):
         return None
 
 # --------------------------------------------------------------------------
-# 3. API エンドポイント (変更なし)
+# 3. API エンドポイント
 # --------------------------------------------------------------------------
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -161,6 +146,7 @@ def chat():
 
 @app.route('/voice/<filename>')
 def serve_voice(filename):
+    # /tmp ディレクトリはRenderなどの多くのホスティングサービスで一時的な書き込みが許可されています
     return send_from_directory('/tmp', filename)
 
 @app.route('/status')
