@@ -1,7 +1,10 @@
-Flask
-Flask-Cors
-SQLAlchemy
+flask
+flask-cors
+sqlalchemy
 groq
-gTTS
+openai
 requests
-psycopg2-binary
+
+# ▼ データベースに応じてどちらか（または両方）が必要
+psycopg2-binary  # PostgreSQLの場合
+mysqlclient      # MySQLの場合
