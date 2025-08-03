@@ -60,7 +60,7 @@ except FileNotFoundError:
 
 # VOICEVOX接続テスト
 def find_working_voicevox_url():
-    """利用可能なVOICEVOX URLを見つける"""
+    """利用可能なVOICEVOX URLを見つける（公式README準拠のテスト）"""
     urls_to_test = []
     
     # Secret Fileまたは環境変数で指定されたURLがあれば最初に試す
@@ -72,15 +72,33 @@ def find_working_voicevox_url():
     
     for url in urls_to_test:
         try:
-            response = requests.get(f"{url}/version", timeout=3)
-            if response.status_code == 200:
-                logger.info(f"VOICEVOX接続成功: {url}")
+            # 公式READMEに従って /version エンドポイントをテスト
+            logger.debug(f"🔍 Testing VOICEVOX at: {url}")
+            version_response = requests.get(f"{url}/version", timeout=5)
+            if version_response.status_code == 200:
+                version_info = version_response.json()
+                logger.info(f"✅ VOICEVOX接続成功: {url}")
+                logger.info(f"📋 Engine version: {version_info.get('version', 'unknown')}")
+                
+                # 追加テスト：公式READMEの /speakers エンドポイント
+                try:
+                    speakers_response = requests.get(f"{url}/speakers", timeout=3)
+                    if speakers_response.status_code == 200:
+                        speakers = speakers_response.json()
+                        speaker_count = len(speakers) if isinstance(speakers, list) else "unknown"
+                        logger.info(f"📢 Available speakers: {speaker_count}")
+                    else:
+                        logger.warning(f"⚠️  Speakers endpoint failed: {speakers_response.status_code}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Speaker test failed: {e}")
+                
                 return url
+                
         except Exception as e:
-            logger.debug(f"VOICEVOX接続失敗: {url} - {e}")
+            logger.debug(f"❌ VOICEVOX接続失敗: {url} - {e}")
             continue
     
-    logger.warning("利用可能なVOICEVOXエンジンが見つかりませんでした。音声機能は無効になります。")
+    logger.warning("❌ 利用可能なVOICEVOXエンジンが見つかりませんでした。音声機能は無効になります。")
     return None
 
 # 起動時にVOICEVOX接続をテスト
