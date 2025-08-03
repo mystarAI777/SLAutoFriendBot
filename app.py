@@ -1,149 +1,237 @@
-// ================================================================ //
-// SL Auto Friend Bot - LSL Client Script (v5.0 - 連続対話モード版) //
-// ================================================================ //
-// ユーザー体験を向上させるため、対話方式を大幅に改善したバージョン //
-// ・一度のタッチで「連続対話モード」を開始します。                 //
-// ・対話モード中は、再度タッチするまでチャットに応答し続けます。   //
-// ・あなたとの会話中に、他の人がタッチしても邪魔されません。       //
-// ================================================================ //
+import os
+import requests
+import logging
+import sys
+from datetime import datetime
+from flask import Flask, request, jsonify, send_from_directory, safe_join
+from flask_cors import CORS
+from sqlalchemy import create_engine, Column, String, DateTime, Integer, text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
+from groq import Groq
+from openai import OpenAI
+
+# ログ設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- ▼▼▼ Secret Fileからの設定読み込み ▼▼▼ ---
+
+# --- DATABASE_URL ---
+DATABASE_URL = None
+DATABASE_URL_SECRET_FILE = '/etc/secrets/DATABASE_URL'
+try:
+    with open(DATABASE_URL_SECRET_FILE, 'r') as f:
+        DATABASE_URL = f.read().strip()
+    logger.info("Secret FileからDATABASE_URLを読み込みました。")
+except FileNotFoundError:
+    logger.warning(f"Secret File '{DATABASE_URL_SECRET_FILE}' が見つかりません。環境変数を試します。")
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# --- GROQ_API_KEY ---
+GROQ_API_KEY = None
+GROQ_API_KEY_SECRET_FILE = '/etc/secrets/GROQ_API_KEY'
+try:
+    with open(GROQ_API_KEY_SECRET_FILE, 'r') as f:
+        GROQ_API_KEY = f.read().strip()
+    logger.info("Secret FileからGROQ_API_KEYを読み込みました。")
+except FileNotFoundError:
+    logger.error(f"Secret Fileが見つかりません: {GROQ_API_KEY_SECRET_FILE}")
+except Exception as e:
+    logger.error(f"APIキーの読み込み中に予期せぬエラー: {e}")
+
+# --- 【修正箇所】VOICEVOX_URL ---
+VOICEVOX_URL = 'http://localhost:50021' # デフォルト値を設定
+VOICEVOX_URL_SECRET_FILE = '/etc/secrets/VOICEVOX_URL'
+try:
+    with open(VOICEVOX_URL_SECRET_FILE, 'r') as f:
+        VOICEVOX_URL = f.read().strip()
+    logger.info("Secret FileからVOICEVOX_URLを読み込みました。")
+except FileNotFoundError:
+    logger.warning(f"Secret File '{VOICEVOX_URL_SECRET_FILE}' が見つかりません。環境変数またはデフォルト値を使用します。")
+    VOICEVOX_URL = os.environ.get('VOICEVOX_URL', 'http://localhost:50021')
+except Exception as e:
+    logger.error(f"VOICEVOX_URLの読み込み中に予期せぬエラー: {e}")
+
+# --- ▲▲▲ 設定読み込みはここまで ▲▲▲ ---
 
 
-// --- ▼▼▼ 設定項目 ▼▼▼ ---
-//【注意！】末尾が「/chat_lsl」になっていることを確認してください。
-string SERVER_URL = "https://slautofriendbot.onrender.com/chat_lsl"; 
-// 会話が途切れた後、自動でリセットされるまでの時間（秒）
-float INACTIVITY_TIMEOUT = 90.0; 
-// --- ▲▲▲ 設定項目はここまで ▲▲▲ ---
+# --- 必須変数のチェック ---
+if not DATABASE_URL:
+    logger.error("DATABASE_URLが設定されていません。")
+    sys.exit(1)
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEYが設定されていません。")
+    sys.exit(1)
 
+app = Flask(__name__)
+CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"])
 
-// --- グローバル変数 ---
-key     gUserKey;       // 現在会話中のユーザーキー
-key     gHttpRequestId;
-integer gListenHandle;
+# --- Groqクライアントの初期設定 ---
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    use_openai_compatible = False
+    logger.info("Groq native クライアントの初期設定が完了しました。")
+    test_response = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": "test"}], model="llama3-8b-8192", max_tokens=5)
+    logger.info("Groq APIキーの検証が成功しました。")
+except Exception as e:
+    logger.error(f"Groq nativeクライアントでのエラー、OpenAI互換にフォールバック: {e}")
+    try:
+        groq_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+        use_openai_compatible = True
+        logger.info("Groq OpenAI互換クライアントの初期設定が完了しました。")
+        test_response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": "test"}], model="llama3-8b-8192", max_tokens=5)
+        logger.info("Groq OpenAI互換APIキーの検証が成功しました。")
+    except Exception as final_error:
+        logger.error(f"OpenAI互換クライアントでもエラー: {final_error}")
+        groq_client = None
 
-// --- 状態管理のための定数 ---
-integer STATE_IDLE = 0;                     // 0: 誰とも話していない待機状態
-integer STATE_LISTENING = 1;                // 1: ユーザーの発言を待っている状態
-integer STATE_WAITING_FOR_RESPONSE = 2;     // 2: サーバーからの返事を待っている状態
-integer gCurrentState;                      // 現在の状態を保持する変数
+Base = declarative_base()
 
-vector  TEXT_COLOR = <1.0, 1.0, 1.0>;
-float   TEXT_ALPHA = 1.0;
+class UserMemory(Base):
+    __tablename__ = 'user_memories'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False)
+    user_name = Column(String(255), nullable=False)
+    personality_notes = Column(String(2000), default='')
+    favorite_topics = Column(String(2000), default='')
+    interaction_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_interaction = Column(DateTime, default=datetime.utcnow)
 
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+logger.info(f"データベース接続が完了しました。URL: {DATABASE_URL[:20]}...")
 
-// --- 状態を完全にリセットする関数 ---
-reset() {
-    llSetTimerEvent(0.0);
-    if (gListenHandle != 0) {
-        llListenRemove(gListenHandle);
-        gListenHandle = 0;
-    }
-    llSetText("", <0,0,0>, 0.0);
-    gUserKey = NULL_KEY;
-    gCurrentState = STATE_IDLE;
-    llSetObjectDesc("待機中... 私にタッチして会話を始めてね。");
-}
+class UserDataContainer:
+    def __init__(self, user_uuid, user_name, personality_notes='', favorite_topics='',
+                 interaction_count=0, created_at=None, last_interaction=None):
+        self.user_uuid = user_uuid
+        self.user_name = user_name
+        self.personality_notes = personality_notes
+        self.favorite_topics = favorite_topics
+        self.interaction_count = interaction_count
+        self.created_at = created_at or datetime.utcnow()
+        self.last_interaction = last_interaction or datetime.utcnow()
 
+def get_or_create_user(user_uuid, user_name):
+    session = Session()
+    try:
+        user_memory = session.query(UserMemory).filter(UserMemory.user_uuid == user_uuid).first()
+        if user_memory:
+            user_memory.interaction_count += 1
+            user_memory.last_interaction = datetime.utcnow()
+            session.commit()
+            return UserDataContainer(user_uuid=user_memory.user_uuid, user_name=user_memory.user_name, personality_notes=user_memory.personality_notes or '', favorite_topics=user_memory.favorite_topics or '', interaction_count=user_memory.interaction_count, created_at=user_memory.created_at, last_interaction=user_memory.last_interaction)
+        else:
+            new_user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1, created_at=datetime.utcnow(), last_interaction=datetime.utcnow())
+            session.add(new_user)
+            session.commit()
+            return UserDataContainer(user_uuid=new_user.user_uuid, user_name=new_user.user_name, interaction_count=1, created_at=new_user.created_at, last_interaction=new_user.last_interaction)
+    except Exception as e:
+        logger.error(f"ユーザーデータの取得/作成エラー: {e}")
+        session.rollback()
+        return UserDataContainer(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
+    finally:
+        session.close()
 
-// --- メインのステートブロック ---
-default
-{
-    state_entry() {
-        llSay(0, "AIボット「もちこ」が起動しました。(v5.0 - 連続対話モード)");
-        if (llSubStringIndex(SERVER_URL, "/chat_lsl") == -1) {
-            llOwnerSay("【設定エラー】SERVER_URLの末尾が「/chat_lsl」になっていません。");
-        }
-        reset();
-    }
+def generate_ai_response(user_data, message=""):
+    if groq_client is None: return f"こんにちは、{user_data.user_name}さん！現在システムメンテナンス中ですが、お話しできて嬉しいです。"
+    system_prompt = ""
+    if user_data.interaction_count == 1:
+        system_prompt = f"あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。今、{user_data.user_name}さんという方に初めてお会いしました。以下のキャラクター設定を厳守して、60文字以内の自然で親しみやすい初対面の挨拶をしてください。\n- 敬語は使わず、親しみやすい「タメ口」で話します。\n- 少し恥ずかしがり屋ですが、フレンドリーです。\n- 相手に興味津々です。"
+    else:
+        days_since_last = (datetime.utcnow() - user_data.last_interaction).days
+        situation = "継続的な会話" if days_since_last <= 1 else ("数日ぶりの再会" if days_since_last <= 7 else "久しぶりの再会")
+        system_prompt = f"あなたは「もちこ」という名前の、優しくて親しみやすいAIアシスタントです。{user_data.user_name}さんとは{user_data.interaction_count}回目のお話です。\n状況: {situation}。\n過去のメモ: {user_data.personality_notes}\n好きな話題: {user_data.favorite_topics}\n以下のキャラクター設定を厳守し、この状況にふさわしい返事を60文字以内で作成してください。\n- 敬語は使わず、親しみやすい「タメ口」で話します。\n- 過去の会話を覚えている、親しい友人として振る舞います。"
+    try:
+        chat_completion = groq_client.chat.completions.create(messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "こんにちは"}], model="llama3-8b-8192", temperature=0.7, max_tokens=150)
+        return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"AI応答生成エラー: {e}")
+        return f"ごめんなさい、{user_data.user_name}さん。ちょっと考えがまとまらないや…。"
 
-    touch_start(integer total_number) {
-        key toucher = llDetectedKey(0);
+def generate_voice(text, speaker_id=1):
+    try:
+        audio_query_response = requests.post(f"{VOICEVOX_URL}/audio_query", params={"text": text, "speaker": speaker_id})
+        audio_query_response.raise_for_status()
+        synthesis_response = requests.post(f"{VOICEVOX_URL}/synthesis", headers={"Content-Type": "application/json"}, params={"speaker": speaker_id}, json=audio_query_response.json())
+        synthesis_response.raise_for_status()
+        return synthesis_response.content
+    except Exception as e:
+        logger.error(f"音声生成エラー: {e}")
+        return None
 
-        // 誰も使っていない時に、誰かがタッチした場合
-        if (gCurrentState == STATE_IDLE) {
-            gUserKey = toucher;
-            string name = llDetectedName(0);
-            llInstantMessage(gUserKey, "こんにちは！連続対話モードを開始します。\n近くのチャットで話しかけてください。\n会話を終わる時は、私をもう一度タッチしてくださいね。");
-            gListenHandle = llListen(0, "", gUserKey, "");
-            gCurrentState = STATE_LISTENING;
-            llSetObjectDesc(name + "さんと連続会話中...");
-            llSetTimerEvent(INACTIVITY_TIMEOUT); // 無操作タイムアウトを開始
-        }
-        // 会話中に、会話を始めた本人がタッチした場合
-        else if (toucher == gUserKey) {
-            llInstantMessage(gUserKey, "会話を終了します。またね！");
-            reset();
-        }
-        // 会話中に、別人がタッチした場合
-        else {
-            string current_user_name = llKey2Name(gUserKey);
-            llInstantMessage(toucher, "ごめんなさい、今は " + current_user_name + " さんとお話中です。");
-        }
-    }
+@app.route('/chat', methods=['POST', 'OPTIONS'])
+def chat():
+    if request.method == 'OPTIONS': return jsonify(status='ok')
+    try:
+        data = request.json
+        user_uuid = data.get('user_uuid') or data.get('uuid')
+        user_name = data.get('user_name') or data.get('name')
+        if not user_uuid or not user_name: return jsonify(error='user_uuid and user_name are required'), 400
+        user_data = get_or_create_user(user_uuid, user_name)
+        ai_response = generate_ai_response(user_data, data.get('message', ''))
+        voice_data = generate_voice(ai_response)
+        response_data = {'text': ai_response, 'response': ai_response, 'interaction_count': user_data.interaction_count, 'has_voice': voice_data is not None}
+        if voice_data:
+            voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
+            voice_path = os.path.join('/tmp', voice_filename)
+            with open(voice_path, 'wb') as f: f.write(voice_data)
+            response_data['voice_url'] = f'/voice/{voice_filename}'
+            response_data['audio_url'] = f'/voice/{voice_filename}'
+        return jsonify(response_data)
+    except Exception as e:
+        logger.error(f"チャットエラー: {e}")
+        return jsonify(error='Internal server error'), 500
 
-    listen(integer channel, string name, key id, string message) {
-        // 発言者が本人で、かつ発言を待っている状態でなければ無視
-        if (id != gUserKey || gCurrentState != STATE_LISTENING) return;
+@app.route('/chat_lsl', methods=['POST'])
+def chat_lsl():
+    try:
+        data = request.json
+        user_uuid = data.get('uuid')
+        user_name = data.get('name')
+        message = data.get('message', '')
+        if not user_uuid or not user_name: return "Error: user_uuid and user_name are required", 400
+        user_data = get_or_create_user(user_uuid, user_name)
+        if not user_data: return "Error: Failed to get user data", 500
+        ai_response = generate_ai_response(user_data, message)
+        voice_data = generate_voice(ai_response)
+        audio_url_part = ""
+        if voice_data:
+            voice_filename = f"voice_{user_uuid}_{datetime.now().timestamp()}.wav"
+            voice_path = os.path.join('/tmp', voice_filename)
+            with open(voice_path, 'wb') as f: f.write(voice_data)
+            audio_url_part = f'/voice/{voice_filename}'
+        response_text = f"{ai_response}|{audio_url_part}"
+        response = app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
+        return response
+    except Exception as e:
+        logger.error(f"LSLチャットエラー: {e}")
+        return "Error: Internal server error", 500
 
-        gCurrentState = STATE_WAITING_FOR_RESPONSE; // サーバーの返答待ち状態に移行
-        llSetText("考え中...", TEXT_COLOR, TEXT_ALPHA);
-        llSetTimerEvent(0.0); // 応答待ちの間はタイムアウトを一時停止
+@app.route('/voice/<filename>')
+def serve_voice(filename):
+    directory = '/tmp'
+    try:
+        safe_path = safe_join(directory, filename)
+        if os.path.exists(safe_path):
+            return send_from_directory(directory, filename)
+        else:
+            logger.error(f"音声ファイルが見つかりません: {safe_path}")
+            return "File not found", 404
+    except Exception as e:
+        logger.error(f"音声ファイル提供エラー: {e}")
+        return "Server error", 500
 
-        // JSON文字列を手動で構築
-        string escaped_name = llDumpList2String(llParseString2List(name, ["\""], []), "\\\"");
-        string escaped_message = llDumpList2String(llParseString2List(message, ["\""], []), "\\\"");
-        string json_body = "{" +
-            "\"uuid\":\"" + (string)id + "\"," +
-            "\"name\":\"" + escaped_name + "\"," +
-            "\"message\":\"" + escaped_message + "\"" +
-        "}";
+@app.route('/health')
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
 
-        gHttpRequestId = llHTTPRequest(SERVER_URL, [HTTP_METHOD, "POST", HTTP_MIMETYPE, "application/json"], json_body);
-    }
-
-    http_response(key request_id, integer status, list metadata, string body) {
-        if (request_id != gHttpRequestId) return;
-        llSetText("", <0,0,0>, 0.0);
-
-        if (status != 200) {
-            llSay(0, "うぅ、サーバーと通信できなかったみたい…ごめんなさい。");
-            llInstantMessage(gUserKey, "エラーが発生したので、会話を終了します。");
-            reset();
-            return;
-        }
-
-        // パイプ区切りのテキストを処理
-        list parts = llParseString2List(body, ["|"], []);
-        string ai_text = llList2String(parts, 0);
-        string audio_url = "";
-        if (llGetListLength(parts) > 1) {
-            audio_url = llList2String(parts, 1);
-        }
-        
-        if (ai_text != "") {
-            llSay(0, ai_text);
-        } else {
-            llSay(0, "あれ？何か言うのを忘れちゃったみたい。");
-        }
-        
-        // 音声再生
-        if (audio_url != "" && llGetSubString(audio_url, 0, 0) == "/") {
-            string base_url = llGetSubString(SERVER_URL, 0, llSubStringIndex(SERVER_URL, "/chat_lsl") - 1);
-            llPlaySound(base_url + audio_url, 1.0);
-        }
-
-        // 再びリスニング状態に戻る
-        gCurrentState = STATE_LISTENING;
-        llSetTimerEvent(INACTIVITY_TIMEOUT); // 再び無操作タイムアウトを開始
-    }
-    
-    timer() {
-        // 無操作タイムアウトが発生した場合
-        llInstantMessage(gUserKey, "しばらくお返事がないので、会話を終了しました。また話したくなったらタッチしてね！");
-        reset();
-    }
-    
-    on_rez(integer start_param) {
-        llResetScript();
-    }
-}
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
