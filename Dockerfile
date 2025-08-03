@@ -18,13 +18,14 @@ WORKDIR /app
 
 # ▼▼▼【ここから修正】▼▼▼
 # Python依存関係をインストール
-# ビルドに必要なライブラリを一時的にインストールし、完了後に削除する
+# ビルドに必要なライブラリ(gcc, libmariadb-dev, pkg-config)を一時的にインストールし、完了後に削除する
 COPY requirements.txt .
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libmariadb-dev && \
+    apt-get install -y --no-install-recommends gcc libmariadb-dev pkg-config && \
     pip install --no-cache-dir -r requirements.txt && \
-    apt-get purge -y --auto-remove gcc libmariadb-dev && \
+    apt-get purge -y --auto-remove gcc libmariadb-dev pkg-config && \
     rm -rf /var/lib/apt/lists/*
+# ▲▲▲【ここまで修正】▲▲▲
 
 # アプリケーションファイルをコピー
 COPY . .
