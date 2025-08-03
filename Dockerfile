@@ -1,11 +1,35 @@
-# 起動スクリプトを作成
+# ステージ1: VOICEVOXエンジンを含める
+FROM voicevox/voicevox_engine:cpu-latest as voicevox
+
+# ステージ2: 最終的なアプリケーションイメージ
+FROM python:3.9-slim
+
+# 必要なシステムパッケージをインストール
+RUN apt-get update && apt-get install -y \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# VOICEVOXエンジンを最初のステージからコピー
+COPY --from=voicevox /opt/voicevox_engine /opt/voicevox_engine
+
+# アプリケーションディレクトリ
+WORKDIR /app
+
+# Python依存関係をインストール
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# アプリケーションファイルをコピー
+COPY . .
+
+# 起動スクリプトを作成（起動コマンドを修正済み）
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
 echo "=== Starting VOICEVOX Engine (Official Docker Image) ==="\n\
 \n\
-# VOICEVOXエンジンをバックグラウンドで起動\n\
-# 公式イメージのENTRYPOINTやCMDに合わせた起動方法\n\
+# VOICEVOXエンジンをバックグラウンドで起動（現在の公式イメージの実行ファイルを使用）\n\
 echo "🚀 Starting VOICEVOX engine on 0.0.0.0:50021..."\n\
 /opt/voicevox_engine/run --host 0.0.0.0 --port 50021 &\n\
 VOICEVOX_PID=$!\n\
@@ -43,3 +67,9 @@ cd /app\n\
 echo "🌶️  Starting Flask app..."\n\
 exec python app.py\n\
 ' > /start.sh && chmod +x /start.sh
+
+# ポートを公開
+EXPOSE 5000
+
+# 起動コマンド
+CMD ["/start.sh"]
