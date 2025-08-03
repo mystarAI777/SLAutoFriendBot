@@ -1,0 +1,15 @@
+- name: voicevox-engine
+    type: web
+    env: shell
+    repo: https://github.com/VOICEVOX/voicevox_engine
+    autoDeploy: false
+    envVars:
+      - key: VOICEVOX_CPU_NUM_THREADS
+        value: 2
+    startCommand: |
+      VERSION=0.14.4
+      curl -sL https://github.com/VOICEVOX/voicevox_engine/releases/download/${VERSION}/voicevox_engine-linux-cpu-${VERSION}.zip -o voicevox_engine.zip
+      unzip voicevox_engine.zip
+      rm voicevox_engine.zip
+      ./voicevox_engine/run --host 0.0.0.0
+    healthCheckPath: /version
