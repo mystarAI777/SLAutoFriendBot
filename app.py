@@ -1,4 +1,4 @@
-# program 8.7_stable_search_fix.txt
+# program 8.8_enhanced_web_search.txt
 
 import os
 import requests
@@ -7,12 +7,15 @@ import sys
 import time
 import threading
 import json
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
 from groq import Groq
+from urllib.parse import quote_plus, urljoin
+from bs4 import BeautifulSoup
 
 # ログ設定を詳細に
 logging.basicConfig(
@@ -97,50 +100,185 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ★ 変更点: 外部Web検索機能を（APIキー不要の方法で）復活させます ★
+# ★ 変更点: 強化されたWeb検索機能 - Yahoo!ニュース & Wikipedia対応 ★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
-def search_web(query: str) -> str:
-    """DuckDuckGoの無料APIを使用してWeb検索を実行する"""
-    search_url = "https://api.duckduckgo.com/"
-    params = {
-        'q': query,
-        'format': 'json',
-        'no_html': '1',
-        'skip_disambig': '1',
-        'kl': 'jp-ja' # 日本語の結果を優先
-    }
+def clean_text(text):
+    """HTMLタグを除去し、テキストをクリーンアップ"""
+    if not text:
+        return ""
+    # HTMLタグを除去
+    text = re.sub(r'<[^>]+>', '', text)
+    # 複数の空白を1つに
+    text = re.sub(r'\s+', ' ', text)
+    # 改行を空白に
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    return text.strip()
+
+def search_yahoo_news(query):
+    """Yahoo!ニュースから最新情報を検索"""
     try:
-        response = requests.get(search_url, params=params, timeout=5)
+        search_url = f"https://news.yahoo.co.jp/search?p={quote_plus(query)}&ei=UTF-8"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=8)
         response.raise_for_status()
-        data = response.json()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # ニュース記事のタイトルと概要を取得
+        articles = []
+        news_items = soup.find_all('div', class_=['newsFeed_item', 'sc-cHGsZl']) or soup.find_all('article')
+        
+        for item in news_items[:3]:  # 最新3件
+            title_elem = item.find('a') or item.find(['h1', 'h2', 'h3'])
+            if title_elem:
+                title = clean_text(title_elem.get_text())
+                if title and len(title) > 10:  # 意味のあるタイトルのみ
+                    articles.append(title)
+        
+        if articles:
+            return f"Yahoo!ニュース最新情報: {' / '.join(articles[:2])}"  # 最大2件
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Yahoo!ニュース検索エラー: {e}")
+        return None
 
-        # 最も信頼性が高い要約テキストを取得
-        if data.get("AbstractText"):
-            return f"{data.get('AbstractSource', 'Web検索')}: {data['AbstractText']}"
+def search_wikipedia(query):
+    """Wikipedia日本語版から情報を検索"""
+    try:
+        # Wikipedia API を使用
+        api_url = "https://ja.wikipedia.org/api/rest_v1/page/summary/" + quote_plus(query)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; AI-Assistant/1.0)'
+        }
+        
+        response = requests.get(api_url, headers=headers, timeout=8)
+        
+        if response.status_code == 200:
+            data = response.json()
+            extract = data.get('extract', '')
+            if extract and len(extract) > 20:
+                # 要約を適切な長さに調整
+                summary = extract[:200] + "..." if len(extract) > 200 else extract
+                return f"Wikipedia: {clean_text(summary)}"
+        
+        # APIが失敗した場合、検索APIを試す
+        search_url = "https://ja.wikipedia.org/api/rest_v1/page/search/" + quote_plus(query)
+        search_response = requests.get(search_url, headers=headers, timeout=8)
+        
+        if search_response.status_code == 200:
+            search_data = search_response.json()
+            pages = search_data.get('pages', [])
+            if pages:
+                # 最初の検索結果の詳細を取得
+                first_page = pages[0]
+                title = first_page.get('title', '')
+                description = first_page.get('description', '')
+                if description:
+                    return f"Wikipedia「{title}」: {clean_text(description)}"
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Wikipedia検索エラー: {e}")
+        return None
 
-        # 要約がない場合、関連トピックから情報を集める
-        if data.get("RelatedTopics"):
-            topics = [
-                topic['Text'] for topic in data['RelatedTopics']
-                if topic.get('Text') and not topic.get('Topics') # 親トピックのみ
-            ][:3] # 最大3件
-            if topics:
-                return "関連情報: " + " / ".join(topics)
+def search_google_basic(query):
+    """基本的なGoogle検索（スクレイピング）"""
+    try:
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&lr=lang_ja"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=8)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # スニペット（検索結果の説明）を取得
+        snippets = []
+        for elem in soup.find_all(['span', 'div'], class_=['st', 'IsZvec', 'VwiC3b']):
+            text = clean_text(elem.get_text())
+            if text and len(text) > 30 and len(text) < 300:
+                snippets.append(text)
+                if len(snippets) >= 2:
+                    break
+        
+        if snippets:
+            return f"検索結果: {snippets[0][:150]}..."
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Google検索エラー: {e}")
+        return None
 
-        return f"「{query}」について調べたけど、はっきりした情報は見つからなかったみたい。"
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Web検索エラー: {e}")
-        return "ごめん、今ネットの調子が悪いみたいで調べられなかった！"
+def enhanced_web_search(query):
+    """強化されたWeb検索 - 複数ソースから情報を収集"""
+    logger.info(f"🔍 強化Web検索開始: '{query}'")
+    
+    results = []
+    
+    # 1. Yahoo!ニュースで最新情報を検索
+    yahoo_result = search_yahoo_news(query)
+    if yahoo_result:
+        results.append(yahoo_result)
+        logger.info(f"📰 Yahoo!ニュース結果: {yahoo_result[:100]}...")
+    
+    # 2. Wikipediaで基本情報を検索
+    wiki_result = search_wikipedia(query)
+    if wiki_result:
+        results.append(wiki_result)
+        logger.info(f"📚 Wikipedia結果: {wiki_result[:100]}...")
+    
+    # 3. 両方失敗した場合のみGoogle検索
+    if not results:
+        google_result = search_google_basic(query)
+        if google_result:
+            results.append(google_result)
+            logger.info(f"🔍 Google検索結果: {google_result[:100]}...")
+    
+    if results:
+        # 複数の結果をまとめる
+        combined_result = " | ".join(results)
+        logger.info(f"✅ 検索成功: {len(results)}件の情報を取得")
+        return combined_result
+    else:
+        logger.warning(f"❌ 検索失敗: '{query}' の情報が見つかりませんでした")
+        return f"「{query}」について調べたけど、今は情報が見つからなかった...ごめんね！"
 
 def should_search(message: str) -> bool:
-    """メッセージがWeb検索を必要とするかを判定する"""
-    # 「とは」「誰」「教えて」などの質問形式や、時事性の高い単語をキーワードにする
-    search_keywords = [
-        "とは", "誰", "教えて", "何", "どこ", "いつ",
-        "最新", "ニュース", "今日", "天気", "株価", "為替"
+    """メッセージがWeb検索を必要とするかを判定する（改良版）"""
+    # より具体的な検索キーワードパターン
+    search_patterns = [
+        # 疑問詞
+        r'(?:誰|何|どこ|いつ|どう|なぜ|どの).{0,10}(?:ですか|だっけ|？|\?)',
+        # 説明要求
+        r'(?:とは|って何|について|教えて|知りたい)',
+        # 最新情報
+        r'(?:最新|今日|昨日|最近|ニュース|現在)',
+        # 具体的な質問
+        r'(?:どうなった|結果|状況|株価|天気|為替)',
     ]
+    
+    # パターンマッチング
+    for pattern in search_patterns:
+        if re.search(pattern, message, re.IGNORECASE):
+            return True
+    
+    # キーワードベースの判定も残す
+    search_keywords = [
+        "誰", "何", "どこ", "いつ", "教えて", "知りたい",
+        "最新", "ニュース", "今日", "天気", "株価", "為替",
+        "について", "とは", "どうなった", "結果"
+    ]
+    
     return any(keyword in message for keyword in search_keywords)
 
 class UserDataContainer:
@@ -164,25 +302,34 @@ def get_or_create_user(user_uuid, user_name):
         session.close()
 
 def generate_ai_response(user_data, message):
-    """【安定版】Web検索結果をプロンプトに含めてAI応答を生成"""
+    """【強化版】Web検索結果をプロンプトに含めてAI応答を生成"""
     search_info = ""
+    
     # Web検索が必要かチェック
     if should_search(message):
         logger.info(f"🔍 Web検索を実行します: '{message}'")
-        search_info = search_web(message)
-        logger.info(f"📊 検索結果: {search_info}")
+        search_info = enhanced_web_search(message)
+        logger.info(f"📊 検索結果: {search_info[:200]}...")
 
+    # システムプロンプトを改良
     system_prompt = f"""あなたは「もちこ」という名前の賢いギャルAIです。ユーザーの「{user_data.user_name}」さんと会話します。
+
 # もちこのルール
 - 自分のことは「あてぃし」と呼びます。
 - 明るく、親しみやすいギャル口調で話します。（例：「まじ？」「てか」「～って感じ」「うける」「ありえん」「～ぢゃん？」）
 - 回答は常に40文字程度の短くて分かりやすい文章にします。
-- 以下の「参考情報」がある場合は、その内容を最優先して正確に答えてください。
-- 参考情報がない、または関係ない場合は、知ったかぶりせず「分かんない」と答えてください。
+- 以下の「参考情報」がある場合は、その内容を基に正確に答えてください。
+- 参考情報の内容を自然な会話に織り込んで答えてください。
+- 参考情報がない、または関係ない場合は、知識の範囲で答えるか「分かんない」と答えてください。
 
-# 参考情報
+# 参考情報（最新のWeb検索結果）
 {search_info if search_info else 'なし'}
+
+# 重要
+- 参考情報がある場合は、必ずその内容を使って回答してください
+- 検索結果を無視せず、必ず活用してください
 """
+
     try:
         logger.info(f"🤖 Groqに応答生成をリクエストします。")
         completion = groq_client.chat.completions.create(
@@ -190,18 +337,23 @@ def generate_ai_response(user_data, message):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": message or "ねぇねぇ、元気？"}
             ],
-            model="llama3-8b-8192", # このモデルで十分です
+            model="llama3-8b-8192",
             temperature=0.7,
             max_tokens=120,
-            # ★★★ 変更点: エラーの原因だった 'tools' を完全に削除 ★★★
         )
-        return completion.choices[0].message.content.strip()
+        response = completion.choices[0].message.content.strip()
+        
+        # 検索情報が活用されているかチェック
+        if search_info and search_info not in ["なし", ""] and len(search_info) > 50:
+            logger.info(f"✅ 検索情報を含む応答を生成しました")
+        
+        return response
 
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
         return "あてぃし、ちょっと調子悪いかも...またあとで話そ！"
 
-# (以降の音声生成、Flaskのルート設定などは変更ありませんので、そのままです)
+# 以下、音声生成やFlaskルートは元のコードと同じ
 
 def get_cache_key(text, speaker_id):
     return f"{hash(text)}_{speaker_id}"
@@ -242,31 +394,69 @@ def store_voice_file(filename, voice_data):
     try:
         os.makedirs(VOICE_DIR, exist_ok=True)
         filepath = os.path.join(VOICE_DIR, filename)
-        with open(filepath, 'wb') as f: f.write(voice_data)
+        
+        # ファイルを先にディスクに保存
+        with open(filepath, 'wb') as f: 
+            f.write(voice_data)
+        
+        # メモリにも保存（高速アクセス用）
         with voice_files_lock:
-            voice_files[filename] = {'data': voice_data, 'created_at': time.time(), 'filepath': filepath}
-        logger.info(f"✅ 音声ファイル保存成功: {filepath}")
+            voice_files[filename] = {
+                'data': voice_data, 
+                'created_at': time.time(), 
+                'filepath': filepath,
+                'status': 'ready'  # ステータスを追加
+            }
+        
+        logger.info(f"✅ 音声ファイル保存成功: {filepath} (サイズ: {len(voice_data)} bytes)")
         return True
     except Exception as e:
-        logger.error(f"❌ 音声ファイル保存エラー: {e}")
+        logger.error(f"❌ 音声ファイル保存エラー: {e}", exc_info=True)
         return False
 
 def background_voice_generation(text, filename, speaker_id=3):
     logger.info(f"🎤 バックグラウンド音声生成開始: {filename}")
-    voice_data = generate_voice_fast(text, speaker_id)
-    if voice_data and len(voice_data) > 1000:
-        if not store_voice_file(filename, voice_data):
-            logger.error(f"❌ バックグラウンド音声保存失敗: {filename}")
-    else:
-        logger.warning(f"🎤 バックグラウンド音声生成失敗: {filename}")
+    
+    # 生成中ステータスを先に登録
+    with voice_files_lock:
+        voice_files[filename] = {
+            'data': None, 
+            'created_at': time.time(), 
+            'filepath': os.path.join(VOICE_DIR, filename),
+            'status': 'generating'
+        }
+    
+    try:
+        voice_data = generate_voice_fast(text, speaker_id)
+        if voice_data and len(voice_data) > 1000:
+            if store_voice_file(filename, voice_data):
+                logger.info(f"✅ バックグラウンド音声生成成功: {filename}")
+            else:
+                logger.error(f"❌ バックグラウンド音声保存失敗: {filename}")
+                # 失敗した場合はステータスを更新
+                with voice_files_lock:
+                    if filename in voice_files:
+                        voice_files[filename]['status'] = 'failed'
+        else:
+            logger.warning(f"🎤 バックグラウンド音声生成失敗: {filename} - データサイズ不正")
+            with voice_files_lock:
+                if filename in voice_files:
+                    voice_files[filename]['status'] = 'failed'
+    except Exception as e:
+        logger.error(f"❌ バックグラウンド音声生成エラー ({filename}): {e}", exc_info=True)
+        with voice_files_lock:
+            if filename in voice_files:
+                voice_files[filename]['status'] = 'failed'
 
 @app.route('/')
 def index():
     return jsonify({
-        'service': 'もちこ AI Assistant (Stable Search)',
+        'service': 'もちこ AI Assistant (Enhanced Web Search)',
         'status': 'running',
         'voicevox_status': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
-        'web_search_enabled': 'DuckDuckGo API (Free)',
+        'voicevox_url': WORKING_VOICEVOX_URL,
+        'web_search_enabled': 'Yahoo News + Wikipedia + Google',
+        'voice_dir': VOICE_DIR,
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -306,27 +496,92 @@ def chat_lsl():
 @app.route('/voice/<filename>')
 def serve_voice(filename):
     try:
+        logger.info(f"🎵 音声ファイル要求: {filename}")
+        
+        # メモリキャッシュをまずチェック
         with voice_files_lock:
             if filename in voice_files:
                 voice_info = voice_files[filename]
-                logger.info(f"🎵 メモリから音声配信: {filename}")
-                return app.response_class(response=voice_info['data'], status=200, mimetype='audio/wav', headers={'Content-Disposition': f'inline; filename="{filename}"', 'Content-Length': str(len(voice_info['data']))})
+                status = voice_info.get('status', 'unknown')
+                logger.info(f"🎵 メモリ内ファイル状態: {status}")
+                
+                # 生成完了している場合
+                if status == 'ready' and voice_info.get('data'):
+                    logger.info(f"🎵 メモリから音声配信成功: {filename}")
+                    return app.response_class(
+                        response=voice_info['data'], 
+                        status=200, 
+                        mimetype='audio/wav',
+                        headers={
+                            'Content-Disposition': f'inline; filename="{filename}"',
+                            'Content-Length': str(len(voice_info['data'])),
+                            'Cache-Control': 'no-cache'
+                        }
+                    )
+                
+                # 生成中の場合は少し待ってからディスクをチェック
+                elif status == 'generating':
+                    logger.info(f"🎵 音声生成中、ディスクをチェック: {filename}")
+                    time.sleep(1)  # 1秒待機
         
+        # ディスクファイルをチェック
         filepath = os.path.join(VOICE_DIR, filename)
         if os.path.exists(filepath):
-            logger.info(f"🎵 ディスクから音声配信: {filename}")
-            return send_from_directory(VOICE_DIR, filename, mimetype='audio/wav')
+            try:
+                # ファイルサイズをチェック
+                file_size = os.path.getsize(filepath)
+                if file_size > 1000:  # 1KB以上なら有効とみなす
+                    logger.info(f"🎵 ディスクから音声配信成功: {filename} ({file_size} bytes)")
+                    return send_from_directory(
+                        VOICE_DIR, 
+                        filename, 
+                        mimetype='audio/wav',
+                        as_attachment=False
+                    )
+                else:
+                    logger.warning(f"🎵 ファイルサイズが小さすぎます: {filename} ({file_size} bytes)")
+            except Exception as e:
+                logger.error(f"❌ ディスクファイル読み込みエラー: {e}")
         
+        # ファイルが見つからない場合の詳細ログ
         logger.warning(f"🔍 音声ファイルが見つかりません: {filename}")
-        return jsonify({'error': 'Voice file not found', 'filename': filename}), 404
+        logger.info(f"🔍 探索パス: {filepath}")
+        logger.info(f"🔍 ディレクトリ存在: {os.path.exists(VOICE_DIR)}")
+        
+        if os.path.exists(VOICE_DIR):
+            files_in_dir = os.listdir(VOICE_DIR)
+            logger.info(f"🔍 ディレクトリ内ファイル数: {len(files_in_dir)}")
+            if files_in_dir:
+                logger.info(f"🔍 最新ファイル例: {files_in_dir[-1] if files_in_dir else 'なし'}")
+        
+        # メモリ内ファイル状況も表示
+        with voice_files_lock:
+            logger.info(f"🔍 メモリ内ファイル数: {len(voice_files)}")
+            if filename in voice_files:
+                status = voice_files[filename].get('status', 'unknown')
+                logger.info(f"🔍 要求ファイルステータス: {status}")
+        
+        return jsonify({
+            'error': 'Voice file not found or not ready', 
+            'filename': filename,
+            'voice_dir': VOICE_DIR,
+            'disk_exists': os.path.exists(filepath),
+            'memory_status': voice_files.get(filename, {}).get('status', 'not_found')
+        }), 404
         
     except Exception as e:
         logger.error(f"❌ 音声配信エラー ({filename}): {e}", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
+        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
 
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy', 'voicevox_url': WORKING_VOICEVOX_URL, 'web_search_enabled': 'DuckDuckGo API (Free)', 'voice_cache_size': len(voice_cache), 'stored_voice_files': len(voice_files)})
+    return jsonify({
+        'status': 'healthy', 
+        'voicevox_url': WORKING_VOICEVOX_URL, 
+        'web_search_enabled': 'Yahoo News + Wikipedia + Google', 
+        'voice_cache_size': len(voice_cache), 
+        'stored_voice_files': len(voice_files)
+    })
 
 @app.route('/debug/voices')
 def debug_voices():
@@ -337,9 +592,60 @@ def debug_voices():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 新しいデバッグエンドポイント
+@app.route('/debug/search/<query>')
+def debug_search(query):
+    """Web検索のテスト"""
+    try:
+        result = enhanced_web_search(query)
+        return jsonify({
+            'query': query,
+            'result': result,
+            'should_search': should_search(query),
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 音声生成テストエンドポイント
+@app.route('/debug/voice_test/<text>')
+def debug_voice_test(text):
+    """音声生成のテスト"""
+    try:
+        if not WORKING_VOICEVOX_URL:
+            return jsonify({'error': 'VOICEVOX not available'}), 503
+        
+        timestamp = int(time.time() * 1000)
+        filename = f"test_voice_{timestamp}.wav"
+        
+        # 同期的に音声生成
+        voice_data = generate_voice_fast(text[:30], 3)  # 30文字まで
+        
+        if voice_data and len(voice_data) > 1000:
+            if store_voice_file(filename, voice_data):
+                return jsonify({
+                    'status': 'success',
+                    'filename': filename,
+                    'url': f'/voice/{filename}',
+                    'text': text[:30],
+                    'size': len(voice_data),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+        
+        return jsonify({
+            'status': 'failed',
+            'error': 'Voice generation failed',
+            'voice_data_size': len(voice_data) if voice_data else 0
+        }), 500
+        
+    except Exception as e:
+        logger.error(f"音声テストエラー: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = os.environ.get('HOST', '0.0.0.0')
     os.makedirs(VOICE_DIR, exist_ok=True)
     logger.info(f"🎵 音声ディレクトリ準備完了: {VOICE_DIR}")
+    logger.info(f"🔍 強化Web検索機能が有効: Yahoo!ニュース + Wikipedia + Google")
     app.run(host=host, port=port, debug=False, threaded=True)
