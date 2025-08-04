@@ -223,23 +223,42 @@ def cache_voice(text, speaker_id, voice_data):
             del voice_cache[next(iter(voice_cache))]
         voice_cache[get_cache_key(text, speaker_id)] = voice_data
 
-# --- 強化された音声生成 ---
+# --- 強化された音声生成 (修正済みの関数) ---
 def generate_voice_fast(text, speaker_id=3):
-    if not WORKING_VOICEVOX_URL: return None
-    if len(text) > VOICEVOX_MAX_TEXT_LENGTH: text = text[:VOICEVOX_MAX_TEXT_LENGTH] + "..."
+    if not WORKING_VOICEVOX_URL:
+        logger.warning("🚫 VOICEVOX利用不可 - 音声生成スキップ")
+        return None
+        
+    if len(text) > VOICEVOX_MAX_TEXT_LENGTH:
+        text = text[:VOICEVOX_MAX_TEXT_LENGTH] + "..."
+    
     if cached_voice := get_cached_voice(text, speaker_id):
         logger.info(f"🚀 キャッシュヒット: '{text[:20]}...'")
         return cached_voice
     
-    logger.info(f"🎵 音声合成開始: '{text}'")
+    logger.info(f"🎵 音声合成開始: '{text}' (speaker:{speaker_id})")
     start_time = time.time()
+    
     try:
-        query_response = requests.post(f"{WORKING_VOICEVOX_URL}/audio_query", params={'text': text, 'speaker': speaker_id}, timeout=VOICEVOX_FAST_TIMEOUT)
+        # Step 1: audio_query
+        logger.info("   -> Step 1/2: audio_query")
+        query_response = requests.post(
+            f"{WORKING_VOICEVOX_URL}/audio_query", 
+            params={'text': text, 'speaker': speaker_id}, 
+            timeout=VOICEVOX_FAST_TIMEOUT
+        )
         if query_response.status_code != 200:
             logger.error(f"❌ Query失敗: {query_response.status_code} {query_response.text[:200]}")
             return None
         
-        synthesis_response = requests.post(f"{WORKING_VOICEVOX_URL}/synthesis", params={'speaker': speaker_id}, json=query_response.json(), timeout=VOICEVOX_FAST_TIMEOUT * 2)
+        # Step 2: synthesis
+        logger.info("   -> Step 2/2: synthesis")
+        synthesis_response = requests.post(
+            f"{WORKING_VOICEVOX_URL}/synthesis", 
+            params={'speaker': speaker_id}, 
+            json=query_response.json(), 
+            timeout=VOICEVOX_FAST_TIMEOUT * 4  # ★★★ タイムアウトを40秒に延長 ★★★
+        )
         if synthesis_response.status_code != 200:
             logger.error(f"❌ Synthesis失敗: {synthesis_response.status_code} {synthesis_response.text[:200]}")
             return None
@@ -248,6 +267,7 @@ def generate_voice_fast(text, speaker_id=3):
         logger.info(f"✅ 音声合成成功: {time.time() - start_time:.2f}秒, {len(voice_data)}bytes")
         cache_voice(text, speaker_id, voice_data)
         return voice_data
+        
     except Exception as e:
         logger.error(f"❌ 音声合成エラー: {e}")
         return None
