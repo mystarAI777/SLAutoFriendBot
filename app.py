@@ -6,8 +6,10 @@ logging.basicConfig(    level=logging.INFO,    format='%(asctime)s - %(name)s - 
 VOICEVOX_MAX_TEXT_LENGTH = 50VOICEVOX_FAST_TIMEOUT = 10
 --- 音声ファイル保存設定 ---
 VOICE_DIR = '/tmp/voices'
-音声ディレクトリを作成
-os.makedirs(VOICE_DIR, exist_ok=True)logger.info(f"📁 音声ディレクトリを確認/作成しました: {VOICE_DIR}")
+音声ディレクトリを作成し、権限を設定
+try:    os.makedirs(VOICE_DIR, exist_ok=True)    os.chmod(VOICE_DIR, 0o777)  # 読み書き実行を許可    logger.info(f"📁 音声ディレクトリを確認/作成しました: {VOICE_DIR}")except Exception as e:    logger.error(f"❌ 音声ディレクトリ作成/権限設定エラー: {e}")    sys.exit(1)
+ディレクトリがアクセス可能かチェック
+if not os.access(VOICE_DIR, os.W_OK | os.R_OK):    logger.critical(f"❌ 音声ディレクトリ {VOICE_DIR} にアクセスできません")    sys.exit(1)
 --- 音声キャッシュ設定 ---
 voice_cache = {}CACHE_MAX_SIZE = 100cache_lock = threading.Lock()
 --- Secret Fileからの設定読み込み ---
@@ -17,9 +19,12 @@ DATABASE_URL = get_secret('DATABASE_URL')GROQ_API_KEY = get_secret('GROQ_API_KEY
 groq_client = Nonetry:    from groq import Groq    if GROQ_API_KEY:        groq_client = Groq(api_key=GROQ_API_KEY)        logger.info("✅ Groqクライアント初期化成功")    else:        logger.error("❌ GROQ_API_KEYが設定されていません")except ImportError:    logger.error("❌ groqライブラリのインポートに失敗しました")except Exception as e:    logger.error(f"❌ Groqクライアント初期化エラー: {e}")
 --- 強化されたVOICEVOX接続テスト ---
 VOICEVOX_URLS = [    'http://localhost:50021', 'http://127.0.0.1:50021',    'http://voicevox-engine:50021', 'http://voicevox:50021']
-def find_working_voicevox_url():    logger.info("🚀 VOICEVOX URL検索開始")    urls_to_test = [url for url in ([VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS) if url]    for url in urls_to_test:        try:            logger.info(f"📡 テスト開始: {url}")            if requests.get(f"{url}/version", timeout=5).status_code == 200:                logger.info(f"🎯 VOICEVOX URL決定: {url}")                return url        except requests.exceptions.RequestException:            continue    default_url = 'http://localhost:50021'    logger.warning(f"❌ 利用可能なVOICEVOX URLが見つかりません。デフォルトURLを使用: {default_url}")    return default_url
+def find_working_voicevox_url(max_retries=3, retry_delay=2):    logger.info("🚀 VOICEVOX URL検索開始")    urls_to_test = [url for url in ([VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS) if url]    for url in urls_to_test:        for attempt in range(1, max_retries + 1):            try:                logger.info(f"📡 テスト開始: {url} (試行 {attempt}/{max_retries})")                response = requests.get(f"{url}/version", timeout=5)                if response.status_code == 200:                    logger.info(f"🎯 VOICEVOX URL決定: {url}")                    return url                logger.warning(f"📡 テスト失敗: {url} - ステータスコード {response.status_code}")            except requests.exceptions.RequestException as e:                logger.warning(f"📡 テスト失敗: {url} - エラー: {e}")                if attempt < max_retries:                    time.sleep(retry_delay)                    continue    default_url = 'http://localhost:50021'    logger.warning(f"❌ 利用可能なVOICEVOX URLが見つかりません。デフォルトURLを使用: {default_url}")    return default_url
 --- 初期化処理 ---
 WORKING_VOICEVOX_URL = find_working_voicevox_url()logger.info(f"✅ VOICEVOX初期化完了: {WORKING_VOICEVOX_URL}")
+VOICEVOX接続テスト
+def test_voicevox_connection():    if not WORKING_VOICEVOX_URL:        logger.error("❌ VOICEVOX URLが設定されていません")        return False    try:        response = requests.get(f"{WORKING_VOICEVOX_URL}/speakers", timeout=5)        response.raise_for_status()        logger.info(f"✅ VOICEVOX接続テスト成功: {len(response.json())} スピーカー取得")        return True    except requests.exceptions.RequestException as e:        logger.error(f"❌ VOICEVOX接続テスト失敗: {e}")        return False
+if not test_voicevox_connection():    logger.warning("⚠️ VOICEVOX接続テスト失敗。音声機能が制限されます。")
 if not DATABASE_URL:    logger.critical("FATAL: DATABASE_URL が設定されていません")    sys.exit(1)
 if not groq_client:    logger.critical("FATAL: Groqクライアントの初期化に失敗しました")    sys.exit(1)
 app = Flask(name)CORS(app)engine = create_engine(DATABASE_URL)Base = declarative_base()
