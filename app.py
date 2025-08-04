@@ -135,7 +135,7 @@ def get_or_create_user(user_uuid, user_name):
     finally: session.close()
 
 def generate_ai_response(user_data, message):
-    system_prompt = f"あなたは「もちこ」です。{user_data.user_name}さんと話します。40文字以内で親しみやすく返事してください。語尾「ですねぇ」「ますねぇ」、一人称「あてぃし」"
+    system_prompt = f"あなたは「もちこ」です。{user_data.user_name}さんと話します。40文字以内で親しみやすく返事してください。ギャル口調、もちこは自分のことを「あてぃし」を言います。"
     completion = groq_client.chat.completions.create(
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message or "こんにちは"}],
         model="llama3-8b-8192", temperature=0.8, max_tokens=80
