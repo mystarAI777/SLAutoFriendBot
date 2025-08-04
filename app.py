@@ -148,9 +148,8 @@ def generate_ai_response(user_data, message):
             temperature=0.7,
             max_tokens=120,
             # ★ 変更点: Web検索ツールを有効化
-            tools=[{
-                "type": "tavily_search",
-                "tavily_search": { "max_results": 3 }
+           tools=[{
+                "type": "browser_search"
             }],
             tool_choice="auto" # AIが必要に応じてツール（検索）を使うように設定
         )
