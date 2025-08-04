@@ -13,7 +13,6 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, DateTime, Integer
 from sqlalchemy.orm import declarative_base, sessionmaker
-from groq import Groq
 from urllib.parse import quote_plus, urljoin
 from bs4 import BeautifulSoup
 
@@ -55,6 +54,20 @@ DATABASE_URL = get_secret('DATABASE_URL')
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
+# --- Groqクライアントの初期化（エラーハンドリング付き） ---
+groq_client = None
+try:
+    from groq import Groq
+    if GROQ_API_KEY:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        logger.info("✅ Groqクライアント初期化成功")
+    else:
+        logger.error("❌ GROQ_API_KEYが設定されていません")
+except ImportError:
+    logger.error("❌ groqライブラリのインポートに失敗しました")
+except Exception as e:
+    logger.error(f"❌ Groqクライアント初期化エラー: {e}")
+
 # --- 強化されたVOICEVOX接続テスト ---
 VOICEVOX_URLS = [
     'http://localhost:50021', 'http://127.0.0.1:50021',
@@ -79,13 +92,16 @@ def find_working_voicevox_url():
 WORKING_VOICEVOX_URL = find_working_voicevox_url()
 logger.info(f"✅ VOICEVOX初期化完了: {WORKING_VOICEVOX_URL or '失敗'}")
 
-if not DATABASE_URL or not GROQ_API_KEY:
-    logger.critical("FATAL: 必須環境変数が不足。")
+if not DATABASE_URL:
+    logger.critical("FATAL: DATABASE_URL が設定されていません")
+    sys.exit(1)
+
+if not groq_client:
+    logger.critical("FATAL: Groqクライアントの初期化に失敗しました")
     sys.exit(1)
 
 app = Flask(__name__)
 CORS(app)
-groq_client = Groq(api_key=GROQ_API_KEY)
 engine = create_engine(DATABASE_URL)
 Base = declarative_base()
 
@@ -100,7 +116,7 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ★ 変更点: 強化されたWeb検索機能 - Yahoo!ニュース & Wikipedia対応 ★
+# ★ 強化されたWeb検索機能 - Yahoo!ニュース & Wikipedia対応 ★
 # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
 def clean_text(text):
@@ -303,6 +319,9 @@ def get_or_create_user(user_uuid, user_name):
 
 def generate_ai_response(user_data, message):
     """【強化版】Web検索結果をプロンプトに含めてAI応答を生成"""
+    if not groq_client:
+        return "あてぃし、今ちょっと調子悪いかも...またあとで話そ！"
+
     search_info = ""
     
     # Web検索が必要かチェック
@@ -453,6 +472,7 @@ def index():
     return jsonify({
         'service': 'もちこ AI Assistant (Enhanced Web Search)',
         'status': 'running',
+        'groq_status': 'available' if groq_client else 'unavailable',
         'voicevox_status': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
         'voicevox_url': WORKING_VOICEVOX_URL,
         'web_search_enabled': 'Yahoo News + Wikipedia + Google',
@@ -577,6 +597,7 @@ def serve_voice(filename):
 def health_check():
     return jsonify({
         'status': 'healthy', 
+        'groq_status': 'available' if groq_client else 'unavailable',
         'voicevox_url': WORKING_VOICEVOX_URL, 
         'web_search_enabled': 'Yahoo News + Wikipedia + Google', 
         'voice_cache_size': len(voice_cache), 
@@ -648,4 +669,5 @@ if __name__ == '__main__':
     os.makedirs(VOICE_DIR, exist_ok=True)
     logger.info(f"🎵 音声ディレクトリ準備完了: {VOICE_DIR}")
     logger.info(f"🔍 強化Web検索機能が有効: Yahoo!ニュース + Wikipedia + Google")
+    logger.info(f"🤖 Groqクライアント状態: {'利用可能' if groq_client else '利用不可'}")
     app.run(host=host, port=port, debug=False, threaded=True)
