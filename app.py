@@ -187,7 +187,15 @@ def background_voice_generation(text, filename, speaker_id=3):
             logger.error(f"❌ バックグラウンド音声保存エラー: {e}")
     else:
         logger.warning(f"🎤 バックグラウンド音声生成失敗、またはデータ不足: {filename}")
-
+@app.route('/')
+def index():
+    """ルートURLにアクセスした際に、サービスのステータスを返す"""
+    return jsonify({
+        'service': 'もちこ AI Assistant (Live)',
+        'status': 'running',
+        'voicevox_status': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
+        'timestamp': datetime.utcnow().isoformat()
+    })
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     """非同期対応チャットエンドポイント"""
