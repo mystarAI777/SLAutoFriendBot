@@ -4,7 +4,5 @@ sqlalchemy
 groq
 openai
 requests
-
-# ▼ データベースに応じてどちらか（または両方）が必要
 psycopg2-binary  # PostgreSQLの場合
 mysqlclient      # MySQLの場合
