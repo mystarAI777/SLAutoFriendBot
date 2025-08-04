@@ -5,7 +5,7 @@ logging.basicConfig(    level=logging.INFO,    format='%(asctime)s - %(name)s - 
 --- 最適化設定 ---
 VOICEVOX_MAX_TEXT_LENGTH = 50VOICEVOX_FAST_TIMEOUT = 10
 --- 音声ファイル保存設定 ---
-VOICE_DIR = '/tmp/voices'
+VOICE_DIR = '/app/voices'
 音声ディレクトリを作成し、権限を設定
 try:    os.makedirs(VOICE_DIR, exist_ok=True)    os.chmod(VOICE_DIR, 0o777)  # 読み書き実行を許可    logger.info(f"📁 音声ディレクトリを確認/作成しました: {VOICE_DIR}")except Exception as e:    logger.error(f"❌ 音声ディレクトリ作成/権限設定エラー: {e}")    sys.exit(1)
 ディレクトリがアクセス可能かチェック
@@ -24,7 +24,10 @@ def find_working_voicevox_url(max_retries=3, retry_delay=2):    logger.info("�
 WORKING_VOICEVOX_URL = find_working_voicevox_url()logger.info(f"✅ VOICEVOX初期化完了: {WORKING_VOICEVOX_URL}")
 VOICEVOX接続テスト
 def test_voicevox_connection():    if not WORKING_VOICEVOX_URL:        logger.error("❌ VOICEVOX URLが設定されていません")        return False    try:        response = requests.get(f"{WORKING_VOICEVOX_URL}/speakers", timeout=5)        response.raise_for_status()        logger.info(f"✅ VOICEVOX接続テスト成功: {len(response.json())} スピーカー取得")        return True    except requests.exceptions.RequestException as e:        logger.error(f"❌ VOICEVOX接続テスト失敗: {e}")        return False
-if not test_voicevox_connection():    logger.warning("⚠️ VOICEVOX接続テスト失敗。音声機能が制限されます。")
+音声合成テスト
+def test_voice_synthesis():    if not WORKING_VOICEVOX_URL:        logger.error("❌ VOICEVOX URLが設定されていません")        return False    try:        test_text = "テスト"        speaker_id = 3        logger.info(f"🧪 音声合成テスト開始: テキスト='{test_text}', スピーカー={speaker_id}")        query_response = requests.post(            f"{WORKING_VOICEVOX_URL}/audio_query",            params={'text': test_text, 'speaker': speaker_id},            timeout=VOICEVOX_FAST_TIMEOUT        )        query_response.raise_for_status()        synthesis_response = requests.post(            f"{WORKING_VOICEVOX_URL}/synthesis",            params={'speaker': speaker_id},            json=query_response.json(),            timeout=VOICEVOX_FAST_TIMEOUT * 6        )        synthesis_response.raise_for_status()        voice_data = synthesis_response.content        if len(voice_data) > 1000:            logger.info(f"✅ 音声合成テスト成功: サイズ={len(voice_data)} bytes")            return True        else:            logger.warning("❌ 音声合成テスト失敗: 生成された音声データが小さすぎます")            return False    except requests.exceptions.RequestException as e:        logger.error(f"❌ 音声合成テスト失敗: {e}")        return False
+VOICEVOXステータスを初期化
+VOICEVOX_ENABLED = test_voicevox_connection() and test_voice_synthesis()if not VOICEVOX_ENABLED:    logger.warning("⚠️ VOICEVOX接続または音声合成テスト失敗。音声機能が無効化されます。")
 if not DATABASE_URL:    logger.critical("FATAL: DATABASE_URL が設定されていません")    sys.exit(1)
 if not groq_client:    logger.critical("FATAL: Groqクライアントの初期化に失敗しました")    sys.exit(1)
 app = Flask(name)CORS(app)engine = create_engine(DATABASE_URL)Base = declarative_base()
@@ -199,7 +202,7 @@ system_prompt = f"""あなたは「もちこ」という名前の賢いギャル
 def get_cache_key(text, speaker_id):    return f"{hash(text)}_{speaker_id}"
 def get_cached_voice(text, speaker_id):    with cache_lock:        return voice_cache.get(get_cache_key(text, speaker_id))
 def cache_voice(text, speaker_id, voice_data):    with cache_lock:        if len(voice_cache) >= CACHE_MAX_SIZE:            del voice_cache[next(iter(voice_cache))]        voice_cache[get_cache_key(text, speaker_id)] = voice_data
-def generate_voice_fast(text, speaker_id=3):    if not WORKING_VOICEVOX_URL:        logger.error("❌ VOICEVOX URLが設定されていません")        return None    if not text or not isinstance(text, str):        logger.error("❌ 無効なテキスト入力")        return None    if not isinstance(speaker_id, int) or speaker_id < 0:        logger.error(f"❌ 無効なスピーカーID: {speaker_id}")        return None    if len(text) > VOICEVOX_MAX_TEXT_LENGTH:        text = text[:VOICEVOX_MAX_TEXT_LENGTH]        logger.info(f"📝 テキストを{VOICEVOX_MAX_TEXT_LENGTH}文字に短縮: {text}")    if cached_voice := get_cached_voice(text, speaker_id):        logger.info(f"✅ キャッシュから音声を取得: {text[:20]}...")        return cached_voice
+def generate_voice_fast(text, speaker_id=3):    if not VOICEVOX_ENABLED:        logger.error("❌ VOICEVOXが無効化されています")        return None    if not WORKING_VOICEVOX_URL:        logger.error("❌ VOICEVOX URLが設定されていません")        return None    if not text or not isinstance(text, str):        logger.error("❌ 無効なテキスト入力")        return None    if not isinstance(speaker_id, int) or speaker_id < 0:        logger.error(f"❌ 無効なスピーカーID: {speaker_id}")        return None    if len(text) > VOICEVOX_MAX_TEXT_LENGTH:        text = text[:VOICEVOX_MAX_TEXT_LENGTH]        logger.info(f"📝 テキストを{VOICEVOX_MAX_TEXT_LENGTH}文字に短縮: {text}")    if cached_voice := get_cached_voice(text, speaker_id):        logger.info(f"✅ キャッシュから音声を取得: {text[:20]}...")        return cached_voice
 try:
     logger.info(f"🎙️ 音声合成開始: テキスト='{text[:20]}...', スピーカー={speaker_id}")
     query_response = requests.post(
@@ -276,7 +279,7 @@ except Exception as e:
         if filename in voice_files:
             voice_files[filename]['status'] = 'failed'
 
-@app.route('/')def index():    return jsonify({        'service': 'もちこ AI Assistant (Enhanced Web Search)',        'status': 'running',        'groq_status': 'available' if groq_client else 'unavailable',        'voicevox_status': 'available' if WORKING_VOICEVOX_URL else 'unavailable',        'voicevox_url': WORKING_VOICEVOX_URL,        'web_search_enabled': 'Yahoo News + Wikipedia + Google',        'voice_dir': VOICE_DIR,        'timestamp': datetime.utcnow().isoformat()    })
+@app.route('/')def index():    return jsonify({        'service': 'もちこ AI Assistant (Enhanced Web Search)',        'status': 'running',        'groq_status': 'available' if groq_client else 'unavailable',        'voicevox_status': 'available' if VOICEVOX_ENABLED else 'unavailable',        'voicevox_url': WORKING_VOICEVOX_URL,        'web_search_enabled': 'Yahoo News + Wikipedia + Google',        'voice_dir': VOICE_DIR,        'timestamp': datetime.utcnow().isoformat()    })
 @app.route('/chat_lsl', methods=['POST'])def chat_lsl():    try:        data = request.json or {}        user_uuid = data.get('uuid')        user_name = data.get('name')        message = data.get('message', '')
     if not (user_uuid and user_name): return "Error: uuid and name required", 400
     
@@ -286,7 +289,7 @@ except Exception as e:
     logger.info(f"🤖 AI応答: '{ai_text}'")
     
     audio_url = ""
-    if WORKING_VOICEVOX_URL:
+    if VOICEVOX_ENABLED:
         timestamp = int(time.time() * 1000)
         filename = f"voice_{user_uuid[:8]}_{timestamp}.wav"
         audio_url = f'/voice/{filename}'
