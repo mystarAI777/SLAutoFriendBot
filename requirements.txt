@@ -7,9 +7,9 @@ sqlalchemy==2.0.23
 psycopg2-binary==2.9.9  # PostgreSQL
 mysqlclient==2.2.0      # MySQL
 
-# AI/API clients
-groq==0.4.1
-openai==1.3.7
+# AI/API clients - Updated versions
+groq>=0.10.0
+openai>=1.40.0
 
 # HTTP requests and web scraping
 requests==2.31.0
