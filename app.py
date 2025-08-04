@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 import threading
+import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, send_from_directory
@@ -13,21 +14,19 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from groq import Groq
 from openai import OpenAI
 
-# ログ設定
-logging.basicConfig(level=logging.INFO)
+# ログ設定を詳細に
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # --- 最適化設定 ---
-# VOICEVOX処理最適化
-VOICEVOX_MAX_TEXT_LENGTH = 50  # テキスト長制限（短縮）
-VOICEVOX_FAST_TIMEOUT = 10     # タイムアウトを少し長く
-VOICEVOX_WORKERS = 2           # 並列処理用ワーカー数
+VOICEVOX_MAX_TEXT_LENGTH = 50
+VOICEVOX_FAST_TIMEOUT = 10  # タイムアウトを長く
+VOICEVOX_WORKERS = 2
 
-# 音声ファイル保存ディレクトリを作成
-VOICE_DIR = '/tmp/voices'
-os.makedirs(VOICE_DIR, exist_ok=True)
-
-# 音声キャッシュ（簡易版）
+# 音声キャッシュ
 voice_cache = {}
 CACHE_MAX_SIZE = 100
 cache_lock = threading.Lock()
@@ -51,7 +50,7 @@ DATABASE_URL = get_secret('DATABASE_URL')
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
-# --- 改良版VOICEVOX接続テスト ---
+# --- 強化されたVOICEVOX接続テスト ---
 VOICEVOX_URLS = [
     'http://localhost:50021',
     'http://127.0.0.1:50021',
@@ -59,69 +58,118 @@ VOICEVOX_URLS = [
     'http://voicevox:50021'
 ]
 
+def check_system_processes():
+    """システムプロセスとポートの確認"""
+    logger.info("🔍 システム診断開始")
+    
+    try:
+        # プロセス確認
+        ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+        voicevox_processes = [line for line in ps_result.stdout.split('\n') if 'voicevox' in line.lower()]
+        if voicevox_processes:
+            logger.info(f"🔍 VOICEVOXプロセス発見: {len(voicevox_processes)}個")
+            for proc in voicevox_processes[:3]:  # 最初の3つだけ表示
+                logger.info(f"   {proc}")
+        else:
+            logger.warning("🔍 VOICEVOXプロセスが見つかりません")
+    except Exception as e:
+        logger.error(f"🔍 プロセス確認エラー: {e}")
+    
+    try:
+        # ポート確認
+        netstat_result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True, timeout=5)
+        port_50021 = [line for line in netstat_result.stdout.split('\n') if '50021' in line]
+        if port_50021:
+            logger.info(f"🔍 ポート50021の状態:")
+            for port_line in port_50021:
+                logger.info(f"   {port_line}")
+        else:
+            logger.warning("🔍 ポート50021がリッスンしていません")
+    except Exception as e:
+        logger.error(f"🔍 ポート確認エラー: {e}")
+
 def find_working_voicevox_url():
-    """改良版 - VOICEVOX URL検索（より詳細なテスト）"""
+    """強化されたVOICEVOX URL検索"""
+    logger.info("🚀 VOICEVOX URL検索開始")
+    
+    # システム診断実行
+    check_system_processes()
+    
     urls_to_test = []
     if VOICEVOX_URL_FROM_ENV:
         urls_to_test.insert(0, VOICEVOX_URL_FROM_ENV)
+        logger.info(f"🔧 環境変数URL: {VOICEVOX_URL_FROM_ENV}")
     urls_to_test.extend([url for url in VOICEVOX_URLS if url not in urls_to_test])
     
-    logger.info(f"🔍 VOICEVOX URL検索開始: {len(urls_to_test)}個のURLをテスト")
+    logger.info(f"🧪 テスト対象URL: {len(urls_to_test)}個")
     
     for i, url in enumerate(urls_to_test, 1):
-        logger.info(f"📡 ({i}/{len(urls_to_test)}) テスト中: {url}")
+        logger.info(f"📡 ({i}/{len(urls_to_test)}) テスト開始: {url}")
+        
         try:
-            # Step 1: バージョンチェック
+            # Step 1: バージョンチェック（詳細ログ）
+            logger.info(f"   ステップ1: GET {url}/version")
             version_response = requests.get(f"{url}/version", timeout=5)
-            if version_response.status_code != 200:
-                logger.warning(f"❌ バージョンチェック失敗: {version_response.status_code}")
-                continue
-                
-            version_info = version_response.json()
-            version = version_info.get('version', 'unknown')
-            logger.info(f"✅ バージョン確認成功: v{version}")
+            logger.info(f"   レスポンス: {version_response.status_code}")
             
-            # Step 2: スピーカーリストチェック
-            speakers_response = requests.get(f"{url}/speakers", timeout=5)
-            if speakers_response.status_code != 200:
-                logger.warning(f"❌ スピーカーリスト取得失敗: {speakers_response.status_code}")
-                continue
+            if version_response.status_code == 200:
+                version_info = version_response.json()
+                version = version_info.get('version', 'unknown')
+                logger.info(f"   ✅ バージョン: v{version}")
                 
-            speakers = speakers_response.json()
-            logger.info(f"✅ スピーカー確認成功: {len(speakers)}個")
-            
-            # Step 3: 実際の音声合成テスト
-            test_text = "テスト"
-            test_query_response = requests.post(
-                f"{url}/audio_query",
-                params={'text': test_text, 'speaker': 3},
-                timeout=5
-            )
-            if test_query_response.status_code != 200:
-                logger.warning(f"❌ 音声クエリテスト失敗: {test_query_response.status_code}")
-                continue
+                # Step 2: スピーカーリストチェック
+                logger.info(f"   ステップ2: GET {url}/speakers")
+                speakers_response = requests.get(f"{url}/speakers", timeout=5)
+                logger.info(f"   レスポンス: {speakers_response.status_code}")
                 
-            logger.info(f"✅ 音声クエリテスト成功")
-            
-            # 全テスト通過
-            logger.info(f"🎯 VOICEVOX URL決定: {url}")
-            return url
+                if speakers_response.status_code == 200:
+                    speakers = speakers_response.json()
+                    logger.info(f"   ✅ スピーカー: {len(speakers)}個")
+                    
+                    # Step 3: 簡単な音声合成テスト
+                    logger.info(f"   ステップ3: POST {url}/audio_query")
+                    test_query = requests.post(
+                        f"{url}/audio_query",
+                        params={'text': 'テスト', 'speaker': 3},
+                        timeout=8
+                    )
+                    logger.info(f"   レスポンス: {test_query.status_code}")
+                    
+                    if test_query.status_code == 200:
+                        logger.info(f"   ✅ 音声クエリテスト成功")
+                        logger.info(f"🎯 VOICEVOX URL決定: {url}")
+                        return url
+                    else:
+                        logger.warning(f"   ❌ 音声クエリテスト失敗: {test_query.status_code}")
+                else:
+                    logger.warning(f"   ❌ スピーカーリスト取得失敗: {speakers_response.status_code}")
+            else:
+                logger.warning(f"   ❌ バージョンチェック失敗: {version_response.status_code}")
                 
-        except requests.exceptions.Timeout:
-            logger.warning(f"⏰ タイムアウト: {url}")
-            continue
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"🔌 接続エラー: {url}")
-            continue
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"   ⏰ タイムアウト: {e}")
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"   🔌 接続エラー: {e}")
         except Exception as e:
-            logger.error(f"❌ 予期しないエラー ({url}): {e}")
-            continue
+            logger.error(f"   ❌ 予期しないエラー: {e}")
     
     logger.error("❌ 利用可能なVOICEVOX URLが見つかりません")
+    logger.info("🔧 トラブルシューティング情報:")
+    logger.info("   1. VOICEVOXエンジンが起動しているか確認")
+    logger.info("   2. ポート50021がリッスンしているか確認")
+    logger.info("   3. Docker内でのネットワーク設定を確認")
+    
     return None
 
 # VOICEVOX接続テスト実行
+logger.info("=" * 50)
+logger.info("VOICEVOX初期化開始")
 WORKING_VOICEVOX_URL = find_working_voicevox_url()
+if WORKING_VOICEVOX_URL:
+    logger.info(f"✅ VOICEVOX初期化成功: {WORKING_VOICEVOX_URL}")
+else:
+    logger.error("❌ VOICEVOX初期化失敗")
+logger.info("=" * 50)
 
 # --- 必須変数のチェック ---
 if not DATABASE_URL or not GROQ_API_KEY:
@@ -132,11 +180,10 @@ if not DATABASE_URL or not GROQ_API_KEY:
 app = Flask(__name__)
 CORS(app, origins=["*"], methods=["GET", "POST", "OPTIONS"])
 
-# --- 最適化されたサービス初期化 ---
+# --- サービス初期化 ---
 groq_client = None
 try:
     groq_client = Groq(api_key=GROQ_API_KEY)
-    # APIキー検証（高速）
     test_response = groq_client.chat.completions.create(
         messages=[{"role": "user", "content": "Hi"}], 
         model="llama3-8b-8192", 
@@ -146,7 +193,7 @@ try:
 except Exception as e:
     logger.error(f"❌ Groq API初期化失敗: {e}")
 
-# --- データベース設定（簡素化） ---
+# --- データベース設定 ---
 Base = declarative_base()
 
 class UserMemory(Base):
@@ -172,7 +219,7 @@ class UserDataContainer:
         self.interaction_count = interaction_count
 
 def get_or_create_user(user_uuid, user_name):
-    """最適化されたユーザーデータ取得"""
+    """ユーザーデータ取得"""
     session = Session()
     try:
         user_memory = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
@@ -199,12 +246,11 @@ def get_or_create_user(user_uuid, user_name):
         session.close()
 
 def generate_ai_response(user_data, message):
-    """最適化されたAI応答生成"""
+    """AI応答生成"""
     if not groq_client:
         return f"{user_data.user_name}さん、こんにちは！"
     
-    # 超シンプルプロンプト（高速化）
-    system_prompt = f"あなたは「もちこ」です。{user_data.user_name}さんと話します。40文字以内で親しみやすく返事してください。語尾「ですわ」「ますわ」、一人称「あてぃし」"
+    system_prompt = f"あなたは「もちこ」です。{user_data.user_name}さんと話します。40文字以内で親しみやすく返事してください。一人称「あてぃし」"
     
     try:
         completion = groq_client.chat.completions.create(
@@ -214,45 +260,39 @@ def generate_ai_response(user_data, message):
             ], 
             model="llama3-8b-8192",
             temperature=0.8,
-            max_tokens=80  # トークン数削減（高速化）
+            max_tokens=80
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI応答エラー: {e}")
-        return f"{user_data.user_name}さん、ちょっと考え中ですわ！"
+        return f"{user_data.user_name}さん、ちょっと考え中です！"
 
 # --- 音声キャッシュ機能 ---
 def get_cache_key(text, speaker_id):
-    """音声キャッシュキー生成"""
     return f"{hash(text)}_{speaker_id}"
 
 def get_cached_voice(text, speaker_id):
-    """キャッシュから音声取得"""
     with cache_lock:
         key = get_cache_key(text, speaker_id)
         return voice_cache.get(key)
 
 def cache_voice(text, speaker_id, voice_data):
-    """音声をキャッシュに保存"""
     with cache_lock:
         if len(voice_cache) >= CACHE_MAX_SIZE:
-            # 古いキャッシュを削除（FIFO）
             oldest_key = next(iter(voice_cache))
             del voice_cache[oldest_key]
-        
         key = get_cache_key(text, speaker_id)
         voice_cache[key] = voice_data
 
-# --- 修正版 - 確実な音声生成関数 ---
+# --- 強化された音声生成 ---
 def generate_voice_fast(text, speaker_id=3):
-    """修正版 - より確実な音声生成"""
+    """強化された音声生成（詳細ログ付き）"""
     if not WORKING_VOICEVOX_URL:
         logger.warning("🚫 VOICEVOX_URL未設定 - 音声生成スキップ")
         return None
     
-    # テキスト長制限
-    original_length = len(text)
     if len(text) > VOICEVOX_MAX_TEXT_LENGTH:
+        original_length = len(text)
         text = text[:VOICEVOX_MAX_TEXT_LENGTH] + "..."
         logger.info(f"📝 テキスト短縮: {original_length} → {len(text)}文字")
     
@@ -262,14 +302,14 @@ def generate_voice_fast(text, speaker_id=3):
         logger.info(f"🚀 キャッシュヒット: '{text[:20]}...' ({len(cached_voice)}bytes)")
         return cached_voice
     
+    logger.info(f"🎵 音声合成開始: '{text}' (speaker:{speaker_id})")
+    start_time = time.time()
+    
     try:
-        logger.info(f"🎵 音声合成開始: '{text}' (speaker:{speaker_id})")
-        start_time = time.time()
-        
-        # ステップ1: audio_query
+        # Step 1: audio_query
         query_url = f"{WORKING_VOICEVOX_URL}/audio_query"
         query_params = {'text': text, 'speaker': speaker_id}
-        logger.info(f"📤 Query送信: {query_url}")
+        logger.info(f"📤 Query送信: {query_url} - params: {query_params}")
         
         query_response = requests.post(
             query_url,
@@ -279,16 +319,17 @@ def generate_voice_fast(text, speaker_id=3):
         
         logger.info(f"📥 Query応答: {query_response.status_code}")
         if query_response.status_code != 200:
-            logger.error(f"❌ Query失敗: {query_response.status_code} - {query_response.text}")
+            logger.error(f"❌ Query失敗: {query_response.status_code}")
+            logger.error(f"レスポンス内容: {query_response.text[:200]}")
             return None
             
         query_data = query_response.json()
-        logger.info(f"📋 Query成功")
+        logger.info(f"📋 Query成功: データサイズ {len(str(query_data))}文字")
         
-        # ステップ2: synthesis
+        # Step 2: synthesis
         synthesis_url = f"{WORKING_VOICEVOX_URL}/synthesis"
         synthesis_params = {'speaker': speaker_id}
-        logger.info(f"📤 Synthesis送信: {synthesis_url}")
+        logger.info(f"📤 Synthesis送信: {synthesis_url} - speaker: {speaker_id}")
         
         synthesis_response = requests.post(
             synthesis_url,
@@ -300,7 +341,8 @@ def generate_voice_fast(text, speaker_id=3):
         
         logger.info(f"📥 Synthesis応答: {synthesis_response.status_code}")
         if synthesis_response.status_code != 200:
-            logger.error(f"❌ Synthesis失敗: {synthesis_response.status_code} - {synthesis_response.text}")
+            logger.error(f"❌ Synthesis失敗: {synthesis_response.status_code}")
+            logger.error(f"レスポンス内容: {synthesis_response.text[:200]}")
             return None
         
         voice_data = synthesis_response.content
@@ -308,17 +350,17 @@ def generate_voice_fast(text, speaker_id=3):
             logger.error(f"❌ 無効な音声データ: {len(voice_data) if voice_data else 0}bytes")
             return None
         
-        # 処理時間ログ
         elapsed = time.time() - start_time
         logger.info(f"✅ 音声合成成功: {elapsed:.2f}秒, {len(voice_data)}bytes")
         
         # キャッシュに保存
         cache_voice(text, speaker_id, voice_data)
+        logger.info(f"💾 キャッシュ保存完了")
         
         return voice_data
         
     except requests.exceptions.Timeout:
-        logger.error(f"⏰ 音声合成タイムアウト: '{text}'")
+        logger.error(f"⏰ 音声合成タイムアウト({VOICEVOX_FAST_TIMEOUT}s): '{text}'")
         return None
     except requests.exceptions.RequestException as req_error:
         logger.error(f"🌐 リクエストエラー: {req_error}")
@@ -327,13 +369,13 @@ def generate_voice_fast(text, speaker_id=3):
         logger.error(f"❌ 音声合成エラー: {e}")
         return None
 
-# --- 並列処理エンドポイント ---
+# --- エンドポイント ---
 executor = ThreadPoolExecutor(max_workers=VOICEVOX_WORKERS)
 
 @app.route('/')
 def index():
     return jsonify({
-        'service': 'もちこ AI Assistant (最適化版)',
+        'service': 'もちこ AI Assistant (デバッグ強化版)',
         'status': 'running',
         'voicevox': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
         'voicevox_url': WORKING_VOICEVOX_URL,
@@ -347,7 +389,7 @@ def index():
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
-    """修正版 - LSLチャットエンドポイント（音声URL確実生成版）"""
+    """強化されたLSLチャットエンドポイント"""
     try:
         data = request.json or {}
         user_uuid = data.get('uuid')
@@ -360,19 +402,21 @@ def chat_lsl():
         
         logger.info(f"📨 チャット受信: {user_name} ({user_uuid[:8]}...) - '{message[:30]}...'")
         
-        # 高速ユーザーデータ取得
+        # ユーザーデータ取得
         user_data = get_or_create_user(user_uuid, user_name)
         if not user_data:
             logger.error("❌ ユーザーデータ取得失敗")
             return "Error: User data failed", 500
         
-        # AI応答生成（高速）
+        # AI応答生成
         ai_text = generate_ai_response(user_data, message)
         logger.info(f"🤖 AI応答: '{ai_text}'")
         
-        # VOICEVOX利用不可の場合
+        # VOICEVOX利用可能性チェック（詳細ログ）
         if not WORKING_VOICEVOX_URL:
             logger.warning("🚫 VOICEVOX利用不可 - テキストのみ返却")
+            logger.info(f"🔧 VOICEVOX_URL: {WORKING_VOICEVOX_URL}")
+            logger.info(f"🔧 環境変数URL: {VOICEVOX_URL_FROM_ENV}")
             response_text = f"{ai_text}|"
             return app.response_class(
                 response=response_text, 
@@ -387,12 +431,14 @@ def chat_lsl():
         audio_url = ""
         if voice_data and len(voice_data) > 0:
             try:
-                # ユニークなファイル名生成
+                # 音声ファイル保存
                 timestamp = int(time.time() * 1000)
                 filename = f"voice_{user_uuid[:8]}_{timestamp}.wav"
-                filepath = os.path.join(VOICE_DIR, filename)
+                filepath = os.path.join('/tmp', filename)
                 
-                # 音声ファイル保存
+                # ディレクトリ確認
+                os.makedirs('/tmp', exist_ok=True)
+                
                 with open(filepath, 'wb') as f:
                     f.write(voice_data)
                 
@@ -407,11 +453,11 @@ def chat_lsl():
             except Exception as file_error:
                 logger.error(f"❌ ファイル保存エラー: {file_error}")
         else:
-            logger.warning(f"❌ 音声データ生成失敗")
+            logger.warning(f"❌ 音声データ生成失敗: voice_data={'None' if voice_data is None else f'{len(voice_data)}bytes'}")
         
-        # 最終レスポンス生成
+        # 最終レスポンス
         response_text = f"{ai_text}|{audio_url}"
-        logger.info(f"📤 最終レスポンス: '{ai_text}' | '{audio_url}'")
+        logger.info(f"📤 最終レスポンス: テキスト='{ai_text}', URL='{audio_url}'")
         
         return app.response_class(
             response=response_text, 
@@ -427,33 +473,32 @@ def chat_lsl():
 
 @app.route('/voice/<filename>')
 def serve_voice(filename):
-    """音声ファイル配信（改良版）"""
+    """音声ファイル配信"""
     try:
-        filepath = os.path.join(VOICE_DIR, filename)
+        filepath = os.path.join('/tmp', filename)
         if not os.path.exists(filepath):
             logger.error(f"❌ 音声ファイル不存在: {filepath}")
             return "File not found", 404
             
         logger.info(f"📁 音声ファイル配信: {filename} ({os.path.getsize(filepath)}bytes)")
-        return send_from_directory(VOICE_DIR, filename)
+        return send_from_directory('/tmp', filename)
     except Exception as e:
         logger.error(f"❌ 音声ファイル配信エラー: {e}")
         return "File not found", 404
 
 @app.route('/health')
 def health_check():
-    """ヘルスチェック（詳細版）"""
-    health_status = {
+    """詳細ヘルスチェック"""
+    return jsonify({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
         'database': 'connected' if DATABASE_URL else 'unavailable',
         'groq_api': 'available' if groq_client else 'unavailable',
-        'voicevox': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
-        'voicevox_url': WORKING_VOICEVOX_URL,
-        'voice_directory': {
-            'path': VOICE_DIR,
-            'exists': os.path.exists(VOICE_DIR),
-            'writable': os.access(VOICE_DIR, os.W_OK) if os.path.exists(VOICE_DIR) else False
+        'voicevox': {
+            'status': 'available' if WORKING_VOICEVOX_URL else 'unavailable',
+            'working_url': WORKING_VOICEVOX_URL,
+            'env_url': VOICEVOX_URL_FROM_ENV,
+            'test_urls': VOICEVOX_URLS
         },
         'cache_stats': {
             'size': len(voice_cache),
@@ -464,162 +509,66 @@ def health_check():
             'timeout': VOICEVOX_FAST_TIMEOUT,
             'workers': VOICEVOX_WORKERS
         }
-    }
-    
-    # VOICEVOX詳細チェック
-    if WORKING_VOICEVOX_URL:
-        try:
-            version_response = requests.get(f"{WORKING_VOICEVOX_URL}/version", timeout=3)
-            if version_response.status_code == 200:
-                health_status['voicevox_version'] = version_response.json()
-        except:
-            health_status['voicevox_version'] = 'check_failed'
-    
-    return jsonify(health_status)
+    })
 
-@app.route('/cache/clear', methods=['POST'])
-def clear_cache():
-    """音声キャッシュクリア"""
-    with cache_lock:
-        cache_size = len(voice_cache)
-        voice_cache.clear()
-    logger.info(f"🗑️ 音声キャッシュクリア: {cache_size}個削除")
-    return jsonify({'message': f'Cache cleared: {cache_size} items'})
-
-# --- 詳細デバッグエンドポイント ---
-@app.route('/debug/voicevox')
-def debug_voicevox():
-    """VOICEVOX詳細デバッグ情報"""
-    debug_info = {
-        'current_working_url': WORKING_VOICEVOX_URL,
-        'env_url': VOICEVOX_URL_FROM_ENV,
-        'voice_directory': {
-            'path': VOICE_DIR,
-            'exists': os.path.exists(VOICE_DIR),
-            'writable': os.access(VOICE_DIR, os.W_OK) if os.path.exists(VOICE_DIR) else False,
-            'files_count': len(os.listdir(VOICE_DIR)) if os.path.exists(VOICE_DIR) else 0
-        },
-        'test_results': {}
-    }
-    
-    # 全URLを再テスト
-    test_urls = [VOICEVOX_URL_FROM_ENV] if VOICEVOX_URL_FROM_ENV else []
-    test_urls.extend(VOICEVOX_URLS)
-    
-    for url in test_urls:
-        if not url:
-            continue
-            
-        test_result = {
-            'url': url,
-            'version_test': 'failed',
-            'speakers_test': 'failed',
-            'synthesis_test': 'failed',
-            'error': None
-        }
-        
-        try:
-            # バージョンテスト
-            version_response = requests.get(f"{url}/version", timeout=3)
-            if version_response.status_code == 200:
-                test_result['version_test'] = 'success'
-                test_result['version_info'] = version_response.json()
-            
-            # スピーカーテスト
-            speakers_response = requests.get(f"{url}/speakers", timeout=3)
-            if speakers_response.status_code == 200:
-                test_result['speakers_test'] = 'success'
-                test_result['speakers_count'] = len(speakers_response.json())
-            
-            # 音声合成テスト
-            query_response = requests.post(
-                f"{url}/audio_query",
-                params={'text': 'テスト', 'speaker': 3},
-                timeout=5
-            )
-            if query_response.status_code == 200:
-                test_result['synthesis_test'] = 'success'
-                
-        except Exception as e:
-            test_result['error'] = str(e)
-        
-        debug_info['test_results'][url] = test_result
-    
-    return jsonify(debug_info)
-
-@app.route('/debug/voice_test', methods=['POST'])
-def debug_voice_test():
-    """音声生成完全テスト"""
-    data = request.json or {}
-    test_text = data.get('text', 'テストですわ')
-    speaker_id = data.get('speaker', 3)
-    
-    result = {
-        'test_text': test_text,
-        'speaker_id': speaker_id,
+@app.route('/debug/voicevox_retry')
+def debug_voicevox_retry():
+    """VOICEVOX接続再試行"""
+    global WORKING_VOICEVOX_URL
+    logger.info("🔄 VOICEVOX URL再検索開始")
+    WORKING_VOICEVOX_URL = find_working_voicevox_url()
+    return jsonify({
+        'retry_result': 'success' if WORKING_VOICEVOX_URL else 'failed',
         'working_url': WORKING_VOICEVOX_URL,
-        'voice_directory': VOICE_DIR,
-        'steps': {}
-    }
-    
-    if not WORKING_VOICEVOX_URL:
-        result['error'] = 'VOICEVOX URL not available'
-        return jsonify(result)
-    
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+@app.route('/debug/system_info')
+def debug_system_info():
+    """システム情報取得"""
     try:
-        # Step 1: 音声生成
-        result['steps']['voice_generation'] = 'starting'
-        voice_data = generate_voice_fast(test_text, speaker_id)
+        # プロセス情報
+        ps_result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=5)
+        voicevox_processes = [line for line in ps_result.stdout.split('\n') if 'voicevox' in line.lower()]
         
-        if voice_data:
-            result['steps']['voice_generation'] = 'success'
-            result['voice_data_size'] = len(voice_data)
-            
-            # Step 2: ファイル保存
-            result['steps']['file_save'] = 'starting'
-            test_filename = f"test_voice_{int(time.time())}.wav"
-            test_filepath = os.path.join(VOICE_DIR, test_filename)
-            
-            with open(test_filepath, 'wb') as f:
-                f.write(voice_data)
-            
-            # Step 3: ファイル確認
-            if os.path.exists(test_filepath) and os.path.getsize(test_filepath) > 0:
-                result['steps']['file_save'] = 'success'
-                result['test_file_path'] = test_filepath
-                result['test_file_size'] = os.path.getsize(test_filepath)
-                result['test_file_url'] = f'/voice/{test_filename}'
-                result['success'] = True
-            else:
-                result['steps']['file_save'] = 'failed'
-                result['error'] = 'File save verification failed'
-        else:
-            result['steps']['voice_generation'] = 'failed'
-            result['error'] = 'Voice generation returned None'
-            
+        # ポート情報
+        netstat_result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True, timeout=5)
+        port_lines = [line for line in netstat_result.stdout.split('\n') if '50021' in line]
+        
+        return jsonify({
+            'processes': {
+                'voicevox_count': len(voicevox_processes),
+                'voicevox_processes': voicevox_processes[:5]  # 最初の5つ
+            },
+            'ports': {
+                'port_50021': port_lines
+            },
+            'directories': {
+                'tmp_exists': os.path.exists('/tmp'),
+                'tmp_writable': os.access('/tmp', os.W_OK),
+                'voicevox_engine_exists': os.path.exists('/opt/voicevox_engine')
+            }
+        })
     except Exception as e:
-        result['error'] = str(e)
-        result['success'] = False
-    
-    return jsonify(result)
+        return jsonify({'error': str(e)})
 
 # --- アプリケーション実行 ---
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = os.environ.get('HOST', '0.0.0.0')
     
-    logger.info(f"🚀 もちこAI最適化版起動")
+    logger.info("🚀 もちこAI デバッグ強化版起動")
     logger.info(f"📍 {host}:{port}")
     logger.info(f"🗄️ DB: {'OK' if DATABASE_URL else 'NG'}")
     logger.info(f"🤖 Groq: {'OK' if groq_client else 'NG'}")
     logger.info(f"🎵 VOICEVOX: {'OK' if WORKING_VOICEVOX_URL else 'NG'}")
     if WORKING_VOICEVOX_URL:
         logger.info(f"🎯 VOICEVOX URL: {WORKING_VOICEVOX_URL}")
-    logger.info(f"📁 音声ディレクトリ: {VOICE_DIR}")
-    logger.info(f"⚡ 最適化設定:")
-    logger.info(f"   - テキスト制限: {VOICEVOX_MAX_TEXT_LENGTH}文字")
-    logger.info(f"   - タイムアウト: {VOICEVOX_FAST_TIMEOUT}秒")
-    logger.info(f"   - キャッシュサイズ: {CACHE_MAX_SIZE}個")
-    logger.info(f"   - ワーカー数: {VOICEVOX_WORKERS}個")
+    else:
+        logger.error("❌ VOICEVOX利用不可")
+        logger.info("🔧 デバッグエンドポイント:")
+        logger.info("   /debug/voicevox_retry - 再接続試行")
+        logger.info("   /debug/system_info - システム情報")
+        logger.info("   /health - 詳細ヘルスチェック")
     
     app.run(host=host, port=port, debug=False, threaded=True)
