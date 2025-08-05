@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: mochiko-ai-assistant
+    env: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python app.py
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: PORT
+        value: 5000
+      - key: PYTHONUNBUFFERED
+        value: 1
+      - key: DATABASE_URL
+        fromDatabase:
+          name: mochiko-db
+          property: connectionString
+      - key: GROQ_API_KEY
+        sync: false  # これは手動で設定する必要があります
+    autoDeploy: true
