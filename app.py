@@ -225,31 +225,58 @@ def clean_text(text):
     return text.strip()
 
 def search_yahoo_news(query):
-    """Yahoo!ニュースから最新情報を検索"""
+    """Yahoo!ニュースから最新情報を検索（改良版）"""
     try:
-        search_url = f"https://news.yahoo.co.jp/search?p={quote_plus(query)}&ei=UTF-8"
+        # クエリを調整 - より具体的な検索を行う
+        if "ニュース" in query and len(query) <= 6:
+            # 「今日のニュース」のような曖昧な検索の場合
+            import datetime
+            today = datetime.datetime.now().strftime("%Y年%m月%d日")
+            search_query = f"{today} ニュース 速報"
+        else:
+            search_query = query
+            
+        search_url = f"https://news.yahoo.co.jp/search?p={quote_plus(search_query)}&ei=UTF-8"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
 
-        response = requests.get(search_url, headers=headers, timeout=8)
+        logger.info(f"📰 Yahoo!ニュース検索: {search_query}")
+        response = requests.get(search_url, headers=headers, timeout=10)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # ニュース記事のタイトルと概要を取得
+        # より多様なセレクターで記事を探す
         articles = []
-        news_items = soup.find_all('div', class_=['newsFeed_item', 'sc-cHGsZl']) or soup.find_all('article')
         
-        for item in news_items[:3]:  # 最新3件
-            title_elem = item.find('a') or item.find(['h1', 'h2', 'h3'])
-            if title_elem:
-                title = clean_text(title_elem.get_text())
-                if title and len(title) > 10:  # 意味のあるタイトルのみ
-                    articles.append(title)
+        # 検索結果のタイトルと概要を取得
+        news_selectors = [
+            'div[class*="newsFeed"] a',
+            'article a',
+            'div[class*="searchResult"] a',
+            'h3 a',
+            'h2 a',
+            '.tit a'
+        ]
+        
+        for selector in news_selectors:
+            elements = soup.select(selector)
+            for elem in elements[:5]:  # 各セレクターから最大5件
+                title = clean_text(elem.get_text())
+                if title and len(title) > 15 and title not in articles:  # 重複除外
+                    # ニュース記事らしいタイトルかチェック
+                    if any(keyword in title for keyword in ['発表', '開始', '決定', '実施', '対策', '問題', '事件', '政府', '企業', '経済', '社会']):
+                        articles.append(title)
+                        if len(articles) >= 3:
+                            break
+            if len(articles) >= 3:
+                break
         
         if articles:
-            return f"Yahoo!ニュース最新情報: {' / '.join(articles[:2])}"  # 最大2件
+            result = f"最新ニュース: {' | '.join(articles[:2])}"
+            logger.info(f"📰 Yahoo!取得成功: {len(articles)}件")
+            return result
         
         return None
         
@@ -258,8 +285,13 @@ def search_yahoo_news(query):
         return None
 
 def search_wikipedia(query):
-    """Wikipedia日本語版から情報を検索"""
+    """Wikipedia日本語版から情報を検索（改良版）"""
     try:
+        # 曖昧な検索語の場合はスキップ
+        if query in ["今日のニュース", "ニュース", "最新ニュース"]:
+            logger.info("📚 曖昧な検索語のためWikipediaをスキップ")
+            return None
+            
         # Wikipedia API を使用
         api_url = "https://ja.wikipedia.org/api/rest_v1/page/summary/" + quote_plus(query)
         headers = {
@@ -271,10 +303,17 @@ def search_wikipedia(query):
         if response.status_code == 200:
             data = response.json()
             extract = data.get('extract', '')
-            if extract and len(extract) > 20:
+            title = data.get('title', '')
+            
+            # ニュース番組や一般的すぎる項目は除外
+            if any(exclude in title for exclude in ['ニュース', '今日', 'きょう']) and any(exclude in extract for exclude in ['放送', '番組', 'テレビ']):
+                logger.info(f"📚 Wikipedia: ニュース番組情報のためスキップ ({title})")
+                return None
+                
+            if extract and len(extract) > 30:
                 # 要約を適切な長さに調整
-                summary = extract[:200] + "..." if len(extract) > 200 else extract
-                return f"Wikipedia: {clean_text(summary)}"
+                summary = extract[:180] + "..." if len(extract) > 180 else extract
+                return f"Wikipedia「{title}」: {clean_text(summary)}"
         
         # APIが失敗した場合、検索APIを試す
         search_url = "https://ja.wikipedia.org/api/rest_v1/page/search/" + quote_plus(query)
@@ -283,12 +322,15 @@ def search_wikipedia(query):
         if search_response.status_code == 200:
             search_data = search_response.json()
             pages = search_data.get('pages', [])
-            if pages:
-                # 最初の検索結果の詳細を取得
-                first_page = pages[0]
-                title = first_page.get('title', '')
-                description = first_page.get('description', '')
-                if description:
+            for page in pages[:3]:  # 上位3件をチェック
+                title = page.get('title', '')
+                description = page.get('description', '')
+                
+                # ニュース番組関連を除外
+                if any(exclude in title.lower() for exclude in ['ニュース', '今日', 'きょう', '放送', '番組']):
+                    continue
+                    
+                if description and len(description) > 20:
                     return f"Wikipedia「{title}」: {clean_text(description)}"
         
         return None
@@ -298,29 +340,56 @@ def search_wikipedia(query):
         return None
 
 def search_google_basic(query):
-    """基本的なGoogle検索（スクレイピング）"""
+    """基本的なGoogle検索（スクレイピング）- 改良版"""
     try:
-        search_url = f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&lr=lang_ja"
+        # クエリを調整
+        if "ニュース" in query and len(query) <= 8:
+            import datetime
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            search_query = f"{query} {today} 最新"
+        else:
+            search_query = query
+            
+        search_url = f"https://www.google.com/search?q={quote_plus(search_query)}&hl=ja&lr=lang_ja&tbm=nws"  # ニュース検索を使用
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
 
-        response = requests.get(search_url, headers=headers, timeout=8)
+        logger.info(f"🔍 Google検索: {search_query}")
+        response = requests.get(search_url, headers=headers, timeout=10)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # スニペット（検索結果の説明）を取得
-        snippets = []
-        for elem in soup.find_all(['span', 'div'], class_=['st', 'IsZvec', 'VwiC3b']):
-            text = clean_text(elem.get_text())
-            if text and len(text) > 30 and len(text) < 300:
-                snippets.append(text)
-                if len(snippets) >= 2:
-                    break
+        # ニュース検索結果のスニペットを取得
+        news_items = []
         
-        if snippets:
-            return f"検索結果: {snippets[0][:150]}..."
+        # ニュース検索結果用のセレクター
+        selectors = [
+            'div[class*="BNeawe"] span',
+            'div[class*="st"]',
+            'div[class*="IsZvec"]',
+            'div[class*="VwiC3b"]',
+            'span[class*="st"]'
+        ]
+        
+        for selector in selectors:
+            elements = soup.select(selector)
+            for elem in elements:
+                text = clean_text(elem.get_text())
+                if text and len(text) > 40 and len(text) < 200:
+                    # ニュース記事らしい内容かチェック
+                    if any(keyword in text for keyword in ['発表', '開始', '決定', '実施', '対策', '企業', '政府', '経済', '社会', '日本', '会社']):
+                        news_items.append(text)
+                        if len(news_items) >= 2:
+                            break
+            if len(news_items) >= 2:
+                break
+        
+        if news_items:
+            result = f"検索結果: {news_items[0][:100]}..."
+            logger.info(f"🔍 Google検索成功: {len(news_items)}件")
+            return result
         
         return None
         
@@ -329,38 +398,39 @@ def search_google_basic(query):
         return None
 
 def enhanced_web_search(query):
-    """強化されたWeb検索 - 複数ソースから情報を収集"""
+    """強化されたWeb検索 - 複数ソースから情報を収集（改良版）"""
     logger.info(f"🔍 強化Web検索開始: '{query}'")
 
     results = []
 
-    # 1. Yahoo!ニュースで最新情報を検索
+    # 1. Yahoo!ニュースで最新情報を検索（優先度高）
     yahoo_result = search_yahoo_news(query)
     if yahoo_result:
         results.append(yahoo_result)
         logger.info(f"📰 Yahoo!ニュース結果: {yahoo_result[:100]}...")
 
-    # 2. Wikipediaで基本情報を検索
-    wiki_result = search_wikipedia(query)
-    if wiki_result:
-        results.append(wiki_result)
-        logger.info(f"📚 Wikipedia結果: {wiki_result[:100]}...")
-
-    # 3. 両方失敗した場合のみGoogle検索
-    if not results:
+    # 2. Google検索で追加情報を検索（Yahoo!で結果がない場合は必須）
+    if not results or len(results) < 2:
         google_result = search_google_basic(query)
         if google_result:
             results.append(google_result)
             logger.info(f"🔍 Google検索結果: {google_result[:100]}...")
 
+    # 3. Wikipediaは特定の固有名詞の場合のみ使用
+    if query and len(query) > 3 and not any(common in query for common in ['ニュース', '今日', '最新', '速報']):
+        wiki_result = search_wikipedia(query)
+        if wiki_result:
+            results.append(wiki_result)
+            logger.info(f"📚 Wikipedia結果: {wiki_result[:100]}...")
+
     if results:
         # 複数の結果をまとめる
-        combined_result = " | ".join(results)
+        combined_result = " | ".join(results[:2])  # 最大2件に制限
         logger.info(f"✅ 検索成功: {len(results)}件の情報を取得")
         return combined_result
     else:
         logger.warning(f"❌ 検索失敗: '{query}' の情報が見つかりませんでした")
-        return f"「{query}」について調べたけど、今は情報が見つからなかった...ごめんね！"
+        return f"「{query}」について調べてみたけど、今は具体的な情報が見つからなかった...ごめんね！"
 
 def should_search(message: str) -> bool:
     """メッセージがWeb検索を必要とするかを判定する（改良版）"""
@@ -430,17 +500,18 @@ def generate_ai_response(user_data, message):
 もちこのルール：
 - 自分のことは「あてぃし」と呼びます。
 - 明るく、親しみやすいギャル口調で話します。（例：「まじ？」「てか」「～って感じ」「うける」「ありえん」「～ぢゃん？」）
-- 回答は常に40文字程度の短くて分かりやすい文章にします。
-- 以下の「参考情報」がある場合は、その内容を基に正確に答えてください。
-- 参考情報の内容を自然な会話に織り込んで答えてください。
-- 参考情報がない、または関係ない場合は、知識の範囲で答えるか「分かんない」と答えてください。
+- 回答は50-80文字程度で、具体的で有用な情報を含めます。
+- 以下の「参考情報」がある場合は、その内容の具体的な事実や数字を必ず含めて答えてください。
+- 参考情報の内容をそのまま読み上げるのではなく、要点を抜き出して自然な会話に織り込んでください。
+- 参考情報がない場合は、「調べてみたけど具体的な情報がなかった」と正直に答えてください。
 
 参考情報（最新のWeb検索結果）：
 {search_info if search_info else 'なし'}
 
-重要：
-- 参考情報がある場合は、必ずその内容を使って回答してください
-- 検索結果を無視せず、必ず活用してください"""
+重要な指示：
+- 参考情報がある場合は、必ずその中の具体的な事実、名前、数字、日付などを使って回答してください
+- 曖昧な回答ではなく、検索で得た具体的な情報を含めてください
+- 検索結果から得た情報と自分の知識を組み合わせて、有用な回答を作ってください"""
 
     try:
         logger.info(f"🤖 Groqに応答生成をリクエストします。")
