@@ -1,25 +1,25 @@
 # Core Flask dependencies
-flask==2.3.3
-flask-cors==4.0.0
+Flask==2.3.3
+Flask-CORS==4.0.0
 
 # Database
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9  # PostgreSQL
-mysqlclient==2.2.0      # MySQL
+SQLAlchemy==2.0.23
+psycopg2-binary==2.9.9
 
-# AI/API clients - Updated versions
+# AI/API clients
 groq>=0.10.0
-openai>=1.40.0
 
 # HTTP requests and web scraping
 requests==2.31.0
 beautifulsoup4==4.12.2
 lxml==4.9.3
 
-# Additional utilities (optional but recommended)
+# Additional utilities
 urllib3==2.1.0
 certifi==2023.11.17
-chardet==5.2.0
 
-# Security (recommended for production)
+# Security
 Werkzeug==2.3.7
+
+# For web scraping
+html5lib==1.1
