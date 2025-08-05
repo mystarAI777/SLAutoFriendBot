@@ -617,3 +617,132 @@ def index():
 @app.route('/health')
 def health():
     """ヘルスチェック用エンドポイント"""
+    return jsonify({
+        'status': 'healthy',
+        'groq': 'ok' if groq_client else 'error',
+        'voicevox': 'ok' if VOICEVOX_ENABLED else 'disabled',
+        'database': 'ok' if DATABASE_URL else 'error'
+    })
+
+@app.route('/chat_lsl', methods=['POST'])
+def chat_lsl():
+    """チャットエンドポイント"""
+    try:
+        data = request.json or {}
+        user_uuid = data.get('uuid')
+        user_name = data.get('name')
+        message = data.get('message', '')
+
+        if not (user_uuid and user_name):
+            return "Error: uuid and name required", 400
+        
+        logger.info(f"📨 チャット受信: {user_name} ({user_uuid[:8]}...) - '{message}'")
+        user_data = get_or_create_user(user_uuid, user_name)
+        ai_text = generate_ai_response(user_data, message)
+        logger.info(f"🤖 AI応答: '{ai_text}'")
+        
+        audio_url = ""
+        if VOICEVOX_ENABLED:
+            timestamp = int(time.time() * 1000)
+            filename = f"voice_{user_uuid[:8]}_{timestamp}.wav"
+            audio_url = f'/voice/{filename}'
+            thread = threading.Thread(target=background_voice_generation, args=(ai_text, filename))
+            thread.daemon = True
+            thread.start()
+            logger.info(f"🚀 音声生成スレッドを開始しました。URL: {audio_url}")
+        
+        response_text = f"{ai_text}|{audio_url}"
+        logger.info(f"📤 即時レスポンス送信: Text='{ai_text}', URL='{audio_url}'")
+        return app.response_class(response=response_text, status=200, mimetype='text/plain; charset=utf-8')
+        
+    except Exception as e:
+        logger.error(f"❌ チャットエンドポイントエラー: {e}", exc_info=True)
+        return "Error: Internal server error", 500
+
+@app.route('/voice/<filename>')
+def serve_voice(filename):
+    """音声ファイル配信エンドポイント"""
+    try:
+        logger.info(f"🎵 音声ファイル要求: {filename}")
+
+        # メモリキャッシュをまずチェック
+        with voice_files_lock:
+            if filename in voice_files:
+                voice_info = voice_files[filename]
+                status = voice_info.get('status', 'unknown')
+                logger.info(f"🎵 メモリ内ファイル状態: {status}")
+                
+                # 生成完了している場合
+                if status == 'ready' and voice_info.get('data'):
+                    logger.info(f"🎵 メモリから音声配信成功: {filename}")
+                    return app.response_class(
+                        response=voice_info['data'], 
+                        status=200, 
+                        mimetype='audio/wav',
+                        headers={
+                            'Content-Disposition': f'inline; filename="{filename}"',
+                            'Content-Length': str(len(voice_info['data'])),
+                            'Cache-Control': 'no-cache'
+                        }
+                    )
+                
+                # 生成中の場合は少し待ってからディスクをチェック
+                elif status == 'generating':
+                    logger.info(f"🎵 音声生成中、ディスクをチェック: {filename}")
+                    time.sleep(1)  # 1秒待機
+        
+        # ディスクファイルをチェック
+        filepath = os.path.join(VOICE_DIR, filename)
+        if os.path.exists(filepath):
+            try:
+                # ファイルサイズをチェック
+                file_size = os.path.getsize(filepath)
+                if file_size > 1000:  # 1KB以上なら有効とみなす
+                    logger.info(f"🎵 ディスクから音声配信成功: {filename} ({file_size} bytes)")
+                    return send_from_directory(
+                        VOICE_DIR, 
+                        filename, 
+                        mimetype='audio/wav',
+                        as_attachment=False
+                    )
+                else:
+                    logger.warning(f"🎵 ファイルサイズが小さすぎます: {filename} ({file_size} bytes)")
+            except Exception as e:
+                logger.error(f"❌ ディスクファイル読み込みエラー: {e}")
+        
+        # ファイルが見つからない場合の詳細ログ
+        logger.warning(f"🔍 音声ファイルが見つかりません: {filename}")
+        logger.info(f"🔍 探索パス: {filepath}")
+        logger.info(f"🔍 ディレクトリ存在: {os.path.exists(VOICE_DIR)}")
+        
+        if os.path.exists(VOICE_DIR):
+            files_in_dir = os.listdir(VOICE_DIR)
+            logger.info(f"🔍 ディレクトリ内ファイル数: {len(files_in_dir)}")
+            if files_in_dir:
+                logger.info(f"🔍 最新ファイル例: {files_in_dir[-1] if files_in_dir else 'なし'}")
+        
+        # メモリ内ファイル状況も表示
+        with voice_files_lock:
+            logger.info(f"🔍 メモリ内ファイル数: {len(voice_files)}")
+            if filename in voice_files:
+                status = voice_files[filename].get('status', 'unknown')
+                logger.info(f"🔍 ファイル状態: {status}")
+        
+        return "Error: Voice file not found", 404
+
+    except Exception as e:
+        logger.error(f"❌ 音声配信エラー: {e}", exc_info=True)
+        return "Error: Internal server error", 500
+
+# メイン実行部分
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    host = '0.0.0.0'
+    
+    logger.info(f"🚀 Flask アプリケーションを開始します: {host}:{port}")
+    logger.info(f"🔧 GROQ API: {'✅ 利用可能' if groq_client else '❌ 利用不可'}")
+    logger.info(f"🔧 VOICEVOX: {'✅ 利用可能' if VOICEVOX_ENABLED else '❌ 利用不可'}")
+    logger.info(f"🔧 データベース: {'✅ 設定済み' if DATABASE_URL else '❌ 未設定'}")
+    logger.info(f"🔧 音声保存先: {VOICE_DIR}")
+    
+    app.run(host=host, port=port, debug=False)
