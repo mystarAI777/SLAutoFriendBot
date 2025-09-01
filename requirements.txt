@@ -23,3 +23,18 @@ Werkzeug==2.3.7
 
 # For web scraping
 html5lib==1.1
+
+# JSON and data processing
+python-dateutil==2.8.2
+
+# Threading and async support
+# threading-timer==0.1.0  # Removed - using built-in threading
+
+# For voice synthesis (VOICEVOX client)
+# Note: VOICEVOX runs as separate service
+
+# Development dependencies (comment out for production)
+# python-dotenv==1.0.0
+
+# Note: Google API dependencies removed for cost savings
+# google-api-python-client==2.108.0  # REMOVED - using free alternatives
