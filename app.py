@@ -762,7 +762,7 @@ def generate_voice(text: str, filename: str):
         # 音声合成クエリ作成
         query_response = requests.post(
             f"{WORKING_VOICEVOX_URL}/audio_query",
-            params={"text": text, "speaker": 1},  # speaker 1: ずんだもん（ノーマル）
+            params={"text": text, "speaker": 20},  # speaker 20: もちこさん（ノーマル）
             timeout=VOICEVOX_FAST_TIMEOUT
         )
         query_response.raise_for_status()
