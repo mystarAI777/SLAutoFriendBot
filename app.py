@@ -478,7 +478,7 @@ def deep_web_search(query: str) -> Union[str, None]:
                         
                         completion = groq_client.chat.completions.create(
                             messages=[{"role": "system", "content": summary_prompt}],
-                            model="llama3-8b-8192",
+                            model="llama-3.1-8b-instant",  # ✅ 修正: 新しいモデル名に変更
                             temperature=0.2,
                             max_tokens=200
                         )
@@ -636,13 +636,13 @@ def generate_ai_response(user_data: Dict[str, Any], message: str, history: List[
 6. **諦めないで！** もし【参考情報】が空っぽでも、**絶対に「わかりません」で終わらせないで。**新しい話題を提案して会話を続けて！
 
 # 行動ルール:
-- **【最重要】** ユーザーが短い相槌を打った場合は、会話が弾むような質問を返したり、新しい話題を振ったりしてあげて。
-"""
+- **【最重要】** ユーザーが短い相槌を打った場合は、会話が弾むような質問を返したり、新しい話題を振ったりしてあげて。"""
     
     if specialized_topic:
-        system_prompt += f"- **【専門家モード】** あなたは今、「{specialized_topic}」の専門サイトから得た、信頼性の高い【参考情報】を持っています。これを元に、専門家として分かりやすく説明してあげて。\n"
+        system_prompt += f"\n- **【専門家モード】** あなたは今、「{specialized_topic}」の専門サイトから得た、信頼性の高い【参考情報】を持っています。これを元に、専門家として分かりやすく説明してあげて。"
     
-    system_prompt += f"""- 【参考情報】がある場合は、その内容を元に自分の言葉で、自然に会話へ盛り込んでね。
+    system_prompt += f"""
+- 【参考情報】がある場合は、その内容を元に自分の言葉で、自然に会話へ盛り込んでね。
 - **【ホロメン専門家】** あなたは、以下の【ホロメンリスト】に含まれる名前の専門家です。絶対にそれ以外の名前は出さないで。
 
 # 【ホロメンリスト】
@@ -665,7 +665,7 @@ def generate_ai_response(user_data: Dict[str, Any], message: str, history: List[
     try:
         completion = groq_client.chat.completions.create(
             messages=messages,
-            model="llama3-8b-8192",
+            model="llama-3.1-8b-instant",  # ✅ 修正: 新しいモデル名に変更
             temperature=0.75,
             max_tokens=200
         )
@@ -673,7 +673,6 @@ def generate_ai_response(user_data: Dict[str, Any], message: str, history: List[
         
     except Exception as e:
         logger.error(f"AI応答生成エラー: {e}")
-        return "ごめん、今ちょっと考えがまとまんない！また後で話しかけて！"
 
 # --- ユーザー管理機能 ---
 def get_or_create_user(session, uuid, name):
