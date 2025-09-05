@@ -17,6 +17,7 @@ lxml==4.9.3
 # Additional utilities
 urllib3==2.1.0
 certifi==2023.11.17
+schedule==1.2.1  # <-- ★★★ これを追加してください ★★★
 
 # Security
 Werkzeug==2.3.7
