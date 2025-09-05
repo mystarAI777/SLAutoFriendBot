@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from threading import Lock
+import schedule
 
 # --- 基本設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -111,6 +112,7 @@ class HololiveNews(Base):
     url = Column(String(1000))
     published_date = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    news_hash = Column(String(100), unique=True)  # 重複防止用ハッシュ
 
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
@@ -127,6 +129,47 @@ class BackgroundTask(Base):
 # テーブル作成
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
+
+# --- ホロライブ関連設定 ---
+HOLOLIVE_NEWS_URL = "https://hololive.hololivepro.com/news"
+HOLOLIVE_WIKI_BASE = "https://seesaawiki.jp/hololivetv/"
+
+# ホロライブメンバーリスト（拡張版）
+HOLOMEM_KEYWORDS = [
+    # 基本キーワード
+    'ホロライブ', 'ホロメン', 'hololive', 'VTuber', 'バーチャル',
+    
+    # ホロライブ0期生
+    'ときのそら', 'ロボ子', 'さくらみこ', '星街すいせい', 'AZKi',
+    
+    # 1期生
+    '白上フブキ', '夏色まつり',
+    
+    # 2期生
+    '湊あくあ', '紫咲シオン', '百鬼あやめ', '大空スバル', '大神ミオ',
+    
+    # ゲーマーズ
+    '猫又おかゆ', '戌神ころね',
+    
+    # 3期生
+    '兎田ぺこら', '不知火フレア', '白銀ノエル', '宝鐘マリン',
+    
+    # 4期生
+    '天音かなた', '角巻わため', '常闇トワ', '姫森ルーナ',
+    
+    # 5期生
+    '雪花ラミィ', '尾丸ポルカ', '桃鈴ねね', '獅白ぼたん',
+    
+    # 6期生
+    'ラプラス・ダークネス', '鷹嶺ルイ', '博衣こより', '沙花叉クロヱ', '風真いろは',
+    
+    # ホロライブEN
+    '森美声', 'カリオペ', 'ワトソン', 'アメリア', 'がうる・ぐら',
+    
+    # その他関連用語
+    'ホロライブプロダクション', 'カバー株式会社', 'YAGOO', '谷郷元昭',
+    'ホロフェス', 'ホロライブエラー', 'ホロライブオルタナティブ'
+]
 
 # --- ユーティリティ関数 ---
 def clean_text(text: str) -> str:
@@ -148,6 +191,12 @@ def get_japan_time() -> str:
     weekday = weekdays[now.weekday()]
     return f"今は{now.year}年{now.month}月{now.day}日({weekday})の{now.hour}時{now.minute}分だよ！"
 
+def create_news_hash(title: str, content: str) -> str:
+    """ニュースのハッシュ値を生成（重複チェック用）"""
+    import hashlib
+    combined = f"{title}{content[:100]}"
+    return hashlib.md5(combined.encode('utf-8')).hexdigest()
+
 # --- 判定関数 ---
 def is_time_request(message: str) -> bool:
     """時刻に関する質問かどうか判定"""
@@ -161,17 +210,6 @@ def is_weather_request(message: str) -> bool:
 def is_recommendation_request(message: str) -> bool:
     """おすすめに関する質問かどうか判定"""
     return any(keyword in message for keyword in ['おすすめ', 'オススメ', '人気', '流行', 'はやり', 'ランキング'])
-
-# ホロライブメンバーリスト
-HOLOMEM_KEYWORDS = [
-    'ホロライブ', 'ホロメン', 'hololive',
-    'ときのそら', 'ロボ子', 'さくらみこ', '星街すいせい', 'AZKi',
-    '白上フブキ', '夏色まつり', '湊あくあ', '紫咲シオン', '百鬼あやめ',
-    '大空スバル', '大神ミオ', '猫又おかゆ', '戌神ころね',
-    '兎田ぺこら', '不知火フレア', '白銀ノエル', '宝鐘マリン',
-    '天音かなた', '角巻わため', '常闇トワ', '姫森ルーナ',
-    'ラプラス・ダークネス', '鷹嶺ルイ', '博衣こより', '沙花叉クロヱ', '風真いろは'
-]
 
 def is_hololive_request(message: str) -> bool:
     """ホロライブに関する質問かどうか判定"""
@@ -233,6 +271,129 @@ def get_weather_forecast(location: str) -> Union[str, None]:
         logger.error(f"天気API取得エラー: {e}")
         return None
 
+# --- ホロライブ情報取得機能 ---
+def scrape_hololive_news() -> List[Dict[str, str]]:
+    """ホロライブ通信から最新ニュースを取得"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(HOLOLIVE_NEWS_URL, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        news_items = []
+        
+        # ニュース項目を取得（サイト構造に応じて調整が必要）
+        articles = soup.find_all('article', limit=10)  # 最新10件
+        
+        for article in articles:
+            try:
+                title_elem = article.find(['h1', 'h2', 'h3', 'h4'])
+                if title_elem:
+                    title = clean_text(title_elem.get_text())
+                    
+                    # 本文取得
+                    content_elem = article.find(['p', 'div'], class_=re.compile(r'(content|text|description)'))
+                    content = clean_text(content_elem.get_text()) if content_elem else title
+                    
+                    # URLを取得
+                    link_elem = article.find('a')
+                    url = link_elem.get('href') if link_elem else None
+                    if url and url.startswith('/'):
+                        url = urljoin(HOLOLIVE_NEWS_URL, url)
+                    
+                    if title and len(title) > 5:  # 短すぎるタイトルは除外
+                        news_items.append({
+                            'title': title,
+                            'content': content[:500],  # 500文字まで
+                            'url': url,
+                            'published_date': datetime.utcnow()
+                        })
+                        
+            except Exception as e:
+                logger.error(f"記事解析エラー: {e}")
+                continue
+        
+        logger.info(f"✅ ホロライブニュース取得: {len(news_items)}件")
+        return news_items
+        
+    except Exception as e:
+        logger.error(f"ホロライブニュース取得エラー: {e}")
+        return []
+
+def update_hololive_news_database():
+    """ホロライブニュースをデータベースに更新"""
+    session = Session()
+    try:
+        news_items = scrape_hololive_news()
+        added_count = 0
+        
+        for item in news_items:
+            # 重複チェック用ハッシュ
+            news_hash = create_news_hash(item['title'], item['content'])
+            
+            # 既存チェック
+            existing = session.query(HololiveNews).filter_by(news_hash=news_hash).first()
+            if existing:
+                continue
+            
+            # 新規追加
+            news = HololiveNews(
+                title=item['title'],
+                content=item['content'],
+                url=item['url'],
+                published_date=item['published_date'],
+                news_hash=news_hash,
+                created_at=datetime.utcnow()
+            )
+            session.add(news)
+            added_count += 1
+        
+        session.commit()
+        
+        if added_count > 0:
+            logger.info(f"📰 ホロライブニュース更新: {added_count}件追加")
+        else:
+            logger.info("📰 ホロライブニュース: 新着なし")
+            
+    except Exception as e:
+        logger.error(f"ホロライブニュースDB更新エラー: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+def get_hololive_info_from_db(query: str = "") -> Union[str, None]:
+    """データベースから最新のホロライブ情報を取得"""
+    session = Session()
+    try:
+        # クエリに応じて検索
+        if query:
+            # キーワード検索
+            news_list = session.query(HololiveNews).filter(
+                HololiveNews.title.contains(query) | HololiveNews.content.contains(query)
+            ).order_by(HololiveNews.created_at.desc()).limit(3).all()
+        else:
+            # 最新情報
+            news_list = session.query(HololiveNews)\
+                .order_by(HololiveNews.created_at.desc())\
+                .limit(3).all()
+        
+        if news_list:
+            result = "最新のホロライブ情報だよ！\n"
+            for news in news_list:
+                result += f"・{news.title}: {news.content[:80]}...\n"
+            return result[:200] + "..."  # 短縮
+            
+        return None
+        
+    except Exception as e:
+        logger.error(f"ホロライブDB取得エラー: {e}")
+        return None
+    finally:
+        session.close()
+
 # --- 無料検索エンジン設定 ---
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -243,10 +404,53 @@ def get_random_user_agent():
     """ランダムなUser-Agentを取得"""
     return random.choice(USER_AGENTS)
 
+# --- ホロライブ専用検索機能 ---
+def search_hololive_wiki(query: str) -> Union[str, None]:
+    """Seesaa Wikiでホロライブ情報を検索"""
+    try:
+        # 検索URL構築
+        search_url = f"{HOLOLIVE_WIKI_BASE}d/search?keywords={quote_plus(query)}"
+        headers = {'User-Agent': get_random_user_agent()}
+        
+        response = requests.get(search_url, headers=headers, timeout=8)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # 検索結果から最初の項目を取得
+        result_items = soup.find_all(['div', 'article'], class_=re.compile(r'(result|search|content)'))
+        
+        for item in result_items[:3]:  # 上位3件まで
+            text_content = clean_text(item.get_text())
+            if text_content and len(text_content) > 20:
+                return text_content[:150] + "..."
+        
+        # 検索結果がない場合は、メインページから情報取得を試行
+        main_response = requests.get(HOLOLIVE_WIKI_BASE, headers=headers, timeout=8)
+        main_soup = BeautifulSoup(main_response.content, 'html.parser')
+        
+        content_divs = main_soup.find_all(['div', 'section'], limit=5)
+        for div in content_divs:
+            text = clean_text(div.get_text())
+            if query in text and len(text) > 30:
+                return text[:150] + "..."
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"ホロライブWiki検索エラー: {e}")
+        return None
+
 # --- 軽量検索実装 ---
 def quick_search(query: str) -> Union[str, None]:
     """高速軽量検索（簡易版）"""
     try:
+        # ホロライブ関連の場合は専用検索
+        if is_hololive_request(query):
+            wiki_result = search_hololive_wiki(query)
+            if wiki_result:
+                return wiki_result
+        
         # 最もシンプルなDuckDuckGo検索
         url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
         headers = {'User-Agent': get_random_user_agent()}
@@ -270,6 +474,38 @@ def quick_search(query: str) -> Union[str, None]:
         logger.error(f"軽量検索エラー: {e}")
         return None
 
+# --- ディープ検索実装 ---
+def deep_search(query: str) -> Union[str, None]:
+    """ディープ検索（複数ソース）"""
+    try:
+        results = []
+        
+        # 1. ホロライブWiki検索（ホロライブ関連の場合）
+        if is_hololive_request(query):
+            wiki_result = search_hololive_wiki(query)
+            if wiki_result:
+                results.append(f"Wiki情報: {wiki_result}")
+        
+        # 2. 通常のWeb検索
+        general_result = quick_search(query)
+        if general_result:
+            results.append(f"Web情報: {general_result}")
+        
+        # 3. データベースからホロライブ情報
+        if is_hololive_request(query):
+            db_result = get_hololive_info_from_db(query)
+            if db_result:
+                results.append(f"最新情報: {db_result[:100]}...")
+        
+        if results:
+            return " / ".join(results[:2])  # 最大2つまで結合
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"ディープ検索エラー: {e}")
+        return None
+
 # --- バックグラウンド検索システム ---
 def background_deep_search(task_id: str, user_uuid: str, query: str):
     """バックグラウンドでディープ検索実行"""
@@ -277,8 +513,18 @@ def background_deep_search(task_id: str, user_uuid: str, query: str):
     try:
         logger.info(f"🔍 バックグラウンド検索開始: {query}")
         
-        # 検索実行
-        search_result = quick_search(query)  # まず軽量検索
+        # ホロライブ関連かチェック
+        if is_hololive_request(query):
+            # 1. まずWiki検索
+            wiki_result = search_hololive_wiki(query)
+            if not wiki_result:
+                # 2. Wiki検索できなかったらディープ検索
+                search_result = deep_search(query)
+            else:
+                search_result = wiki_result
+        else:
+            # 通常のクイック検索
+            search_result = quick_search(query)
         
         if search_result and groq_client:
             # AIで要約
@@ -485,6 +731,12 @@ def generate_quick_ai_response(user_data: Dict[str, Any], message: str, history:
         if weather_info:
             immediate_info = weather_info
     
+    # ホロライブ情報要求
+    elif is_hololive_request(message):
+        holo_info = get_hololive_info_from_db(message)
+        if holo_info:
+            immediate_info = holo_info
+    
     # 完了したバックグラウンドタスクの結果
     background_update = ""
     if completed_tasks and completed_tasks.get('search'):
@@ -599,6 +851,28 @@ def initialize_voice_directory():
         logger.error(f"音声ディレクトリエラー: {e}")
         VOICEVOX_ENABLED = False
 
+# --- ホロライブ情報の定期更新スケジューリング ---
+def schedule_hololive_news_updates():
+    """ホロライブニュースの定期更新をスケジュール"""
+    def update_task():
+        logger.info("📰 ホロライブニュース定期更新開始")
+        update_hololive_news_database()
+    
+    # 1時間毎に更新
+    schedule.every().hour.do(update_task)
+    
+    # 初回実行
+    update_task()
+    
+    # スケジュール実行スレッド
+    def run_schedule():
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # 1分毎にスケジュールチェック
+    
+    threading.Thread(target=run_schedule, daemon=True).start()
+    logger.info("📅 ホロライブニュース定期更新スケジュール開始（1時間毎）")
+
 # --- Flask エンドポイント ---
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -610,7 +884,8 @@ def health_check():
             'database': 'ok' if DATABASE_URL else 'error',
             'groq': 'ok' if groq_client else 'error',
             'voicevox': 'ok' if VOICEVOX_ENABLED else 'disabled',
-            'background_tasks': 'ok'
+            'background_tasks': 'ok',
+            'hololive_news': 'ok'
         }
     })
 
@@ -705,6 +980,7 @@ def api_status():
         user_count = session.query(UserMemory).count()
         conversation_count = session.query(ConversationHistory).count()
         pending_tasks = session.query(BackgroundTask).filter_by(status='pending').count()
+        hololive_news_count = session.query(HololiveNews).count()
         
         return jsonify({
             'server_url': SERVER_URL,
@@ -712,9 +988,10 @@ def api_status():
             'users': user_count,
             'conversations': conversation_count,
             'pending_background_tasks': pending_tasks,
+            'hololive_news_count': hololive_news_count,
             'voicevox': VOICEVOX_ENABLED,
             'fast_response': True,
-            'version': '3.0.0-fast-async'
+            'version': '3.1.0-hololive-enhanced'
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -752,19 +1029,77 @@ def get_user_tasks(user_uuid):
 
 @app.route('/api/search_test', methods=['GET'])
 def search_test():
-    """軽量検索テスト"""
+    """検索機能テスト"""
     try:
         test_query = request.args.get('q', 'ホロライブ')
-        result = quick_search(test_query)
+        
+        # ホロライブ関連かチェック
+        if is_hololive_request(test_query):
+            # Wiki検索テスト
+            wiki_result = search_hololive_wiki(test_query)
+            # DB検索テスト
+            db_result = get_hololive_info_from_db(test_query)
+            
+            return jsonify({
+                'query': test_query,
+                'is_hololive': True,
+                'wiki_result': wiki_result,
+                'db_result': db_result,
+                'type': 'hololive_search'
+            })
+        else:
+            # 通常検索テスト
+            result = quick_search(test_query)
+            return jsonify({
+                'query': test_query,
+                'is_hololive': False,
+                'result': result,
+                'type': 'quick_search'
+            })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hololive/news', methods=['GET'])
+def get_hololive_news():
+    """ホロライブニュース一覧取得"""
+    session = Session()
+    try:
+        limit = int(request.args.get('limit', 10))
+        
+        news_list = session.query(HololiveNews)\
+            .order_by(HololiveNews.created_at.desc())\
+            .limit(limit)\
+            .all()
+        
+        result = []
+        for news in news_list:
+            result.append({
+                'title': news.title,
+                'content': news.content[:200],
+                'url': news.url,
+                'published_date': news.published_date.isoformat() if news.published_date else None,
+                'created_at': news.created_at.isoformat()
+            })
         
         return jsonify({
-            'query': test_query,
-            'result': result,
-            'type': 'quick_search'
+            'news': result,
+            'count': len(result)
         })
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@app.route('/api/hololive/update', methods=['POST'])
+def manual_hololive_update():
+    """ホロライブニュース手動更新"""
+    try:
+        update_hololive_news_database()
+        return jsonify({'status': 'success', 'message': 'ホロライブニュース更新完了'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 # --- バックグラウンドタスク管理 ---
 def cleanup_old_tasks():
@@ -783,10 +1118,16 @@ def cleanup_old_tasks():
             .filter(ConversationHistory.timestamp < week_ago)\
             .delete()
         
+        # 古いホロライブニュースも削除（30日以前）
+        month_ago = datetime.utcnow() - timedelta(days=30)
+        deleted_news = session.query(HololiveNews)\
+            .filter(HololiveNews.created_at < month_ago)\
+            .delete()
+        
         session.commit()
         
-        if deleted_tasks > 0 or deleted_conversations > 0:
-            logger.info(f"🧹 クリーンアップ完了: タスク{deleted_tasks}件、会話{deleted_conversations}件削除")
+        if deleted_tasks > 0 or deleted_conversations > 0 or deleted_news > 0:
+            logger.info(f"🧹 クリーンアップ完了: タスク{deleted_tasks}件、会話{deleted_conversations}件、ニュース{deleted_news}件削除")
             
     except Exception as e:
         logger.error(f"クリーンアップエラー: {e}")
@@ -807,34 +1148,15 @@ def start_background_tasks():
     threading.Thread(target=periodic_cleanup, daemon=True).start()
     logger.info("🚀 バックグラウンドタスク開始")
 
-# --- ホロライブ情報管理（簡略版） ---
-def get_hololive_info_from_db() -> Union[str, None]:
-    """データベースから最新のホロライブ情報を取得"""
-    session = Session()
-    try:
-        latest_news = session.query(HololiveNews)\
-            .order_by(HololiveNews.created_at.desc())\
-            .first()
-            
-        if latest_news:
-            return latest_news.content[:100] + "..."  # 短縮
-        return None
-        
-    except Exception as e:
-        logger.error(f"ホロライブDB取得エラー: {e}")
-        return None
-    finally:
-        session.close()
-
 # --- メイン実行 ---
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
     
-    logger.info("=" * 60)
-    logger.info("🚀 もちこAI 超高速版 起動中...")
+    logger.info("=" * 70)
+    logger.info("🚀 もちこAI ホロライブ強化版 起動中...")
     logger.info(f"🌐 サーバーURL: {SERVER_URL}")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     
     # 初期化
     initialize_voice_directory()
@@ -844,23 +1166,35 @@ if __name__ == '__main__':
     # バックグラウンドタスク開始
     start_background_tasks()
     
-    # 軽量検索テスト
-    logger.info("🔍 軽量検索エンジンテスト中...")
+    # ホロライブニュース定期更新開始
+    schedule_hololive_news_updates()
+    
+    # 検索機能テスト
+    logger.info("🔍 検索エンジンテスト中...")
     test_result = quick_search("test")
     if test_result:
-        logger.info("✅ 軽量検索: 動作確認")
+        logger.info("✅ 通常検索: 動作確認")
     else:
-        logger.warning("⚠️ 軽量検索: 応答なし")
+        logger.warning("⚠️ 通常検索: 応答なし")
+    
+    # ホロライブWiki検索テスト
+    holo_test = search_hololive_wiki("ホロライブ")
+    if holo_test:
+        logger.info("✅ ホロライブWiki検索: 動作確認")
+    else:
+        logger.warning("⚠️ ホロライブWiki検索: 応答なし")
     
     # 起動情報
     logger.info(f"🚀 Flask起動: {host}:{port}")
     logger.info(f"🗄️ データベース: {'✅' if DATABASE_URL else '❌'}")
     logger.info(f"🧠 Groq AI: {'✅' if groq_client else '❌'}")
     logger.info(f"🎤 VOICEVOX: {'✅' if VOICEVOX_ENABLED else '❌'}")
+    logger.info(f"📰 ホロライブニュース: ✅ 1時間毎自動更新")
+    logger.info(f"🔍 ホロライブWiki検索: ✅ 有効")
     logger.info(f"⚡ 高速レスポンス: ✅ 有効")
     logger.info(f"🔄 バックグラウンド処理: ✅ 有効")
     logger.info(f"💰 検索コスト: 完全無料")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     
     # Flask起動
     app.run(host=host, port=port, debug=False, threaded=True)
