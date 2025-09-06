@@ -1,14 +1,4 @@
-import subprocess
 import sys
-
-# --- 依存ライブラリのインストール ---
-try:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask", "Flask-Cors", "SQLAlchemy", "beautifulsoup4", "schedule", "groq", "requests"])
-except subprocess.CalledProcessError as e:
-    print(f"ライブラリのインストール中にエラーが発生しました: {e}")
-    sys.exit(1)
-
-# --- ここからメインのアプリケーションコード ---
 import os
 import requests
 import logging
