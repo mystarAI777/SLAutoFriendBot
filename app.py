@@ -1,3 +1,14 @@
+import subprocess
+import sys
+
+# --- 依存ライブラリのインストール ---
+try:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask", "Flask-Cors", "SQLAlchemy", "beautifulsoup4", "schedule", "groq", "requests"])
+except subprocess.CalledProcessError as e:
+    print(f"ライブラリのインストール中にエラーが発生しました: {e}")
+    sys.exit(1)
+
+# --- ここからメインのアプリケーションコード ---
 import os
 import requests
 import logging
@@ -188,7 +199,6 @@ def specialized_site_search(topic: str, query: str) -> Union[str, None]:
     config = SPECIALIZED_SITES[topic]; return quick_search(f"site:{config['base_url']} {query}")
 
 # --- バックグラウンドタスク & AI応答 ---
-# ★★★↓ここから↓ 不具合修正箇所 ★★★
 def background_deep_search(task_id: str, query: str, is_detailed: bool):
     session = Session(); search_result = None
     try:
@@ -210,7 +220,6 @@ def background_deep_search(task_id: str, query: str, is_detailed: bool):
             task.status = 'completed'; task.completed_at = datetime.utcnow(); session.commit()
             logger.info(f"✅ バックグラウンド検索完了 (Task ID: {task_id})")
     finally: session.close()
-# ★★★↑ここまで↑ 不具合修正箇所 ★★★
 def start_background_search(user_uuid: str, query: str, is_detailed: bool) -> str:
     task_id = str(uuid.uuid4())[:8]; session = Session()
     try:
@@ -352,7 +361,7 @@ def initialize_app():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001)); host = '0.0.0.0'
     logger.info("="*70)
-    logger.info("🚀 もちこAI v12.3 フォールバック実装版 起動中...")
+    logger.info("🚀 もちこAI v12.4 最終FIX版 起動中...")
     
     initialize_app()
     
