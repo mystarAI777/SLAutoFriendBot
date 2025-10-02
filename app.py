@@ -73,30 +73,76 @@ except Exception as e:
     groq_client = None
     logger.error(f"❌ Groq client initialization failed: {e}")
 
+# DATABASE_URL検証
 if not DATABASE_URL:
-    logger.critical("FATAL: データベースURLが不足しています。")
+    logger.critical("FATAL: DATABASE_URLが設定されていません")
     sys.exit(1)
+
+# PostgreSQLの場合はホスト名をログ出力
+if 'postgresql' in DATABASE_URL:
+    try:
+        host_part = DATABASE_URL.split('@')[1].split('/')[0]
+        logger.info(f"📊 PostgreSQL接続先: {host_part}")
+    except:
+        logger.warning("⚠️ DATABASE_URLの形式を確認できません")
 
 if not groq_client:
     logger.warning("警告: Groq APIキーが設定されていないため、AI機能は無効です。")
-
 VOICEVOX_ENABLED = True
 
 # --- Flask & データベース初期化 ---
 app = Flask(__name__)
 CORS(app)
 
+# --- Flask & データベース初期化 ---
+app = Flask(__name__)
+CORS(app)
+
+# ★ 修正: データベース接続にリトライロジックを追加
+def create_db_engine_with_retry(max_retries=5, retry_delay=5):
+    """データベースエンジンをリトライ付きで作成"""
+    from sqlalchemy.exc import OperationalError
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔄 データベース接続試行 {attempt + 1}/{max_retries}...")
+            
+            # PostgreSQLの接続タイムアウトを設定
+            connect_args = {'check_same_thread': False} if 'sqlite' in DATABASE_URL else {'connect_timeout': 10}
+            
+            engine = create_engine(
+                DATABASE_URL,
+                pool_pre_ping=True,           # 接続前にpingテスト
+                pool_recycle=300,             # 5分ごとに接続をリサイクル
+                connect_args=connect_args
+            )
+            
+            # 接続テスト
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            
+            logger.info("✅ データベース接続成功")
+            return engine
+            
+        except OperationalError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ データベース接続失敗 (試行 {attempt + 1}/{max_retries}): {e}")
+                logger.info(f"⏳ {retry_delay}秒後にリトライします...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ データベース接続が{max_retries}回失敗しました")
+                logger.error(f"DATABASE_URL: {DATABASE_URL[:50]}..." if len(DATABASE_URL) > 50 else DATABASE_URL)
+                raise
+        except Exception as e:
+            logger.error(f"❌ 予期しないデータベースエラー: {e}")
+            raise
+
 try:
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        pool_recycle=300,
-        connect_args={'check_same_thread': False} if 'sqlite' in DATABASE_URL else {}
-    )
-    logger.info("✅ Database engine created successfully")
+    engine = create_db_engine_with_retry()
 except Exception as e:
-    logger.error(f"❌ Database engine creation failed: {e}")
-    raise
+    logger.critical(f"🔥 データベース初期化失敗: {e}")
+    logger.critical("Render環境の場合は、Internal Database URLを使用してください")
+    sys.exit(1)
 
 Base = declarative_base()
 
