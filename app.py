@@ -90,9 +90,6 @@ if not groq_client:
     logger.warning("警告: Groq APIキーが設定されていないため、AI機能は無効です。")
 VOICEVOX_ENABLED = True
 
-# --- Flask & データベース初期化 ---
-app = Flask(__name__)
-CORS(app)
 
 # --- Flask & データベース初期化 ---
 app = Flask(__name__)
