@@ -410,13 +410,78 @@ def get_weather_forecast(location):
         logger.error(f"天気APIエラー ({location}): {e}")
         return "天気情報がうまく取れなかったみたい…"
 
-# --- ニュース取得機能（改善版） ---
+# --- ニュース取得機能（改善版 - ホロライブ通信対応） ---
+def fetch_article_content(article_url):
+    """記事の詳細ページから本文を取得"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        }
+        response = requests.get(article_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # 記事本文を探す（複数のセレクタを試行）
+        content_selectors = [
+            'article .entry-content',
+            '.post-content',
+            '.article-content',
+            'article p',
+            '.content p'
+        ]
+        
+        article_text = ""
+        for selector in content_selectors:
+            content_elem = soup.select_one(selector)
+            if content_elem:
+                # pタグをすべて取得して結合
+                paragraphs = content_elem.find_all('p')
+                article_text = ' '.join([clean_text(p.get_text()) for p in paragraphs if len(clean_text(p.get_text())) > 20])
+                if len(article_text) > 100:
+                    break
+        
+        return article_text[:2000] if article_text else None  # 最大2000文字
+        
+    except Exception as e:
+        logger.warning(f"⚠️ 記事詳細取得エラー ({article_url}): {e}")
+        return None
+
+def summarize_article(title, content):
+    """記事を要約する（Groq AI使用）"""
+    if not groq_client or not content:
+        return content[:500] if content else title
+    
+    try:
+        summary_prompt = f"""以下のホロライブニュース記事を200文字以内で要約してください。
+重要なポイントのみを簡潔にまとめてください。
+
+タイトル: {title}
+本文: {content[:1500]}
+
+要約（200文字以内）:"""
+        
+        completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": summary_prompt}],
+            model="llama-3.1-8b-instant",
+            temperature=0.5,
+            max_tokens=200
+        )
+        
+        summary = completion.choices[0].message.content.strip()
+        logger.info(f"✅ 要約生成成功: {len(summary)}文字")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"❌ 要約生成エラー: {e}")
+        return content[:500] if content else title
+
 def update_hololive_news_database():
-    """ホロライブニュースデータベースを更新"""
+    """ホロライブニュースデータベースを更新（ホロライブ通信版）"""
     session = Session()
     added_count = 0
     found_count = 0
-    logger.info("📰 ホロライブニュースのDB更新処理を開始...")
+    logger.info("📰 ホロライブ通信ニュースのDB更新処理を開始...")
     
     try:
         headers = {
@@ -433,83 +498,96 @@ def update_hololive_news_database():
             verify=True
         )
         
-        logger.info(f"📡 ニュースサイト応答: {response.status_code}")
+        logger.info(f"📡 ホロライブ通信サイト応答: {response.status_code}")
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
+        # ホロライブ通信の記事を取得
+        # 一般的なWordPressブログの構造を想定
         selectors = [
             'article',
-            '.news-item',
             '.post',
-            '[class*="news"]',
+            '.entry',
+            '[class*="post"]',
             '[class*="article"]'
         ]
         
         articles_found = []
         for selector in selectors:
-            found = soup.select(selector)[:10]
+            found = soup.select(selector)
             if found:
-                articles_found = found[:5]
+                articles_found = found[:10]  # 最新10件を取得
                 logger.info(f"📄 セレクタ '{selector}' で {len(articles_found)} 件の記事を発見")
                 break
         
         if not articles_found:
-            articles_found = soup.find_all(['h1', 'h2', 'h3', 'h4'], limit=5)
-            logger.info(f"📄 フォールバック: ヘッダー要素から {len(articles_found)} 件を発見")
+            logger.warning("⚠️ 記事が見つかりませんでした")
+            return
         
-        for article in articles_found:
+        for article in articles_found[:5]:  # 最新5件のみ処理
             try:
-                if article.name in ['h1', 'h2', 'h3', 'h4']:
-                    title_elem = article
-                else:
-                    title_elem = article.find(['h1', 'h2', 'h3', 'h4'])
-                
+                # タイトルとURLを取得
+                title_elem = article.find(['h1', 'h2', 'h3', 'a'])
                 if not title_elem:
                     continue
-                    
-                title = clean_text(title_elem.get_text())
+                
+                # タイトル取得
+                if title_elem.name == 'a':
+                    title = clean_text(title_elem.get_text())
+                    article_url = title_elem.get('href', '')
+                else:
+                    title = clean_text(title_elem.get_text())
+                    link_elem = article.find('a', href=True)
+                    article_url = link_elem.get('href', '') if link_elem else ''
+                
                 if not title or len(title) < 5:
                     logger.debug(f"⏭️ タイトルが短すぎるためスキップ: {title}")
                     continue
                 
+                if not article_url or not article_url.startswith('http'):
+                    logger.debug(f"⏭️ 無効なURLのためスキップ: {article_url}")
+                    continue
+                
                 found_count += 1
+                logger.info(f"🔍 記事を処理中: {title[:50]}...")
                 
-                content_selectors = [
-                    ['p', {'class': re.compile(r'(content|text|description|summary)')}],
-                    ['div', {'class': re.compile(r'(content|text|description|summary)')}],
-                    ['p'],
-                    ['div']
-                ]
+                # 記事の詳細ページから本文を取得
+                article_content = fetch_article_content(article_url)
                 
-                content = title
-                for tag, attrs in content_selectors:
-                    if isinstance(attrs, dict):
-                        content_elem = article.find(tag, attrs)
+                if not article_content:
+                    # 本文が取得できない場合は、一覧ページの抜粋を使用
+                    snippet_elem = article.find(['p', 'div'], class_=re.compile(r'(excerpt|summary|description)'))
+                    if snippet_elem:
+                        article_content = clean_text(snippet_elem.get_text())
                     else:
-                        content_elem = article.find(tag)
-                    
-                    if content_elem:
-                        content_text = clean_text(content_elem.get_text())
-                        if content_text and len(content_text) > len(title):
-                            content = content_text
-                            break
+                        article_content = title
                 
-                news_hash = create_news_hash(title, content)
+                # 記事を要約
+                summary = summarize_article(title, article_content)
                 
+                # ハッシュ値を生成（重複チェック用）
+                news_hash = create_news_hash(title, article_content)
+                
+                # 既存記事をチェック
                 existing_news = session.query(HololiveNews).filter_by(news_hash=news_hash).first()
                 if not existing_news:
                     new_news = HololiveNews(
                         title=title,
-                        content=content[:500],
+                        content=summary,  # 要約を保存
                         news_hash=news_hash,
-                        url=HOLOLIVE_NEWS_URL
+                        url=article_url
                     )
                     session.add(new_news)
                     added_count += 1
                     logger.info(f"➕ 新着記事追加: {title[:50]}{'...' if len(title) > 50 else ''}")
+                    logger.info(f"   📝 要約: {summary[:100]}{'...' if len(summary) > 100 else ''}")
                 else:
                     logger.debug(f"⏭️ 既存記事をスキップ: {title[:50]}{'...' if len(title) > 50 else ''}")
+                
+                # APIレート制限を考慮して少し待機
+                if groq_client:
+                    time.sleep(0.5)
                     
             except Exception as article_error:
                 logger.warning(f"⚠️ 個別記事処理エラー: {article_error}")
@@ -525,17 +603,18 @@ def update_hololive_news_database():
                 logger.warning("⚠️ 有効な記事が見つかりませんでした")
             
     except requests.exceptions.Timeout:
-        logger.error("❌ ホロライブニュース取得: タイムアウト")
+        logger.error("❌ ホロライブ通信ニュース取得: タイムアウト")
         if not session.query(HololiveNews).first():
             add_fallback_news(session)
             
     except requests.exceptions.HTTPError as e:
-        logger.error(f"❌ ホロライブニュース取得 HTTPエラー: {e}")
+        logger.error(f"❌ ホロライブ通信ニュース取得 HTTPエラー: {e}")
         if not session.query(HololiveNews).first():
             add_fallback_news(session)
             
     except Exception as e:
         logger.error(f"❌ ニュースDB更新で予期しないエラー: {e}")
+        logger.error(f"❌ エラー詳細: {type(e).__name__}: {str(e)}")
         session.rollback()
         if not session.query(HololiveNews).first():
             add_fallback_news(session)
@@ -546,8 +625,8 @@ def add_fallback_news(session):
     """フォールバック用のダミーニュースを追加"""
     try:
         fallback_news = HololiveNews(
-            title="ホロライブからのお知らせ",
-            content="最新のニュースを取得中です。しばらくお待ちください。ホロライブ公式サイトをご確認ください。",
+            title="ホロライブ通信からのお知らせ",
+            content="最新のニュースを取得中です。しばらくお待ちください。ホロライブ通信をご確認ください: https://hololive-tsuushin.com/",
             news_hash=create_news_hash("fallback", "news"),
             url=HOLOLIVE_NEWS_URL
         )
