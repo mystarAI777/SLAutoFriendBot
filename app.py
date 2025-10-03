@@ -51,13 +51,21 @@ SERVER_URL = "https://slautofriendbot.onrender.com"
 background_executor = ThreadPoolExecutor(max_workers=5)
 
 # --- 秘密情報/環境変数 読み込み ---
-def get_secret(name):
-    """環境変数から秘密情報を取得"""
-    return os.environ.get(name)
+def get_secret(name: str) -> Union[str, None]:
+    """環境変数または秘密ファイルから設定値を取得"""
+    env_value = os.environ.get(name)
+    if env_value: 
+        return env_value
+    try:
+        with open(f'/etc/secrets/{name}', 'r') as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
 
 # 環境変数の読み込み
-DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
-GROQ_API_KEY = get_secret('GROQ_API_KEY') or 'DUMMY_GROQ_KEY'
+DATABASE_URL = get_secret('DATABASE_URL') 
+GROQ_API_KEY = get_secret('GROQ_API_KEY') 
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
 # --- Groqクライアント初期化 ---
