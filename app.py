@@ -51,35 +51,67 @@ SERVER_URL = "https://slautofriendbot.onrender.com"
 background_executor = ThreadPoolExecutor(max_workers=5)
 
 # --- 秘密情報/環境変数 読み込み ---
-def get_secret(name: str) -> Union[str, None]:
-    """環境変数または秘密ファイルから設定値を取得"""
-    env_value = os.environ.get(name)
-    if env_value: 
-        return env_value
-    try:
-        with open(f'/etc/secrets/{name}', 'r') as f:
-            return f.read().strip()
-    except Exception:
-        return None
+def get_secret(name):
+    """環境変数から秘密情報を取得"""
+    return os.environ.get(name)
 
+# 環境変数の読み込み（詳細ログ付き）
+DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 
-# 環境変数の読み込み
-DATABASE_URL = get_secret('DATABASE_URL') 
-GROQ_API_KEY = get_secret('GROQ_API_KEY') 
+# GROQ_API_KEY の詳細診断
+GROQ_API_KEY = get_secret('GROQ_API_KEY')
+logger.info("🔍 GROQ_API_KEY 診断:")
+logger.info(f"   - 環境変数存在: {'はい' if 'GROQ_API_KEY' in os.environ else 'いいえ'}")
+if GROQ_API_KEY:
+    logger.info(f"   - キー長: {len(GROQ_API_KEY)} 文字")
+    logger.info(f"   - 先頭: {GROQ_API_KEY[:10]}... (セキュリティのため一部のみ表示)")
+    logger.info(f"   - 末尾チェック: ...{GROQ_API_KEY[-4:]}")
+else:
+    logger.warning("   - ⚠️ GROQ_API_KEYが見つかりません！")
+    GROQ_API_KEY = 'DUMMY_GROQ_KEY'
+
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
-# --- Groqクライアント初期化 ---
+# --- Groqクライアント初期化（改善版） ---
+groq_client = None
 try:
     from groq import Groq
-    if GROQ_API_KEY != 'DUMMY_GROQ_KEY':
+    
+    if not GROQ_API_KEY or GROQ_API_KEY == 'DUMMY_GROQ_KEY':
+        logger.warning("⚠️ GROQ_API_KEYが設定されていません - AI機能は無効です")
+        logger.warning("⚠️ Renderの Environment Variables に GROQ_API_KEY を設定してください")
+    elif len(GROQ_API_KEY) < 20:
+        logger.error(f"❌ GROQ_API_KEYが短すぎます (長さ: {len(GROQ_API_KEY)})")
+        logger.error("❌ 正しいAPIキーを設定してください")
+    else:
+        # APIキーの前後の空白を削除
+        GROQ_API_KEY = GROQ_API_KEY.strip()
+        
         groq_client = Groq(api_key=GROQ_API_KEY)
         logger.info("✅ Groq client initialized successfully")
-    else:
-        groq_client = None
-        logger.warning("⚠️ Using dummy Groq key - AI features disabled")
+        logger.info(f"✅ APIキー検証: {GROQ_API_KEY[:10]}...")
+        
+        # 接続テスト（オプション）
+        try:
+            # 簡単なテストリクエスト
+            test_completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}],
+                model="llama-3.1-8b-instant",
+                max_tokens=5
+            )
+            logger.info("✅ Groq API 接続テスト成功！")
+        except Exception as test_error:
+            logger.error(f"❌ Groq API 接続テスト失敗: {test_error}")
+            groq_client = None
+            
+except ImportError as e:
+    groq_client = None
+    logger.error(f"❌ Groqライブラリのインポート失敗: {e}")
+    logger.error("❌ requirements.txt に 'groq' が含まれているか確認してください")
 except Exception as e:
     groq_client = None
     logger.error(f"❌ Groq client initialization failed: {e}")
+    logger.error(f"❌ エラー詳細: {type(e).__name__}: {str(e)}")
 
 # DATABASE_URL検証
 if not DATABASE_URL:
@@ -1310,6 +1342,14 @@ def log_startup_status():
     
     logger.info("🔧 システムステータス:")
     
+    # 環境変数の確認
+    logger.info("📋 環境変数チェック:")
+    env_vars = ['DATABASE_URL', 'GROQ_API_KEY', 'PORT', 'RENDER']
+    for var in env_vars:
+        exists = var in os.environ
+        status = "✅" if exists else "❌"
+        logger.info(f"   {status} {var}: {'設定済み' if exists else '未設定'}")
+    
     db_status = "✅ 接続済み" if DATABASE_URL else "❌ 未設定"
     logger.info(f"🗄️ データベース: {db_status}")
     if DATABASE_URL:
@@ -1318,10 +1358,19 @@ def log_startup_status():
         elif 'postgresql' in DATABASE_URL:
             logger.info("   - タイプ: PostgreSQL (本番用)")
     
-    ai_status = "✅ 有効" if groq_client else "❌ 無効"
-    logger.info(f"🧠 Groq AI: {ai_status}")
+    # Groq AI の詳細ステータス
     if groq_client:
+        logger.info(f"🧠 Groq AI: ✅ 有効")
         logger.info("   - モデル: llama-3.1-8b-instant")
+        logger.info("   - 接続: 正常")
+    else:
+        logger.warning(f"🧠 Groq AI: ❌ 無効")
+        if not GROQ_API_KEY or GROQ_API_KEY == 'DUMMY_GROQ_KEY':
+            logger.warning("   ⚠️ 原因: APIキーが設定されていません")
+            logger.warning("   ⚠️ 対処: Renderの Environment Variables で GROQ_API_KEY を設定してください")
+        else:
+            logger.warning(f"   ⚠️ 原因: APIキーの形式エラーまたは接続失敗")
+            logger.warning(f"   ⚠️ キー長: {len(GROQ_API_KEY)} 文字")
     
     voice_status = "✅ 有効" if VOICEVOX_ENABLED else "❌ 無効"
     logger.info(f"🎤 音声機能: {voice_status}")
@@ -1335,7 +1384,7 @@ def log_startup_status():
     logger.info("   - ⏰ 時刻機能: ✅ 有効 (JST対応)")
     logger.info("   - 📰 ニュース機能: ✅ 有効 (ホロライブ公式)")
     logger.info("   - 🔄 非同期処理: ✅ 有効 (バックグラウンド検索)")
-    logger.info("   - 📊 詳細要求モード: ✅ 有効")
+    logger.info(f"   - 🤖 AI応答: {'✅ 有効' if groq_client else '❌ 無効（フォールバックモード）'}")
     
     logger.info(f"🎌 ホロメン対応: ✅ {len(HOLOMEM_KEYWORDS)}名対応")
     
@@ -1447,57 +1496,46 @@ if os.environ.get('FLASK_DEBUG') == 'true':
         finally:
             session.close()
 
-# --- メイン実行（修正版） ---
+# --- メイン実行（Render対応版） ---
 if __name__ == '__main__':
+    # この部分はローカル開発時のみ実行される
+    # Render環境ではGunicornが直接WSGIエントリーポイントを呼び出すため、ここは実行されない
     try:
         port = int(os.environ.get('PORT', 5001))
-        host = '0.0.0.0'  # Renderでは必ず0.0.0.0にバインド
-        debug_mode = False  # 本番環境ではデバッグモード無効
+        host = '0.0.0.0'
+        debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
         
         log_startup_status()
         initialize_app()
         
-        logger.info(f"🚀 Flask起動準備完了: {host}:{port}")
+        logger.info(f"🏠 ローカル開発環境で実行します")
+        logger.info(f"🚀 起動: {host}:{port}")
         logger.info(f"🐛 デバッグモード: {'有効' if debug_mode else '無効'}")
-        
-        if os.environ.get('RENDER'):
-            logger.info("🌐 Render環境を検出")
-            logger.info("   - 自動スケーリング対応")
-            logger.info("   - HTTPS対応")
-        
-        logger.info("="*70)
-        logger.info("✅ 全ての初期化が完了しました。サービス開始！")
         logger.info("="*70)
         
-        # ローカル環境でのみapp.runを実行
-        if not os.environ.get('RENDER'):
-            logger.info("🏠 ローカル環境での実行を開始")
-            app.run(host=host, port=port, debug=debug_mode, threaded=True)
-        else:
-            logger.info("🌐 Render環境: Gunicornによる実行を待機中...")
-            
+        app.run(host=host, port=port, debug=debug_mode, threaded=True)
+        
     except KeyboardInterrupt:
         logger.info("⏹️ ユーザーによってアプリケーションが停止されました")
-        
     except Exception as e:
-        logger.critical(f"🔥 アプリケーション起動に失敗しました: {e}")
+        logger.critical(f"🔥 アプリケーション起動に失敗: {e}")
         logger.critical("スタックトレース:", exc_info=True)
         sys.exit(1)
-        
-    finally:
-        logger.info("👋 もちこAI を終了します...")
 
-# --- WSGIエントリーポイント (Render用・修正版) ---
-# この部分がGunicorn起動時に実行される
-try:
-    log_startup_status()
-    initialize_app()
-    logger.info("🌐 WSGI アプリケーションが作成されました")
-    logger.info("🎯 Gunicornによる本番モード稼働中")
-except Exception as e:
-    logger.critical(f"🔥 WSGI アプリケーション作成に失敗: {e}")
-    logger.critical("スタックトレース:", exc_info=True)
-    raise
+# --- WSGIエントリーポイント (Render/本番環境用) ---
+# Gunicornなどのプロダクションサーバーから呼び出される
+# このコードはモジュールがインポートされた時点で実行される
+else:
+    # 本番環境（Render等）での初期化
+    try:
+        log_startup_status()
+        initialize_app()
+        logger.info("🌐 WSGI アプリケーションが作成されました")
+        logger.info("🎯 Gunicornによる本番モード稼働中")
+    except Exception as e:
+        logger.critical(f"🔥 WSGI アプリケーション作成に失敗: {e}")
+        logger.critical("スタックトレース:", exc_info=True)
+        raise
 
 # Gunicorn等のWSGIサーバー用のエントリーポイント
 application = app
