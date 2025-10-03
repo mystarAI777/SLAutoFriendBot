@@ -273,7 +273,7 @@ SPECIALIZED_SITES = {
     }
 }
 
-HOLOLIVE_NEWS_URL = "https://hololive.hololivepro.com/news"
+HOLOLIVE_NEWS_URL = "https://hololive-tsuushin.com/category/holonews/"
 HOLOMEM_KEYWORDS = [
     'ときのそら', 'ロボ子さん', 'さくらみこ', '星街すいせい', 'AZKi', '夜空メル',
     'アキ・ローゼンタール', '赤井はあと', '白上フブキ', '夏色まつり', '湊あくあ',
@@ -410,11 +410,12 @@ def get_weather_forecast(location):
         logger.error(f"天気APIエラー ({location}): {e}")
         return "天気情報がうまく取れなかったみたい…"
 
-# --- ニュース取得機能 ---
+# --- ニュース取得機能（改善版） ---
 def update_hololive_news_database():
     """ホロライブニュースデータベースを更新"""
     session = Session()
     added_count = 0
+    found_count = 0
     logger.info("📰 ホロライブニュースのDB更新処理を開始...")
     
     try:
@@ -469,7 +470,10 @@ def update_hololive_news_database():
                     
                 title = clean_text(title_elem.get_text())
                 if not title or len(title) < 5:
+                    logger.debug(f"⏭️ タイトルが短すぎるためスキップ: {title}")
                     continue
+                
+                found_count += 1
                 
                 content_selectors = [
                     ['p', {'class': re.compile(r'(content|text|description|summary)')}],
@@ -504,6 +508,8 @@ def update_hololive_news_database():
                     session.add(new_news)
                     added_count += 1
                     logger.info(f"➕ 新着記事追加: {title[:50]}{'...' if len(title) > 50 else ''}")
+                else:
+                    logger.debug(f"⏭️ 既存記事をスキップ: {title[:50]}{'...' if len(title) > 50 else ''}")
                     
             except Exception as article_error:
                 logger.warning(f"⚠️ 個別記事処理エラー: {article_error}")
@@ -511,9 +517,12 @@ def update_hololive_news_database():
         
         if added_count > 0:
             session.commit()
-            logger.info(f"✅ DB更新完了: {added_count}件追加")
+            logger.info(f"✅ DB更新完了: {found_count}件発見 → {added_count}件追加")
         else:
-            logger.info("✅ DB更新完了: 新着記事なし")
+            if found_count > 0:
+                logger.info(f"✅ DB更新完了: {found_count}件発見したが、すべて既存記事でした")
+            else:
+                logger.warning("⚠️ 有効な記事が見つかりませんでした")
             
     except requests.exceptions.Timeout:
         logger.error("❌ ホロライブニュース取得: タイムアウト")
@@ -1251,16 +1260,74 @@ def get_stats():
         news_count = session.query(HololiveNews).count()
         pending_tasks = session.query(BackgroundTask).filter_by(status='pending').count()
         
+        # 最新のニュース3件を取得
+        recent_news = session.query(HololiveNews).order_by(
+            HololiveNews.created_at.desc()
+        ).limit(3).all()
+        
+        news_list = []
+        for news in recent_news:
+            news_list.append({
+                'title': news.title[:50] + '...' if len(news.title) > 50 else news.title,
+                'created_at': news.created_at.isoformat(),
+                'content_length': len(news.content)
+            })
+        
         return jsonify({
             'users': user_count,
             'conversations': conversation_count,
             'news_articles': news_count,
             'pending_tasks': pending_tasks,
+            'recent_news': news_list,
             'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
         logger.error(f"統計情報取得エラー: {e}")
         return jsonify({'error': 'Stats unavailable'}), 500
+    finally:
+        session.close()
+
+@app.route('/news/refresh', methods=['POST'])
+def refresh_news():
+    """ニュースを手動で再取得"""
+    try:
+        # バックグラウンドで実行
+        background_executor.submit(update_hololive_news_database)
+        return jsonify({
+            'status': 'started',
+            'message': 'ニュース取得を開始しました'
+        })
+    except Exception as e:
+        logger.error(f"ニュース再取得エラー: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/news/list', methods=['GET'])
+def list_news():
+    """DB内のニュース一覧を取得"""
+    session = Session()
+    try:
+        limit = int(request.args.get('limit', 10))
+        news_items = session.query(HololiveNews).order_by(
+            HololiveNews.created_at.desc()
+        ).limit(limit).all()
+        
+        news_list = []
+        for news in news_items:
+            news_list.append({
+                'id': news.id,
+                'title': news.title,
+                'content': news.content[:200] + '...' if len(news.content) > 200 else news.content,
+                'url': news.url,
+                'created_at': news.created_at.isoformat()
+            })
+        
+        return jsonify({
+            'total': len(news_list),
+            'news': news_list
+        })
+    except Exception as e:
+        logger.error(f"ニュース一覧取得エラー: {e}")
+        return jsonify({'error': str(e)}), 500
     finally:
         session.close()
 
