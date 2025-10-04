@@ -364,6 +364,14 @@ def should_search(message):
     
     return False
 
+def is_story_request(message):
+    """面白い話や雑談を求めているかどうか判定"""
+    story_keywords = [
+        '面白い話', 'おもしろい話', '話して', '雑談', 'ネタ',
+        '何か話', 'トーク', '喋って', 'しゃべって'
+    ]
+    return any(keyword in message for keyword in story_keywords)
+
 def is_short_response(message):
     """短い相槌的な返事かどうか判定"""
     short_responses = ['うん', 'そう', 'はい', 'そっか', 'なるほど', 'ふーん', 'へー']
@@ -736,11 +744,15 @@ def deep_web_search(query, is_detailed):
         for i, res in enumerate(results, 1):
             summary_text += f"[情報{i}] {res['snippet']}\n"
         
+        # Groq AIが無効な場合は、検索結果をそのまま返す
         if not groq_client:
-            logger.warning("Groqクライアント未設定のため、検索結果の要約をスキップします。")
-            return results[0]['snippet'][:150] + "..." if len(results[0]['snippet']) > 150 else results[0]['snippet']
+            logger.warning("Groqクライアント未設定のため、検索結果をそのまま返します。")
+            result_text = f"検索結果:\n{summary_text}"
+            return result_text
         
-        summary_prompt = f"""以下の検索結果を使い、質問「{query}」にギャル語で、{'詳しく' if is_detailed else '簡潔に'}答えて：
+        # AI要約を試みる
+        try:
+            summary_prompt = f"""以下の検索結果を使い、質問「{query}」にギャル語で、{'詳しく' if is_detailed else '簡潔に'}答えて：
 
 検索結果:
 {summary_text}
@@ -749,24 +761,37 @@ def deep_web_search(query, is_detailed):
 - 一人称は「あてぃし」
 - 語尾は「〜じゃん」「〜的な？」
 - 口癖は「まじ」「てか」「うける」
-- {'400文字程度で詳しく' if is_detailed else '200文字以内で簡潔に'}説明すること"""
-        
-        max_tokens = 400 if is_detailed else 200
-        completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": summary_prompt}],
-            model="llama-3.1-8b-instant",
-            temperature=0.7,
-            max_tokens=max_tokens
-        )
-        
-        ai_response = completion.choices[0].message.content.strip()
-        logger.info(f"✅ AI要約完了 ({len(ai_response)}文字)")
-        return ai_response
+- {'400文字程度で詳しく' if is_detailed else '200文字以内で簡潔に'}説明すること
+- 検索結果の内容を具体的に説明すること"""
+            
+            max_tokens = 400 if is_detailed else 200
+            completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": summary_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.7,
+                max_tokens=max_tokens,
+                timeout=10
+            )
+            
+            ai_response = completion.choices[0].message.content.strip()
+            
+            # AI応答が短すぎる、またはURLのみの場合は検索結果を返す
+            if len(ai_response) < 50 or ai_response.startswith('http'):
+                logger.warning(f"⚠️ AI要約が不十分 (長さ: {len(ai_response)})")
+                result_text = f"検索結果:\n{summary_text}"
+                return result_text
+            
+            logger.info(f"✅ AI要約完了 ({len(ai_response)}文字)")
+            return ai_response
+            
+        except Exception as ai_error:
+            logger.error(f"AI要約エラー: {ai_error}")
+            # AI要約が失敗した場合は検索結果をそのまま返す
+            result_text = f"検索結果:\n{summary_text}"
+            return result_text
         
     except Exception as e:
-        logger.error(f"AI要約エラー: {e}")
-        if results:
-            return results[0]['snippet'][:150] + "..."
+        logger.error(f"Web検索エラー: {e}")
         return None
 
 def quick_search(query):
@@ -1065,7 +1090,7 @@ def background_deep_search(task_id, query, is_detailed):
                     if news_items:
                         db_result = "データベースからの情報:\n"
                         for news in news_items:
-                            db_result += f"・{news.title}: {news.content[:100]}\n"
+                            db_result += f"・{news.title}: {news.content[:150]}\n"
                         search_result = db_result
                         logger.info(f"✅ DBから{len(news_items)}件発見")
                 db_session.close()
@@ -1085,8 +1110,13 @@ def background_deep_search(task_id, query, is_detailed):
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task:
             if search_result and len(search_result.strip()) > 10:
-                task.result = search_result
-                logger.info(f"✅ 検索成功: {len(search_result)}文字")
+                # URLだけの場合はエラー扱い
+                if search_result.startswith('http') and '\n' not in search_result:
+                    logger.warning("⚠️ URLのみの検索結果 - 再検索します")
+                    task.result = "検索結果の取得がうまくいかなかったみたい…。もう一回違う聞き方で試してみて？"
+                else:
+                    task.result = search_result
+                    logger.info(f"✅ 検索成功: {len(search_result)}文字")
             else:
                 task.result = "うーん、ちょっと見つからなかったや…。別の聞き方で試してみて？"
                 logger.warning("⚠️ 有効な検索結果なし")
@@ -1197,17 +1227,17 @@ def chat_lsl():
             logger.info(f"📋 完了タスクを報告: {original_query}")
         
         # ===== 優先順位2: ホロライブニュースリクエスト =====
-        elif is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
+        elif is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ', 'ホロライブ']):
             try:
                 # データベースから最新ニュースを取得
                 news_items = session.query(HololiveNews).order_by(
                     HololiveNews.created_at.desc()
-                ).limit(3).all()
+                ).limit(5).all()
                 
                 if news_items:
                     news_text = "ホロライブの最新ニュースだよ！\n\n"
                     for i, news in enumerate(news_items, 1):
-                        news_text += f"【{i}】{news.title}\n{news.content[:100]}{'...' if len(news.content) > 100 else ''}\n\n"
+                        news_text += f"【{i}】{news.title}\n{news.content}\n\n"
                     
                     if groq_client:
                         # AIで自然な口調に変換
@@ -1216,7 +1246,7 @@ def chat_lsl():
                             message,
                             history,
                             f"以下のニュースをギャル口調で紹介して：\n{news_text}",
-                            is_detailed=False
+                            is_detailed=True
                         )
                     else:
                         ai_text = news_text
@@ -1255,7 +1285,55 @@ def chat_lsl():
             ai_text = " ".join(immediate_responses)
             logger.info("✅ 即時応答で完結")
         
-        # ===== 優先順位4: 検索が必要な質問 =====
+        # ===== 優先順位4: 面白い話リクエスト =====
+        elif is_story_request(message):
+            if groq_client:
+                try:
+                    # ホロライブのニュースから面白そうな話題を探す
+                    recent_news = session.query(HololiveNews).order_by(
+                        HololiveNews.created_at.desc()
+                    ).limit(3).all()
+                    
+                    if recent_news:
+                        news_context = "最近のホロライブニュース:\n"
+                        for news in recent_news:
+                            news_context += f"・{news.title}\n"
+                        
+                        story_prompt = f"""以下のホロライブニュースから、ギャルっぽく面白い話を1つ選んで教えてあげて：
+
+{news_context}
+
+条件：
+- 一人称は「あてぃし」
+- 語尾は「〜じゃん」「〜的な？」
+- 口癖は「まじ」「てか」「うける」
+- 150文字以内で面白おかしく話す
+- ホロライブファンが喜ぶような内容にする"""
+                        
+                        ai_text = generate_ai_response(
+                            user_data,
+                            message,
+                            history,
+                            story_prompt,
+                            is_detailed=False
+                        )
+                    else:
+                        ai_text = "あー、面白い話か〜！ちょっと今ネタが思いつかないや…。ホロライブのニュースとか聞いてみる？"
+                    
+                    logger.info("📖 面白い話リクエストに応答")
+                except Exception as e:
+                    logger.error(f"面白い話生成エラー: {e}")
+                    ai_text = "えー、面白い話したいんだけど、今ちょっと頭が回らなくて…！またあとで話そ！"
+            else:
+                story_options = [
+                    "えーっとね、最近ホロライブのみんなが盛り上がってるんだよ！詳しく知りたい？",
+                    "面白い話か〜！あてぃし、ホロライブのこといっぱい知ってるんだ！何が聞きたい？",
+                    "うける！話したいことはいっぱいあるよ〜。ホロライブのニュースとか興味ある？"
+                ]
+                ai_text = random.choice(story_options)
+                logger.info("📖 簡易応答モードで面白い話リクエストに対応")
+        
+        # ===== 優先順位5: 検索が必要な質問 =====
         elif should_search(message) and not is_short_response(message):
             is_detailed = is_detailed_request(message)
             
@@ -1279,19 +1357,40 @@ def chat_lsl():
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…。もう一回試してくれる？"
                 logger.error("❌ バックグラウンド検索の開始に失敗")
         
-        # ===== 優先順位5: 通常の会話 =====
+        # ===== 優先順位6: 通常の会話 =====
         else:
-            if groq_client:
-                try:
-                    ai_text = generate_ai_response(user_data, message, history)
-                    logger.info("💭 通常会話で応答")
-                except Exception as e:
-                    logger.error(f"通常会話応答エラー: {e}")
-                    ai_text = "ごめん、ちょっと考えがまとまらないや！もう一回言ってもらえる？"
-            else:
-                # Groq AIが無効な場合の簡易応答
-                ai_text = generate_fallback_response(message)
-                logger.info("💭 簡易応答モード（AI無効）")
+            # 短い質問や相槌への対応
+            short_questions = {
+                'わかった': 'うん、わかった？他に何か聞きたいことある？',
+                'わかる': 'わかるよ〜！どうしたの？',
+                'ね': 'ねー！まじそれな！',
+                'そう': 'そうなんだよ！',
+                'うん': 'うんうん！',
+                'ほんと': 'ほんとだよ！まじで！',
+                'まじ': 'まじだよ〜！うける！',
+            }
+            
+            # 短い質問かチェック
+            if len(message) <= 5:
+                for key, response in short_questions.items():
+                    if key in message:
+                        ai_text = response
+                        logger.info("💭 短い質問への応答")
+                        break
+            
+            # 上記に該当しない場合は通常のAI応答
+            if not ai_text:
+                if groq_client:
+                    try:
+                        ai_text = generate_ai_response(user_data, message, history)
+                        logger.info("💭 通常会話で応答")
+                    except Exception as e:
+                        logger.error(f"通常会話応答エラー: {e}")
+                        ai_text = "ごめん、ちょっと考えがまとまらないや！もう一回言ってもらえる？"
+                else:
+                    # Groq AIが無効な場合の簡易応答
+                    ai_text = generate_fallback_response(message)
+                    logger.info("💭 簡易応答モード（AI無効）")
 
         # 会話履歴を保存
         try:
