@@ -331,9 +331,20 @@ def is_recommendation_request(message):
 
 def detect_specialized_topic(message):
     """専門分野のトピックを検出"""
+    # 完全一致または部分一致をチェック
+    message_lower = message.lower()
+    
     for topic, config in SPECIALIZED_SITES.items():
-        if any(keyword in message for keyword in config['keywords']):
-            return topic
+        # キーワードの完全一致または部分一致
+        for keyword in config['keywords']:
+            keyword_lower = keyword.lower()
+            # 「CGニュース」のような短いキーワードは完全一致を優先
+            if len(keyword) <= 5:
+                if keyword in message or keyword_lower in message_lower:
+                    return topic
+            else:
+                if keyword in message:
+                    return topic
     return None
 
 def is_detailed_request(message):
@@ -347,18 +358,31 @@ def is_detailed_request(message):
 
 def should_search(message):
     """検索が必要かどうか判定"""
-    if is_hololive_request(message) or detect_specialized_topic(message) or is_recommendation_request(message):
+    # 専門分野のキーワードがあれば検索
+    if detect_specialized_topic(message):
         return True
     
+    # ホロライブ関連
+    if is_hololive_request(message):
+        # ただし「ニュース」「情報」などのキーワードがある場合は直接応答
+        if not any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ', 'ホロライブ']):
+            return True
+    
+    # おすすめリクエスト
+    if is_recommendation_request(message):
+        return True
+    
+    # 質問パターン
     question_patterns = [
         r'(?:とは|について|教えて)',
         r'(?:調べて|検索)',
-        r'(?:誰|何|どこ|いつ|なぜ)'
+        r'(?:誰|何|どこ|いつ|なぜ|どう)'
     ]
     if any(re.search(pattern, message) for pattern in question_patterns):
         return True
     
-    question_words = ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして', 'どんな']
+    # 質問語
+    question_words = ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして', 'どんな', 'どう']
     if any(word in message for word in question_words):
         return True
     
@@ -405,18 +429,26 @@ def format_search_results(results_text):
     
     # すでに整形済みかチェック
     if results_text.startswith('[情報') or results_text.startswith('データベース'):
-        return results_text
+        # URLを削除
+        import re
+        results_text = re.sub(r'https?://[^\s]+', '', results_text)
+        results_text = re.sub(r'の画像', '', results_text)
+        results_text = re.sub(r'この画像の記事へ', '', results_text)
+        results_text = re.sub(r'\s+', ' ', results_text)
+        results_text = re.sub(r'\n\s*\n+', '\n', results_text)
+        return results_text.strip()
     
     # URLのみの場合は除外
     if results_text.startswith('http') and '\n' not in results_text:
         return None
     
     # 長いURLを削除
-    import re
     results_text = re.sub(r'https?://[^\s]+', '', results_text)
+    results_text = re.sub(r'の画像', '', results_text)
+    results_text = re.sub(r'この画像の記事へ', '', results_text)
     
     # 余分な空白や改行を整理
-    results_text = re.sub(r'\n\s*\n', '\n', results_text)
+    results_text = re.sub(r'\n\s*\n+', '\n', results_text)
     results_text = re.sub(r' +', ' ', results_text)
     
     return results_text.strip()
@@ -1139,7 +1171,11 @@ def background_deep_search(task_id, query, is_detailed):
                     if news_items:
                         db_result = "データベースからの情報:\n"
                         for news in news_items:
-                            db_result += f"・{news.title}: {news.content[:150]}\n"
+                            # URLや余分な情報を削除
+                            clean_content = news.content
+                            clean_content = re.sub(r'https?://[^\s]+', '', clean_content)
+                            clean_content = re.sub(r'\s+', ' ', clean_content).strip()
+                            db_result += f"・{news.title}: {clean_content[:150]}{'...' if len(clean_content) > 150 else ''}\n"
                         search_result = db_result
                         logger.info(f"✅ DBから{len(news_items)}件発見")
                 db_session.close()
@@ -1339,7 +1375,7 @@ def chat_lsl():
                 logger.error(f"ニュース取得エラー: {e}")
                 ai_text = "ニュースを取得しようとしたんだけど、エラーが起きちゃった…ごめんね！"
         
-        # ===== 優先順位3: 時間・天気の即時応答 =====
+        # ===== 優先順位5: 時間・天気の即時応答 =====
         elif is_time_request(message) or is_weather_request(message):
             immediate_responses = []
             
@@ -1364,7 +1400,7 @@ def chat_lsl():
             ai_text = " ".join(immediate_responses)
             logger.info("✅ 即時応答で完結")
         
-        # ===== 優先順位4: 面白い話リクエスト =====
+        # ===== 優先順位6: 面白い話リクエスト =====
         elif is_story_request(message):
             if groq_client:
                 try:
@@ -1412,7 +1448,7 @@ def chat_lsl():
                 ai_text = random.choice(story_options)
                 logger.info("📖 簡易応答モードで面白い話リクエストに対応")
         
-        # ===== 優先順位5: 検索が必要な質問 =====
+        # ===== 優先順位7: 検索が必要な質問 =====
         elif should_search(message) and not is_short_response(message):
             is_detailed = is_detailed_request(message)
             
@@ -1436,7 +1472,7 @@ def chat_lsl():
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…。もう一回試してくれる？"
                 logger.error("❌ バックグラウンド検索の開始に失敗")
         
-        # ===== 優先順位6: 通常の会話 =====
+        # ===== 優先順位8: 通常の会話 =====
         else:
             # 短い質問や相槌への対応
             short_questions = {
