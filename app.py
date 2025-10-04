@@ -372,6 +372,55 @@ def is_story_request(message):
     ]
     return any(keyword in message for keyword in story_keywords)
 
+def is_emotional_expression(message):
+    """感情表現や状態を表す言葉かどうか判定"""
+    emotional_keywords = {
+        '眠': ['眠たい', '眠い', 'ねむい', 'ねむたい'],
+        '疲': ['疲れた', 'つかれた', '疲れ', 'つかれ'],
+        '嬉': ['嬉しい', 'うれしい', '嬉'],
+        '楽': ['楽しい', 'たのしい'],
+        '悲': ['悲しい', 'かなしい'],
+        '寂': ['寂しい', 'さびしい', '寂'],
+        '怒': ['怒', 'むかつく', 'イライラ'],
+        '暇': ['暇', 'ひま']
+    }
+    
+    for key, keywords in emotional_keywords.items():
+        if any(kw in message for kw in keywords):
+            return key
+    return None
+
+def is_seasonal_topic(message):
+    """季節の話題かどうか判定"""
+    seasonal_keywords = [
+        'お月見', '花見', '紅葉', 'クリスマス', '正月', 'ハロウィン',
+        '夏祭り', '七夕', '節分', 'バレンタイン', 'ホワイトデー'
+    ]
+    return any(keyword in message for keyword in seasonal_keywords)
+
+def format_search_results(results_text):
+    """検索結果を読みやすく整形"""
+    if not results_text:
+        return None
+    
+    # すでに整形済みかチェック
+    if results_text.startswith('[情報') or results_text.startswith('データベース'):
+        return results_text
+    
+    # URLのみの場合は除外
+    if results_text.startswith('http') and '\n' not in results_text:
+        return None
+    
+    # 長いURLを削除
+    import re
+    results_text = re.sub(r'https?://[^\s]+', '', results_text)
+    
+    # 余分な空白や改行を整理
+    results_text = re.sub(r'\n\s*\n', '\n', results_text)
+    results_text = re.sub(r' +', ' ', results_text)
+    
+    return results_text.strip()
+
 def is_short_response(message):
     """短い相槌的な返事かどうか判定"""
     short_responses = ['うん', 'そう', 'はい', 'そっか', 'なるほど', 'ふーん', 'へー']
@@ -1208,6 +1257,12 @@ def chat_lsl():
         if completed_task:
             original_query = completed_task['query']
             search_result = completed_task['result']
+            
+            # 検索結果を整形
+            formatted_result = format_search_results(search_result)
+            if not formatted_result:
+                formatted_result = "検索結果がうまく取得できなかったみたい…。もう一回違う聞き方で試してみて？"
+            
             is_detailed = is_detailed_request(original_query)
             
             # Groq AIが有効な場合
@@ -1216,17 +1271,41 @@ def chat_lsl():
                     user_data,
                     f"おまたせ！さっきの「{original_query}」について調べてきたよ！",
                     history,
-                    f"検索結果: {search_result}",
+                    f"検索結果: {formatted_result}",
                     is_detailed=is_detailed,
                     is_task_report=True
                 )
             else:
                 # Groq AIが無効な場合は直接結果を返す
-                ai_text = f"おまたせ！「{original_query}」について調べてきたよ！\n\n{search_result}"
+                ai_text = f"おまたせ！「{original_query}」について調べてきたよ！\n\n{formatted_result}"
             
             logger.info(f"📋 完了タスクを報告: {original_query}")
         
-        # ===== 優先順位2: ホロライブニュースリクエスト =====
+        # ===== 優先順位2: 感情表現への応答 =====
+        elif is_emotional_expression(message):
+            emotion_type = is_emotional_expression(message)
+            emotion_responses = {
+                '眠': 'ねむいのか〜！無理しないで早めに寝てね！おやすみ〜💤',
+                '疲': 'お疲れさま〜！ゆっくり休んで元気になってね！',
+                '嬉': 'やった！何か嬉しいことあったんだね！教えて教えて！',
+                '楽': 'うける！楽しそうでいいじゃん！何してたの？',
+                '悲': 'えー、どうしたの？大丈夫？話聞くよ！',
+                '寂': 'あてぃしがいるじゃん！話そ？',
+                '怒': 'えー、何かあったの？話聞くよ〜',
+                '暇': '暇なんだ〜！じゃあ何か面白いこと話そうか？'
+            }
+            ai_text = emotion_responses.get(emotion_type, "そうなんだ〜。どうしたの？")
+            logger.info(f"💭 感情表現に応答: {emotion_type}")
+        
+        # ===== 優先順位3: 季節の話題への応答 =====
+        elif is_seasonal_topic(message):
+            if groq_client:
+                ai_text = generate_ai_response(user_data, message, history)
+            else:
+                ai_text = "そうだね〜！季節の話っていいよね！あてぃしも好きだよ！"
+            logger.info("🎑 季節の話題に応答")
+        
+        # ===== 優先順位4: ホロライブニュースリクエスト =====
         elif is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ', 'ホロライブ']):
             try:
                 # データベースから最新ニュースを取得
