@@ -1125,26 +1125,17 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # --- メイン実行 ---
-@app.route('/health', methods=['GET'])
-def health_check():
-    """ヘルスチェックエンドポイント - Renderの起動確認用"""
-    try:
-        # データベース接続確認
-        with engine.connect() as conn: 
-            conn.execute(text("SELECT 1"))
-        db_status = 'ok'
-    except Exception as e:
-        logger.error(f"Health check DB error: {e}")
-        db_status = 'error'
-    
-    health_data = {
-        'status': 'ok',
-        'timestamp': datetime.utcnow().isoformat(),
-        'services': {
-            'database': db_status, 
-            'groq_ai': 'ok' if groq_client else 'disabled'
-        }
-    }
-    
-    logger.info(f"Health check: {health_data}")
-    return jsonify(health_data), 200
+# --- メイン実行 ---
+try:
+    initialize_app()
+    application = app
+    logger.info("✅ Flask application 'application' is ready and initialized.")
+except Exception as e:
+    logger.critical(f"🔥 Fatal initialization error: {e}", exc_info=True)
+    # エラーが発生してもアプリケーションオブジェクトは作成する
+    application = app
+    logger.warning("⚠️ Application created with limited functionality due to initialization error.")
+
+if __name__ == '__main__':
+    logger.info("🚀 Running in direct mode (not recommended for production)")
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
