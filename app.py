@@ -257,7 +257,6 @@ def create_optimized_db_engine():
         raise
 
 # ===== 改善版: Groq初期化（接続テストを安全に実行） =====
-# ===== 改善版: Groq初期化（接続テストを安全に実行） =====
 def initialize_groq_client():
     """Groqクライアントを初期化し、接続テストを実行"""
     global groq_client
