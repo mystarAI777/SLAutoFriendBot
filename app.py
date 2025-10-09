@@ -875,12 +875,28 @@ def start_background_search(user_uuid, query, is_detailed):
 # --- Flaskエンドポイント ---
 @app.route('/health', methods=['GET'])
 def health_check():
+    """ヘルスチェックエンドポイント - Renderの起動確認用"""
     try:
-        with engine.connect() as conn: conn.execute(text("SELECT 1"))
+        # データベース接続確認
+        with engine.connect() as conn: 
+            conn.execute(text("SELECT 1"))
         db_status = 'ok'
-    except Exception: db_status = 'error'
-    return jsonify({'status': 'ok', 'services': {'database': db_status, 'groq_ai': 'ok' if groq_client else 'disabled'}})
-
+    except Exception as e:
+        logger.error(f"Health check DB error: {e}")
+        db_status = 'error'
+    
+    health_data = {
+        'status': 'ok',
+        'timestamp': datetime.utcnow().isoformat(),
+        'services': {
+            'database': db_status, 
+            'groq_ai': 'ok' if groq_client else 'disabled'
+        }
+    }
+    
+    logger.info(f"Health check: {health_data}")
+    return jsonify(health_data), 200
+    
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     session = Session()
@@ -1011,63 +1027,92 @@ def populate_extended_holomem_wiki():
 
 def initialize_app():
     global engine, Session, groq_client
-    logger.info("🔧 Initializing application...")
+    logger.info("=" * 60)
+    logger.info("🔧 Starting Mochiko AI initialization...")
+    logger.info("=" * 60)
 
     # Groq初期化を呼び出し
-    try:  # ← 追加
+    try:
+        logger.info("📡 Step 1/5: Initializing Groq client...")
         groq_client = initialize_groq_client()
-    except Exception as e:  # ← 追加
-        logger.warning(f"⚠️ Groq initialization failed but continuing: {e}")  # ← 追加
-        groq_client = None  # ← 追加
+        if groq_client:
+            logger.info("✅ Groq client ready")
+        else:
+            logger.warning("⚠️ Groq client disabled - using fallback responses")
+    except Exception as e:
+        logger.warning(f"⚠️ Groq initialization failed but continuing: {e}")
+        groq_client = None
 
     # データベースエンジン作成
     try:
+        logger.info("🗄️ Step 2/5: Initializing database...")
         engine = create_optimized_db_engine()
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
-        logger.info("✅ Database initialized successfully")  # ← 追加
+        logger.info("✅ Database initialized successfully")
     except Exception as e:
         logger.critical(f"🔥 Database initialization failed: {e}")
-        sys.exit(1)
+        raise  # データベースは必須なので例外を再スロー
 
     # アプリ起動時にWikiを初期化
-    try:  # ← 追加
+    try:
+        logger.info("📚 Step 3/5: Initializing Wiki data...")
         initialize_holomem_wiki()
         populate_extended_holomem_wiki()
-    except Exception as e:  # ← 追加
-        logger.warning(f"⚠️ Wiki initialization failed but continuing: {e}")  # ← 追加
+        logger.info("✅ Wiki initialization complete")
+    except Exception as e:
+        logger.warning(f"⚠️ Wiki initialization failed but continuing: {e}")
     
+    # ニュースデータのチェック
     session = Session()
-    try:  # ← 追加
-        if session.query(HololiveNews).count() == 0:
-            logger.info("🚀 First run: Triggering initial Hololive news fetch.")
+    try:
+        logger.info("📰 Step 4/5: Checking news data...")
+        holo_count = session.query(HololiveNews).count()
+        spec_count = session.query(SpecializedNews).count()
+        
+        if holo_count == 0:
+            logger.info("🚀 First run: Scheduling Hololive news fetch...")
             background_executor.submit(update_hololive_news_database)
-        if session.query(SpecializedNews).count() == 0:
-            logger.info("🚀 First run: Triggering initial specialized news fetch.")
+        else:
+            logger.info(f"✅ Found {holo_count} Hololive news items")
+            
+        if spec_count == 0:
+            logger.info("🚀 First run: Scheduling specialized news fetch...")
             background_executor.submit(update_all_specialized_news)
-    except Exception as e:  # ← 追加
-        logger.warning(f"⚠️ News initialization check failed but continuing: {e}")  # ← 追加
-    finally:  # ← 変更（session.close()をfinally内に）
+        else:
+            logger.info(f"✅ Found {spec_count} specialized news items")
+    except Exception as e:
+        logger.warning(f"⚠️ News initialization check failed but continuing: {e}")
+    finally:
         session.close()
 
     # スケジューラー設定
-    schedule.every().hour.do(update_hololive_news_database)
-    schedule.every(3).hours.do(update_all_specialized_news)
-    schedule.every().day.at("02:00").do(cleanup_old_data_advanced)
-    schedule.every().week.do(populate_extended_holomem_wiki)
-    
-    def run_scheduler():
-        while True:
-            try:  # ← 追加
-                schedule.run_pending()
-            except Exception as e:  # ← 追加
-                logger.error(f"❌ Scheduler error: {e}")  # ← 追加
-            time.sleep(60)
+    try:
+        logger.info("⏰ Step 5/5: Starting scheduler...")
+        schedule.every().hour.do(update_hololive_news_database)
+        schedule.every(3).hours.do(update_all_specialized_news)
+        schedule.every().day.at("02:00").do(cleanup_old_data_advanced)
+        schedule.every().week.do(populate_extended_holomem_wiki)
+        
+        def run_scheduler():
+            while True:
+                try:
+                    schedule.run_pending()
+                except Exception as e:
+                    logger.error(f"❌ Scheduler error: {e}")
+                time.sleep(60)
 
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    logger.info("⏰ Scheduler started.")
-    logger.info("✅ Application initialization complete!")  # ← 追加
+        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
+        logger.info("✅ Scheduler started successfully")
+    except Exception as e:
+        logger.error(f"❌ Scheduler initialization failed: {e}")
+    
+    logger.info("=" * 60)
+    logger.info("✅ Mochiko AI initialization complete!")
+    logger.info("🌐 Server is ready to accept requests")
+    logger.info("=" * 60)
+    
 def signal_handler(sig, frame):
     logger.info(f"🛑 Signal {sig} received. Shutting down gracefully...")
     background_executor.shutdown(wait=True)
@@ -1080,12 +1125,26 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # --- メイン実行 ---
-if __name__ == '__main__':
-    initialize_app()
-    application = app
-    print("✅ Flask application 'application' is ready for deployment.")
-else:
-    # Render等のWSGIサーバー経由での起動時
-    initialize_app()
-    application = app
-    print("✅ Flask application 'application' is ready for WSGI server.")
+@app.route('/health', methods=['GET'])
+def health_check():
+    """ヘルスチェックエンドポイント - Renderの起動確認用"""
+    try:
+        # データベース接続確認
+        with engine.connect() as conn: 
+            conn.execute(text("SELECT 1"))
+        db_status = 'ok'
+    except Exception as e:
+        logger.error(f"Health check DB error: {e}")
+        db_status = 'error'
+    
+    health_data = {
+        'status': 'ok',
+        'timestamp': datetime.utcnow().isoformat(),
+        'services': {
+            'database': db_status, 
+            'groq_ai': 'ok' if groq_client else 'disabled'
+        }
+    }
+    
+    logger.info(f"Health check: {health_data}")
+    return jsonify(health_data), 200
