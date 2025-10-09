@@ -257,6 +257,7 @@ def create_optimized_db_engine():
         raise
 
 # ===== 改善版: Groq初期化（接続テストを安全に実行） =====
+# ===== 改善版: Groq初期化（接続テストを安全に実行） =====
 def initialize_groq_client():
     """Groqクライアントを初期化し、接続テストを実行"""
     global groq_client
@@ -274,24 +275,9 @@ def initialize_groq_client():
         
         client = Groq(api_key=GROQ_API_KEY.strip())
         
-        # 軽量な接続テストを実行
-        try:
-            test_response = client.chat.completions.create(
-                messages=[{"role": "user", "content": "Hi"}],
-                model="llama-3.1-8b-instant",
-                max_tokens=5,
-                temperature=0.1
-            )
-            if test_response.choices:
-                logger.info("✅ Groq client initialized and tested successfully.")
-                return client
-            else:
-                logger.error("❌ Groq API test returned empty response.")
-                return None
-                
-        except Exception as test_error:
-            logger.error(f"❌ Groq API connection test failed: {test_error}")
-            return None
+        # 接続テストはスキップ（起動時間短縮のため）
+        logger.info("✅ Groq client initialized (connection test skipped for faster startup).")
+        return client
             
     except ImportError as e:
         logger.error(f"❌ Failed to import Groq library: {e}")
@@ -299,7 +285,7 @@ def initialize_groq_client():
     except Exception as e:
         logger.error(f"❌ Groq client initialization failed: {e}")
         return None
-
+        
 # --- ユーティリティ関数 ---
 def clean_text(text):
     if not text: return ""
@@ -1029,30 +1015,43 @@ def initialize_app():
     logger.info("🔧 Initializing application...")
 
     # Groq初期化を呼び出し
-    groq_client = initialize_groq_client()
+    try:  # ← 追加
+        groq_client = initialize_groq_client()
+    except Exception as e:  # ← 追加
+        logger.warning(f"⚠️ Groq initialization failed but continuing: {e}")  # ← 追加
+        groq_client = None  # ← 追加
 
     # データベースエンジン作成
     try:
         engine = create_optimized_db_engine()
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
+        logger.info("✅ Database initialized successfully")  # ← 追加
     except Exception as e:
         logger.critical(f"🔥 Database initialization failed: {e}")
         sys.exit(1)
 
     # アプリ起動時にWikiを初期化
-    initialize_holomem_wiki()
-    populate_extended_holomem_wiki()
+    try:  # ← 追加
+        initialize_holomem_wiki()
+        populate_extended_holomem_wiki()
+    except Exception as e:  # ← 追加
+        logger.warning(f"⚠️ Wiki initialization failed but continuing: {e}")  # ← 追加
     
     session = Session()
-    if session.query(HololiveNews).count() == 0:
-        logger.info("🚀 First run: Triggering initial Hololive news fetch.")
-        background_executor.submit(update_hololive_news_database)
-    if session.query(SpecializedNews).count() == 0:
-        logger.info("🚀 First run: Triggering initial specialized news fetch.")
-        background_executor.submit(update_all_specialized_news)
-    session.close()
+    try:  # ← 追加
+        if session.query(HololiveNews).count() == 0:
+            logger.info("🚀 First run: Triggering initial Hololive news fetch.")
+            background_executor.submit(update_hololive_news_database)
+        if session.query(SpecializedNews).count() == 0:
+            logger.info("🚀 First run: Triggering initial specialized news fetch.")
+            background_executor.submit(update_all_specialized_news)
+    except Exception as e:  # ← 追加
+        logger.warning(f"⚠️ News initialization check failed but continuing: {e}")  # ← 追加
+    finally:  # ← 変更（session.close()をfinally内に）
+        session.close()
 
+    # スケジューラー設定
     schedule.every().hour.do(update_hololive_news_database)
     schedule.every(3).hours.do(update_all_specialized_news)
     schedule.every().day.at("02:00").do(cleanup_old_data_advanced)
@@ -1060,13 +1059,16 @@ def initialize_app():
     
     def run_scheduler():
         while True:
-            schedule.run_pending()
+            try:  # ← 追加
+                schedule.run_pending()
+            except Exception as e:  # ← 追加
+                logger.error(f"❌ Scheduler error: {e}")  # ← 追加
             time.sleep(60)
 
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     logger.info("⏰ Scheduler started.")
-
+    logger.info("✅ Application initialization complete!")  # ← 追加
 def signal_handler(sig, frame):
     logger.info(f"🛑 Signal {sig} received. Shutting down gracefully...")
     background_executor.shutdown(wait=True)
@@ -1079,7 +1081,12 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # --- メイン実行 ---
-initialize_app()
-application = app
-
-print("Flask application 'application' is ready.")
+if __name__ == '__main__':
+    initialize_app()
+    application = app
+    print("✅ Flask application 'application' is ready for deployment.")
+else:
+    # Render等のWSGIサーバー経由での起動時
+    initialize_app()
+    application = app
+    print("✅ Flask application 'application' is ready for WSGI server.")
