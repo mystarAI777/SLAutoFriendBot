@@ -523,6 +523,11 @@ def update_hololive_news_database():
 
 def update_all_specialized_news():
     for site_name, config in SPECIALIZED_SITES.items():
+        # 「セカンドライフ」は定期巡回の対象外とする
+        if site_name == 'セカンドライフ':
+            logger.info("ℹ️ Skipping proactive scraping for 'セカンドライフ' as per policy.")
+            continue  # ループの次の要素へ進む
+
         session = Session()
         _update_news_database(session, SpecializedNews, site_name, config['base_url'], ['article', '.post', '.entry', '[class*="post"]', '[class*="article"]'])
         session.close()
@@ -812,11 +817,19 @@ def background_deep_search(task_id, query, is_detailed):
     specialized_topic = detect_specialized_topic(query)
     
     if specialized_topic:
-        news_items = session.query(SpecializedNews).filter(SpecializedNews.site_name == specialized_topic).order_by(SpecializedNews.created_at.desc()).limit(3).all()
-        if news_items:
-            search_result = f"{specialized_topic}のデータベース情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
+        # 「セカンドライフ」に関する質問は、DBを見ずに直接Web検索する
+        if specialized_topic == 'セカンドライフ':
+            logger.info(f"▶️ Performing on-demand web search for 'セカンドライフ': {query}")
+            # 検索クエリをより一般的なものに変更
+            search_result = deep_web_search(f"Second Life 最新情報 {query}", is_detailed)
         else:
-            search_result = deep_web_search(f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}", is_detailed)
+            # それ以外の専門分野は、これまで通りDBをまず検索
+            news_items = session.query(SpecializedNews).filter(SpecializedNews.site_name == specialized_topic).order_by(SpecializedNews.created_at.desc()).limit(3).all()
+            if news_items:
+                search_result = f"{specialized_topic}のデータベース情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
+            else:
+                search_result = deep_web_search(f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}", is_detailed)
+
     elif is_hololive_request(query):
         keywords = [kw for kw in HOLOMEM_KEYWORDS if kw in query]
         if keywords:
