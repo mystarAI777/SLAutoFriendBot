@@ -12,6 +12,7 @@ import uuid
 import hashlib
 from datetime import datetime, timedelta, timezone
 import unicodedata
+from groq import Groq
 
 # 型ヒント用のインポート（エラー対策付き）
 try:
@@ -94,13 +95,34 @@ app = Flask(__name__)
 CORS(app)
 Base = declarative_base()
 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが唯一の変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+
 # --- 秘密情報/環境変数 読み込み ---
 def get_secret(name):
-    return os.environ.get(name)
+    """
+    まずRenderのSecret Fileから秘密情報を読み込み、見つからなければ環境変数から読み込む。
+    """
+    secret_file_path = f"/etc/secrets/{name}"
+    if os.path.exists(secret_file_path):
+        try:
+            with open(secret_file_path, 'r') as f:
+                logger.info(f"✅ Secret Fileから {name} を読み込みました。")
+                return f.read().strip()
+        except IOError as e:
+            logger.error(f"❌ Secret File {secret_file_path} の読み込みに失敗: {e}")
+            return None
+    
+    # Secret Fileが見つからない場合は、フォールバックとして環境変数をチェック
+    value = os.environ.get(name)
+    if value:
+         logger.info(f"✅ 環境変数から {name} を読み込みました。")
+    return value
 
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- 初期化処理 ---
 try:
