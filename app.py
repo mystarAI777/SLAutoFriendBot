@@ -118,6 +118,34 @@ def get_secret(name):
          logger.info(f"✅ 環境変数から {name} を読み込みました。")
     return value
 
+def ensure_voice_directory():
+    """音声ディレクトリの存在を保証"""
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            if not os.path.exists(VOICE_DIR):
+                os.makedirs(VOICE_DIR, mode=0o755, exist_ok=True)
+                logger.info(f"✅ Voice directory created: {VOICE_DIR}")
+            
+            # 書き込み権限を確認
+            if os.access(VOICE_DIR, os.W_OK):
+                logger.info(f"✅ Voice directory is writable: {VOICE_DIR}")
+                return True
+            else:
+                # 権限を修正
+                os.chmod(VOICE_DIR, 0o755)
+                logger.info(f"✅ Voice directory permissions fixed: {VOICE_DIR}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ Voice directory creation failed (attempt {attempt + 1}/{max_attempts}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+            continue
+    
+    logger.critical(f"🔥 Failed to create voice directory after {max_attempts} attempts")
+    return False
+    
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
@@ -657,18 +685,63 @@ def get_friend_list(user_uuid):
         session.close()
 
 def generate_voice(text, speaker_id=VOICEVOX_SPEAKER_ID):
-    if not VOICEVOX_ENABLED: return None
+    """音声生成（改善版）"""
+    if not VOICEVOX_ENABLED:
+        logger.warning("⚠️ VOICEVOX is disabled")
+        return None
+    
+    # ディレクトリの存在を確認（毎回チェック）
+    if not os.path.exists(VOICE_DIR):
+        logger.warning(f"⚠️ Voice directory missing, recreating: {VOICE_DIR}")
+        ensure_voice_directory()
+    
     voicevox_url = VOICEVOX_URL_FROM_ENV or "http://localhost:50021"
+    
     try:
-        query_response = requests.post(f"{voicevox_url}/audio_query", params={"text": text, "speaker": speaker_id}, timeout=10)
+        # Step 1: クエリ作成
+        logger.info(f"🎤 Generating voice query for: {text[:50]}...")
+        query_response = requests.post(
+            f"{voicevox_url}/audio_query",
+            params={"text": text, "speaker": speaker_id},
+            timeout=10
+        )
         query_response.raise_for_status()
-        synthesis_response = requests.post(f"{voicevox_url}/synthesis", params={"speaker": speaker_id}, json=query_response.json(), timeout=30)
+        
+        # Step 2: 音声合成
+        logger.info(f"🎵 Synthesizing voice...")
+        synthesis_response = requests.post(
+            f"{voicevox_url}/synthesis",
+            params={"speaker": speaker_id},
+            json=query_response.json(),
+            timeout=30
+        )
         synthesis_response.raise_for_status()
         
-        filepath = os.path.join(VOICE_DIR, f"voice_{int(time.time())}.wav")
-        with open(filepath, 'wb') as f: f.write(synthesis_response.content)
-        logger.info(f"🎤 Voice generated successfully: {os.path.basename(filepath)}")
+        # Step 3: ファイル保存
+        timestamp = int(time.time())
+        random_suffix = random.randint(1000, 9999)
+        filename = f"voice_{timestamp}_{random_suffix}.wav"
+        filepath = os.path.join(VOICE_DIR, filename)
+        
+        logger.info(f"💾 Saving voice file: {filename}")
+        with open(filepath, 'wb') as f:
+            f.write(synthesis_response.content)
+        
+        # ファイルサイズ確認
+        file_size = os.path.getsize(filepath)
+        logger.info(f"✅ Voice generated successfully: {filename} ({file_size} bytes)")
+        
         return filepath
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ VOICEVOX timeout: {voicevox_url}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"❌ VOICEVOX connection error: {e}")
+        return None
+    except OSError as e:
+        logger.error(f"❌ File system error: {e}")
+        return None
     except Exception as e:
         logger.error(f"❌ VOICEVOX voice generation error: {e}")
         return None
@@ -872,6 +945,83 @@ def start_background_search(user_uuid, query, is_detailed):
     finally:
         session.close()
 
+@app.route('/test_voicevox', methods=['GET'])
+def test_voicevox():
+    """VOICEVOX接続テスト"""
+    voicevox_url = VOICEVOX_URL_FROM_ENV or "http://localhost:50021"
+    
+    result = {
+        'voicevox_url': voicevox_url,
+        'voicevox_enabled': VOICEVOX_ENABLED,
+        'voice_directory': {
+            'path': VOICE_DIR,
+            'exists': os.path.exists(VOICE_DIR),
+            'writable': os.access(VOICE_DIR, os.W_OK) if os.path.exists(VOICE_DIR) else False
+        },
+        'tests': {}
+    }
+    
+    # Test 1: VOICEVOXバージョン確認
+    try:
+        response = requests.get(f"{voicevox_url}/version", timeout=5)
+        if response.ok:
+            result['tests']['version'] = {
+                'status': 'ok',
+                'data': response.json()
+            }
+        else:
+            result['tests']['version'] = {
+                'status': 'error',
+                'http_code': response.status_code
+            }
+    except Exception as e:
+        result['tests']['version'] = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    # Test 2: 簡易音声生成テスト
+    try:
+        test_response = requests.post(
+            f"{voicevox_url}/audio_query",
+            params={"text": "テスト", "speaker": VOICEVOX_SPEAKER_ID},
+            timeout=10
+        )
+        if test_response.ok:
+            result['tests']['audio_query'] = {
+                'status': 'ok',
+                'message': '音声クエリ生成が正常に動作しています'
+            }
+        else:
+            result['tests']['audio_query'] = {
+                'status': 'error',
+                'http_code': test_response.status_code
+            }
+    except Exception as e:
+        result['tests']['audio_query'] = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    # 総合判定
+    all_ok = all(
+        test.get('status') == 'ok' 
+        for test in result['tests'].values()
+    ) and result['voice_directory']['exists'] and result['voice_directory']['writable']
+    
+    result['overall_status'] = 'ok' if all_ok else 'error'
+    
+    if not all_ok:
+        result['recommendations'] = []
+        if not result['voice_directory']['exists']:
+            result['recommendations'].append('音声ディレクトリが存在しません - サーバーを再起動してください')
+        if not result['voice_directory']['writable']:
+            result['recommendations'].append('音声ディレクトリに書き込み権限がありません')
+        if result['tests'].get('version', {}).get('status') != 'ok':
+            result['recommendations'].append('VOICEVOXエンジンに接続できません')
+    
+    return jsonify(result), 200 if all_ok else 500
+    
 # --- Flaskエンドポイント ---
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -1113,7 +1263,7 @@ def initialize_app():
     logger.info("🌐 Server is ready to accept requests")
     logger.info("=" * 60)
     
-def signal_handler(sig, frame):
+signal_handler(sig, frame):
     logger.info(f"🛑 Signal {sig} received. Shutting down gracefully...")
     background_executor.shutdown(wait=True)
     if 'engine' in globals() and engine:
