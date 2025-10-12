@@ -153,7 +153,6 @@ VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- 初期化処理 ---
-try:
     ensure_voice_directory()
 
 if not DATABASE_URL:
