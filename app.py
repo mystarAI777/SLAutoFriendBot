@@ -153,7 +153,7 @@ VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- 初期化処理 ---
-    ensure_voice_directory()
+ensure_voice_directory()
 
 if not DATABASE_URL:
     logger.critical("FATAL: DATABASE_URL is not set.")
