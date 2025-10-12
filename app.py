@@ -154,9 +154,7 @@ VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
 # --- 初期化処理 ---
 try:
-    os.makedirs(VOICE_DIR, exist_ok=True)
-except Exception as e:
-    logger.warning(f"⚠️ Voice directory creation failed: {e}")
+    ensure_voice_directory()
 
 if not DATABASE_URL:
     logger.critical("FATAL: DATABASE_URL is not set.")
@@ -1263,7 +1261,7 @@ def initialize_app():
     logger.info("🌐 Server is ready to accept requests")
     logger.info("=" * 60)
     
-signal_handler(sig, frame):
+def signal_handler(sig, frame):
     logger.info(f"🛑 Signal {sig} received. Shutting down gracefully...")
     background_executor.shutdown(wait=True)
     if 'engine' in globals() and engine:
