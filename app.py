@@ -46,6 +46,10 @@ VOICE_DIR = '/tmp/voices'
 SERVER_URL = "https://slautofriendbot.onrender.com"
 VOICEVOX_SPEAKER_ID = 20  # もち子さん(ノーマル) に統合
 HOLOLIVE_NEWS_URL = "https://hololive-tsuushin.com/category/holonews/"
+
+SL_SAFE_CHAR_LIMIT = 300      # Second Life安全文字数制限
+VOICE_OPTIMAL_LENGTH = 150    # VOICEVOX最適文字数
+
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -93,6 +97,16 @@ groq_client = None
 VOICEVOX_ENABLED = True
 app = Flask(__name__)
 CORS(app)
+
+# ↓↓↓ ここに追加 ↓↓↓
+@app.after_request
+def after_request(response):
+    """CORSヘッダーを全レスポンスに追加"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
+
 Base = declarative_base()
 
 # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが唯一の変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
@@ -383,6 +397,19 @@ def is_news_detail_request(message):
 def is_friend_request(message):
     return any(fk in message for fk in ['友だち', '友達', 'フレンド']) and any(ak in message for ak in ['登録', '教えて', '誰', 'リスト'])
 
+# ↓↓↓ ここに追加 ↓↓↓
+def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT):
+    """
+    テキストを指定文字数以内に制限
+    - 制限内ならそのまま返す
+    - 超えている場合は切り詰めて「...」を追加
+    """
+    if len(text) <= max_length:
+        return text
+    
+    # 単純に切り詰め
+    return text[:max_length - 3] + "..."
+    
 def extract_location(message):
     for location in LOCATION_CODES.keys():
         if location in message:
@@ -421,17 +448,24 @@ def get_cached_news_detail(session, user_uuid, news_number):
 
 # --- コア機能: 天気, ニュース, Wiki, 友達 ---
 def get_weather_forecast(location):
+    """天気予報取得（文字数制限版）"""
     area_code = LOCATION_CODES.get(location, "130000")
     url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         text = clean_text(response.json().get('text', ''))
-        return f"今の{location}の天気はね、「{text}」って感じだよ！" if text else f"{location}の天気情報がちょっと取れなかった…"
+        
+        if not text:
+            return f"{location}の天気情報がちょっと取れなかった…"
+        
+        # ★ 150文字以内に制限
+        weather_text = f"今の{location}の天気はね、「{text}」って感じだよ！"
+        return limit_text_for_sl(weather_text, 150)
+        
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "天気情報がうまく取れなかったみたい…"
-
 # ===== 改善版: 記事取得（リトライ機構付き） =====
 def fetch_article_content(article_url, max_retries=3, timeout=15):
     """記事コンテンツを取得（リトライ機構付き）"""
@@ -1080,15 +1114,20 @@ def chat_lsl():
             if is_time_request(message): responses.append(get_japan_time())
             if is_weather_request(message): responses.append(get_weather_forecast(extract_location(message)))
             ai_text = " ".join(responses)
-        # 優先度4: ニュースリクエスト
+       # 優先度4: ニュースリクエスト（★修正版）
         elif not ai_text and is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
             all_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(10).all()
             if all_news:
                 selected_news = random.sample(all_news, min(random.randint(3, 5), len(all_news)))
                 save_news_cache(session, user_uuid, selected_news, 'hololive')
+                
+                # ★ タイトルのみ表示（コンパクト版）
                 news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n\n"
-                news_text += "\n".join(f"【{i}】{n.title}\n{n.content[:100]}...\n" for i, n in enumerate(selected_news, 1))
-                news_text += "\n気になるのあった？番号で教えて！詳しく教えるよ！"
+                news_text += "\n".join(f"【{i}】{n.title}" for i, n in enumerate(selected_news, 1))
+                news_text += "\n\n気になるのあった？番号で教えて！詳しく教えるよ！"
+                
+                # ★ 300文字以内に制限
+                news_text = limit_text_for_sl(news_text, 300)
                 ai_text = generate_ai_response(user_data, message, history, news_text)
             else:
                 ai_text = "ごめん、今ニュースがまだ取得できてないみたい…。"
@@ -1121,6 +1160,9 @@ def chat_lsl():
 def voice_generation_endpoint():
     text = request.json.get('text', '')[:200]
     if not text: return jsonify({'error': 'テキストがありません'}), 400
+   # ★ 200文字超えたら150文字に制限
+    if len(text) > 200:
+        text = limit_text_for_sl(text, 150)
     if voice_path := generate_voice(text):
         filename = os.path.basename(voice_path)
         return jsonify({'status': 'success', 'filename': filename, 'url': f"{SERVER_URL}/voices/{filename}"})
@@ -1129,6 +1171,123 @@ def voice_generation_endpoint():
 @app.route('/voices/<filename>')
 def serve_voice_file(filename):
     return send_from_directory(VOICE_DIR, filename)
+
+# ↓↓↓ ここに追加 ↓↓↓
+@app.route('/play_voice')
+def play_voice():
+    """音声ファイルを自動再生するHTMLページ"""
+    voice_url = request.args.get('url', '')
+    
+    if not voice_url:
+        return "音声URLが指定されていません", 400
+    
+    if not voice_url.startswith(SERVER_URL):
+        return "不正な音声URLです", 400
+    
+    return f'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>もちこAI 音声再生</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            overflow: hidden;
+        }}
+        .player {{
+            background: rgba(255, 255, 255, 0.95);
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            max-width: 400px;
+        }}
+        .emoji {{
+            font-size: 3em;
+            animation: pulse 1.5s infinite;
+        }}
+        @keyframes pulse {{
+            0%, 100% {{ transform: scale(1); }}
+            50% {{ transform: scale(1.1); }}
+        }}
+        h1 {{
+            color: #667eea;
+            margin: 15px 0 10px 0;
+            font-size: 1.8em;
+        }}
+        p {{ color: #666; margin-bottom: 20px; }}
+        audio {{ width: 100%; margin-top: 10px; }}
+        .status {{
+            margin-top: 15px;
+            padding: 10px;
+            background: #e8f5e9;
+            border-radius: 5px;
+            color: #2e7d32;
+            font-size: 0.9em;
+        }}
+    </style>
+</head>
+<body>
+    <div class="player">
+        <div class="emoji">🎤</div>
+        <h1>もちこAI</h1>
+        <p>音声を再生しています...</p>
+        <audio id="audioPlayer" controls autoplay>
+            <source src="{voice_url}" type="audio/wav">
+        </audio>
+        <div class="status" id="status">準備中...</div>
+    </div>
+    <script>
+        const audio = document.getElementById('audioPlayer');
+        const status = document.getElementById('status');
+        audio.addEventListener('loadstart', () => {{
+            status.textContent = '音声を読み込んでいます...';
+            status.style.background = '#fff3e0';
+            status.style.color = '#e65100';
+        }});
+        audio.addEventListener('play', () => {{
+            status.textContent = '♪ 再生中...';
+            status.style.background = '#e3f2fd';
+            status.style.color = '#1565c0';
+        }});
+        audio.addEventListener('ended', () => {{
+            status.textContent = '✓ 再生完了';
+        }});
+        audio.addEventListener('error', () => {{
+            status.textContent = '✗ 読み込み失敗';
+            status.style.background = '#ffebee';
+            status.style.color = '#c62828';
+        }});
+        audio.play().catch(() => {{
+            status.textContent = '▶ 再生ボタンを押してください';
+            status.style.background = '#fff3e0';
+            status.style.color = '#e65100';
+        }});
+    </script>
+</body>
+</html>'''
+
+@app.route('/play_voice_simple')
+def play_voice_simple():
+    """最小限のHTMLで音声再生"""
+    voice_url = request.args.get('url', '')
+    if not voice_url:
+        return "音声URLが指定されていません", 400
+    return f'''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><style>
+body{{margin:0;background:#667eea;display:flex;justify-content:center;align-items:center;height:100vh;}}
+audio{{width:90%;max-width:400px;}}
+</style></head><body>
+<audio controls autoplay><source src="{voice_url}" type="audio/wav"></audio>
+</body></html>'''
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
