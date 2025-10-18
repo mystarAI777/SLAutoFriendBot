@@ -1158,15 +1158,72 @@ def chat_lsl():
 
 @app.route('/generate_voice', methods=['POST'])
 def voice_generation_endpoint():
-    text = request.json.get('text', '')[:200]
-    if not text: return jsonify({'error': 'テキストがありません'}), 400
-   # ★ 200文字超えたら150文字に制限
-    if len(text) > 200:
-        text = limit_text_for_sl(text, 150)
-    if voice_path := generate_voice(text):
+    """音声生成エンドポイント - 修正版"""
+    try:
+        # request.jsonがNoneの場合の対策
+        data = request.json
+        if not data:
+            logger.error("❌ Empty request body")
+            return jsonify({'error': 'リクエストボディが空です'}), 400
+        
+        # テキスト取得（先に切り詰めない）
+        text = data.get('text', '').strip()
+        
+        if not text:
+            logger.error("❌ No text provided")
+            return jsonify({'error': 'テキストが指定されていません'}), 400
+        
+        # ★ 正しい文字数制限（修正版）
+        original_length = len(text)
+        if original_length > 200:
+            text = limit_text_for_sl(text, 150)
+            logger.warning(f"⚠️ Text truncated: {original_length} → {len(text)} chars")
+        
+        logger.info(f"🎤 Voice generation: {text[:50]}...")
+        
+        # 音声生成
+        voice_path = generate_voice(text)
+        
+        # 結果確認
+        if not voice_path:
+            logger.error("❌ generate_voice() returned None")
+            return jsonify({
+                'error': '音声生成に失敗しました',
+                'details': 'VOICEVOXエンジンに接続できません'
+            }), 500
+        
+        if not os.path.exists(voice_path):
+            logger.error(f"❌ Voice file not found: {voice_path}")
+            return jsonify({
+                'error': '音声ファイルが見つかりません'
+            }), 500
+        
+        # 成功レスポンス
         filename = os.path.basename(voice_path)
-        return jsonify({'status': 'success', 'filename': filename, 'url': f"{SERVER_URL}/voices/{filename}"})
-    return jsonify({'error': '音声生成に失敗しました'}), 500
+        voice_url = f"{SERVER_URL}/voices/{filename}"
+        
+        logger.info(f"✅ Voice generated: {filename}")
+        
+        return jsonify({
+            'status': 'success',
+            'filename': filename,
+            'url': voice_url,
+            'text': text
+        }), 200
+        
+    except AttributeError as e:
+        logger.error(f"❌ AttributeError (request.json is None?): {e}")
+        return jsonify({
+            'error': 'リクエスト形式が不正です',
+            'details': 'Content-Type: application/json が必要です'
+        }), 400
+        
+    except Exception as e:
+        logger.error(f"❌ Voice generation exception: {e}", exc_info=True)
+        return jsonify({
+            'error': '音声生成中にエラーが発生しました',
+            'details': str(e)
+        }), 500
 
 @app.route('/voices/<filename>')
 def serve_voice_file(filename):
