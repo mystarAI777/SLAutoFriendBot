@@ -362,10 +362,32 @@ def is_detailed_request(message):
     return any(keyword in message for keyword in ['詳しく', '詳細', 'くわしく', '教えて', '説明して', '解説して', 'どういう', 'なぜ', 'どうして', '理由', '原因', '具体的に'])
 
 def should_search(message):
-    if detect_specialized_topic(message): return True
-    if is_hololive_request(message) and not any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']): return True
-    if is_recommendation_request(message): return True
-    if any(re.search(pattern, message) for pattern in [r'(?:とは|について|教えて)', r'(?:調べて|検索)', r'(?:誰|何|どこ|いつ|なぜ|どう)']): return True
+    """検索が必要かを判定（短い相槌は除外）"""
+    # ★ 最優先: 短い相槌は検索しない
+    if is_short_response(message):
+        return False
+    
+    # 専門トピック検出
+    if detect_specialized_topic(message):
+        return True
+    
+    # ホロライブ関連（ニュース以外）
+    if is_hololive_request(message) and not any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
+        return True
+    
+    # おすすめリクエスト
+    if is_recommendation_request(message):
+        return True
+    
+    # 明確な検索パターン
+    search_patterns = [
+        r'(?:とは|について|教えて|説明して|解説して)',
+        r'(?:調べて|検索して|探して)',
+        r'(?:誰ですか|何ですか|どこですか|いつですか|なぜですか|どうして)'
+    ]
+    if any(re.search(pattern, message) for pattern in search_patterns):
+        return True
+    
     return False
 
 def is_story_request(message):
@@ -385,7 +407,29 @@ def is_seasonal_topic(message):
     return any(keyword in message for keyword in ['お月見', '花見', '紅葉', 'クリスマス', '正月', 'ハロウィン'])
 
 def is_short_response(message):
-    return len(message.strip()) <= 3 or message.strip() in ['うん', 'そう', 'はい', 'そっか', 'なるほど', 'ふーん', 'へー']
+    """短い相槌・返事を判定（検索対象外にする）"""
+    msg = message.strip()
+    
+    # 3文字以下
+    if len(msg) <= 3:
+        return True
+    
+    # 典型的な相槌パターン
+    short_responses = [
+        'うん', 'そう', 'はい', 'そっか', 'なるほど', 'ふーん', 'へー',
+        'そうなんだ', 'へぇ', 'ほう', 'あー', 'おー', 'ふむ',
+        '何言ってたかな', 'どうだったかな', 'なんだったかな',
+        '忘れた', '覚えてない', 'わからない'
+    ]
+    
+    if msg in short_responses:
+        return True
+    
+    # 「〜かな」で終わる短い発言（10文字以内）
+    if len(msg) <= 10 and msg.endswith('かな'):
+        return True
+    
+    return False
 
 def is_news_detail_request(message):
     match = re.search(r'([1-9]|[１-９])番|【([1-9]|[１-９])】', message)
@@ -1134,10 +1178,13 @@ def chat_lsl():
         # 優先度5: 感情・季節・面白い話
         elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
              ai_text = generate_ai_response(user_data, message, history)
-        # 優先度6: 検索
-        elif not ai_text and should_search(message) and not is_short_response(message):
+        # 優先度6: 検索（短い相槌は除外）
+        elif not ai_text and not is_short_response(message) and should_search(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
-                ai_text = random.choice([f"おっけー、「{message}」について調べてみるね！", f"「{message}」ね、まじ気になる！調べてみるじゃん！"])
+                ai_text = random.choice([
+                    f"おっけー、「{message}」について調べてみるね！",
+                    f"「{message}」ね、まじ気になる！調べてみるじゃん！"
+                ])
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…。"
         # 優先度7: 通常会話
