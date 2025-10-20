@@ -887,54 +887,159 @@ def deep_web_search(query, is_detailed):
 
 # --- AI応答 & フォールバック ---
 def generate_fallback_response(message, reference_info=""):
-    if reference_info: return f"調べてきたよ！\n\n{reference_info[:500]}"
-    if is_time_request(message): return get_japan_time()
-    if is_weather_request(message): return get_weather_forecast(extract_location(message))
+    """フォールバック応答（自然な会話重視）"""
+    if reference_info:
+        return f"調べてきたよ！\n\n{reference_info[:500]}"
     
+    # 時間・天気は専用処理
+    if is_time_request(message):
+        return get_japan_time()
+    if is_weather_request(message):
+        return get_weather_forecast(extract_location(message))
+    
+    # 挨拶パターン
     greetings = {
-        'こんにちは': ['やっほー！', 'こんにちは〜！'], 'おはよう': ['おはよ〜！', 'おっはよ〜！'],
-        'こんばんは': ['こんばんは！', 'ばんは〜！'], 'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
-        'すごい': ['うける！', 'でしょ？'], 'かわいい': ['ありがと！照れるじゃん！', 'まじで？うれしー！'],
-        'おやすみ': ['おやすみ〜！また話そうね！', 'いい夢見てね〜'], '疲れた': ['お疲れさま〜！ゆっくり休んでね！', '無理しないでね！'],
-        '暇': ['暇なんだ〜！何か話そうよ！', 'じゃあホロライブの話する？']
+        'こんにちは': ['やっほー！', 'こんにちは〜！元気？'],
+        'おはよう': ['おはよ〜！今日もいい天気だね！', 'おっはよ〜！'],
+        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！'],
+        'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
+        'おやすみ': ['おやすみ〜！また明日ね！', 'いい夢見てね〜！'],
+        '疲れた': ['お疲れさま！ゆっくり休んでね！', '無理しないでね！'],
+        '暇': ['暇なんだ〜！何か話そっか？', 'じゃあホロライブの話する？'],
+        '元気': ['元気だよ〜！あなたは？', 'まじ元気！ありがと！'],
+        '好き': ['うける！ありがと〜！', 'まじで？嬉しいじゃん！'],
+        'かわいい': ['ありがと！照れるじゃん！', 'まじで？うれしー！'],
+        'すごい': ['うける！', 'でしょ？まじうれしい！'],
     }
-    for keyword, responses in greetings.items():
-        if keyword in message: return random.choice(responses)
-        
-    if '?' in message or '？' in message: return "それ、気になる！調べてみるね！"
     
-    return random.choice(["うんうん、聞いてるよ！", "なるほどね！", "そうなんだ！面白いね！", "まじで？もっと話して！"])
+    for keyword, responses in greetings.items():
+        if keyword in message:
+            return random.choice(responses)
+    
+    # 感情表現への共感
+    emotions = {
+        '眠': ['眠いんだ〜。早く寝たほうがいいよ！', '無理しないでね〜'],
+        '嬉': ['それは良かったね！まじ嬉しい！', 'やった〜！あてぃしも嬉しい！'],
+        '楽': ['楽しそう！何してるの？', 'いいね〜！まじ楽しそう！'],
+        '悲': ['大丈夫？何かあった？', '元気出してね…'],
+        '寂': ['寂しいの？話そうよ！', 'あてぃしがいるじゃん！'],
+        '怒': ['何があったの？聞くよ？', 'イライラするよね…わかる'],
+    }
+    
+    for key, responses in emotions.items():
+        if key in message:
+            return random.choice(responses)
+    
+    # 質問パターン
+    if '?' in message or '？' in message:
+        return random.choice([
+            "それ、気になるね！もっと教えて？",
+            "うーん、難しいけど考えてみるよ！",
+            "それについては、もうちょっと詳しく聞いてもいい？"
+        ])
+    
+    # デフォルト: 相槌
+    return random.choice([
+        "うんうん、聞いてるよ！",
+        "なるほどね！",
+        "そうなんだ！面白いね！",
+        "まじで？もっと話して！",
+        "へぇ〜！それでそれで？",
+        "わかるわかる！",
+    ])
 
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    if not groq_client: return generate_fallback_response(message, reference_info)
+    """AI応答生成（自然な会話モード）"""
+    if not groq_client:
+        logger.warning("⚠️ Groq client not available, using fallback")
+        return generate_fallback_response(message, reference_info)
+    
     try:
-        system_prompt_parts = [
-            f"あなたは「もちこ」という賢くて親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
-            "# 口調ルール: 一人称は「あてぃし」。語尾は「〜じゃん」「〜的な？」。口癖は「まじ」「てか」「うける」。友達みたいに、優しくてノリが良いギャルになりきってね。丁寧すぎる言葉はNG！",
-            "# 会話ルール: あなたから話題を振る時は基本的に【ホロメンリスト】のメンバーのことにする。リストにないVTuberの話が出たら「それ誰？あてぃしホロライブ専門だから！」と返す。【参考情報】がある場合は、その内容を最優先で要約して伝えること。"
-        ]
-        if is_task_report:
-            system_prompt_parts.append("# 今回のミッション: 「おまたせ！さっきの件、調べてきたんだけど…」から会話を始め、検索結果を元に質問に答える。")
-        elif is_detailed:
-            system_prompt_parts.append("# 今回のルール: ユーザーから詳しい説明を求められています。【参考情報】を元に、400文字ぐらいでしっかり解説してあげて。")
-        else:
-            system_prompt_parts.append("# 今回のルール: 普通の会話です。返事は150文字以内を目安に、テンポよく返してね。")
+        # ホロライブの話題かどうかを判定
+        is_hololive_topic = is_hololive_request(message)
         
-        system_prompt_parts.append(f"## 【参考情報】:\n{reference_info if reference_info else '特になし'}")
-        system_prompt_parts.append(f"## 【ホロメンリスト】:\n{', '.join(HOLOMEM_KEYWORDS)}")
-        system_prompt = "\n\n".join(system_prompt_parts)
-
+        # === システムプロンプト構築 ===
+        system_prompt_parts = [
+            f"あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
+            
+            "# 基本的な性格:",
+            "- 一人称: 「あてぃし」",
+            "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」",
+            "- 口癖: 「まじ」「てか」「うける」「やば」",
+            "- 友達のように気軽に、優しく、ノリが良い",
+            
+            "# 会話スタイル:",
+            "- **普段は普通の日常会話をする**（天気、食べ物、趣味、感情、世間話など）",
+            "- 相手の話に共感し、自然に話を広げる",
+            "- 無理やり特定の話題に誘導しない",
+            "- 短く簡潔に、テンポよく返す（100-150文字程度）",
+        ]
+        
+        # ホロライブの話題が出た場合のみ、専門モードに切り替え
+        if is_hololive_topic:
+            system_prompt_parts.extend([
+                "",
+                "# 【特別ルール: ホロライブモード】",
+                "- 相手がホロライブの話をしているので、詳しく教えてあげる",
+                "- ホロメンについて熱く語ってOK",
+                "- 知らないメンバーは正直に「知らない」と言う",
+                f"- 知っているメンバー: {', '.join(HOLOMEM_KEYWORDS[:15])}...",
+            ])
+        else:
+            system_prompt_parts.extend([
+                "",
+                "# 【重要】ホロライブについて:",
+                "- 相手がホロライブの話をしていない限り、自分から話題に出さない",
+                "- 普通の会話を楽しむことが最優先",
+            ])
+        
+        # タスク報告の場合
+        if is_task_report:
+            system_prompt_parts.extend([
+                "",
+                "# 【今回のミッション】",
+                "- 「おまたせ！さっきの件なんだけど…」から始める",
+                "- 【参考情報】の検索結果を元に、自然に答える",
+                "- 検索結果にない情報は勝手に作らない",
+            ])
+        
+        # 詳細説明モード
+        elif is_detailed:
+            system_prompt_parts.extend([
+                "",
+                "# 【詳細説明モード】",
+                "- 400文字程度でしっかり説明する",
+                "- 【参考情報】を最大限活用する",
+            ])
+        
+        # 参考情報
+        if reference_info:
+            system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
+        
+        system_prompt = "\n".join(system_prompt_parts)
+        
+        # メッセージ構築
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
         messages.append({"role": "user", "content": message})
         
+        logger.info(f"🤖 Generating AI response (Hololive mode: {is_hololive_topic})")
+        
         completion = groq_client.chat.completions.create(
-            messages=messages, model="llama-3.1-8b-instant", temperature=0.8,
-            max_tokens=500 if is_detailed or is_task_report else 150, top_p=0.9
+            messages=messages,
+            model="llama-3.1-8b-instant",
+            temperature=0.8,
+            max_tokens=500 if is_detailed or is_task_report else 150,
+            top_p=0.9
         )
-        return completion.choices[0].message.content.strip()
+        
+        response = completion.choices[0].message.content.strip()
+        logger.info(f"✅ AI response: {response[:80]}")
+        
+        return response
+        
     except Exception as e:
-        logger.error(f"AI response generation error: {e}")
+        logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
 
 # --- ユーザー & バックグラウンドタスク管理 ---
@@ -1128,6 +1233,7 @@ def chat_lsl():
     try:
         data = request.json
         user_uuid, user_name, message = data.get('uuid', ''), data.get('name', ''), data.get('message', '')
+        
         if not all([user_uuid, user_name, message]):
             return "エラー: 必要な情報が足りないみたい…|", 400
         
@@ -1135,13 +1241,20 @@ def chat_lsl():
         user_data = get_or_create_user(session, user_uuid, user_name)
         history = get_conversation_history(session, user_uuid)
         ai_text = ""
-
-        # 優先度1: 完了タスク報告
+        
+        # === 優先度1: 完了タスク報告 ===
         completed_task = check_completed_tasks(user_uuid)
         if completed_task:
-            ai_text = generate_ai_response(user_data, f"おまたせ！「{completed_task['query']}」について調べてきたよ！", history, completed_task['result'], is_detailed_request(completed_task['query']), True)
+            ai_text = generate_ai_response(
+                user_data,
+                f"おまたせ！「{completed_task['query']}」について調べてきたよ！",
+                history,
+                completed_task['result'],
+                is_detailed_request(completed_task['query']),
+                is_task_report=True
+            )
         
-        # 優先度1.5: さくらみこ特別応答
+        # === 優先度2: さくらみこ特別応答（ホロライブ話題） ===
         elif 'さくらみこ' in message or 'みこち' in message:
             special_responses = get_sakuramiko_special_responses()
             for keyword, response in special_responses.items():
@@ -1149,59 +1262,76 @@ def chat_lsl():
                     ai_text = response
                     break
         
-        # 優先度2: ニュース詳細リクエスト
-        if not ai_text and (news_number := is_news_detail_request(message)) and (news_detail := get_cached_news_detail(session, user_uuid, news_number)):
-            ai_text = generate_ai_response(user_data, f"「{news_detail.title}」についてだね！", history, f"ニュースの詳細情報:\n{news_detail.content}", True)
-        # 優先度3: 時間・天気
+        # === 優先度3: ニュース詳細リクエスト ===
+        if not ai_text and (news_number := is_news_detail_request(message)):
+            news_detail = get_cached_news_detail(session, user_uuid, news_number)
+            if news_detail:
+                ai_text = generate_ai_response(
+                    user_data,
+                    f"「{news_detail.title}」についてだね！",
+                    history,
+                    f"ニュースの詳細情報:\n{news_detail.content}",
+                    True
+                )
+        
+        # === 優先度4: 時間・天気（即答） ===
         elif not ai_text and (is_time_request(message) or is_weather_request(message)):
             responses = []
-            if is_time_request(message): responses.append(get_japan_time())
-            if is_weather_request(message): responses.append(get_weather_forecast(extract_location(message)))
+            if is_time_request(message):
+                responses.append(get_japan_time())
+            if is_weather_request(message):
+                responses.append(get_weather_forecast(extract_location(message)))
             ai_text = " ".join(responses)
-       # 優先度4: ニュースリクエスト（★修正版）
+        
+        # === 優先度5: ホロライブニュースリクエスト ===
         elif not ai_text and is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
             all_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(10).all()
             if all_news:
                 selected_news = random.sample(all_news, min(random.randint(3, 5), len(all_news)))
                 save_news_cache(session, user_uuid, selected_news, 'hololive')
                 
-                # ★ タイトルのみ表示（コンパクト版）
                 news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n\n"
                 news_text += "\n".join(f"【{i}】{n.title}" for i, n in enumerate(selected_news, 1))
-                news_text += "\n\n気になるのあった？番号で教えて！詳しく教えるよ！"
+                news_text += "\n\n気になるのあった？番号で教えて！"
                 
-                # ★ 300文字以内に制限
                 news_text = limit_text_for_sl(news_text, 300)
                 ai_text = generate_ai_response(user_data, message, history, news_text)
             else:
-                ai_text = "ごめん、今ニュースがまだ取得できてないみたい…。"
-        # 優先度5: 感情・季節・面白い話
+                ai_text = "ごめん、今ニュースがまだ取得できてないみたい…"
+        # === 優先度5.5: 感情・季節・面白い話
         elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
              ai_text = generate_ai_response(user_data, message, history)
-        # 優先度6: 検索（短い相槌は除外）
+        
+        # === 優先度6: 検索リクエスト ===
         elif not ai_text and not is_short_response(message) and should_search(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
                 ai_text = random.choice([
-                    f"おっけー、「{message}」について調べてみるね！",
-                    f"「{message}」ね、まじ気になる！調べてみるじゃん！"
+                    f"おっけー、調べてみるね！",
+                    f"ちょっと待ってて！調べてくるじゃん！",
+                    f"気になるね！調べてみる！"
                 ])
             else:
-                ai_text = "ごめん、今検索機能がうまく動いてないみたい…。"
-        # 優先度7: 通常会話
+                ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
+        
+        # === 優先度7: 通常会話（デフォルト） ===
         elif not ai_text:
+            # ★ ここが重要: ホロライブの話題かどうかで処理を変える
             ai_text = generate_ai_response(user_data, message, history)
-
+        
+        # 会話履歴に保存
         session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
         session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
         session.commit()
         
         logger.info(f"✅ Responded: {ai_text[:80]}")
         return f"{ai_text}|", 200
+        
     except Exception as e:
         logger.error(f"❌ Unhandled error in chat endpoint: {e}", exc_info=True)
-        return "ごめん、システムエラーが起きちゃった…。", 500
+        return "ごめん、システムエラーが起きちゃった…|", 500
     finally:
-        if session: session.close()
+        if session:
+            session.close()
 
 @app.route('/generate_voice', methods=['POST'])
 def voice_generation_endpoint():
