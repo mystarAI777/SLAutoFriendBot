@@ -164,6 +164,76 @@ DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
+# --- Hololive Wiki検索機能の追加 ---
+def search_hololive_wiki(member_name, query_topic):
+    """
+    SeesaawikiのホロライブWikiから情報を検索する。
+    メンバー名と特定のトピックを組み合わせて検索クエリを生成。
+    """
+    base_url = "https://seesaawiki.jp/hololivetv/"
+    search_query = f"{member_name} {query_topic}"
+    encoded_query = quote_plus(search_query.encode('euc-jp')) # SeesaawikiはEUC-JPが多い
+    search_url = f"{base_url}search?query={encoded_query}"
+    
+    try:
+        logger.info(f"🔍 Searching Hololive Wiki for: {search_query} at {search_url}")
+        response = requests.get(
+            search_url,
+            headers={'User-Agent': random.choice(USER_AGENTS)},
+            timeout=15,
+            allow_redirects=True
+        )
+        # Seesaawikiのエンコーディングに合わせてデコードを試みる
+        response.encoding = 'euc-jp'
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 検索結果ページから関連性の高いコンテンツを探す
+        # ページ全体のテキストを取得し、関連部分を抽出するアプローチ
+        
+        # まず、メインコンテンツエリアを特定
+        main_content_div = soup.find('div', id='pagebody') or soup.find('div', class_='contents')
+        if not main_content_div:
+            logger.warning("Hololive Wiki: Could not find main content div.")
+            return None
+
+        # 関連性の高い情報を抽出するためのキーワード検索
+        page_text = clean_text(main_content_div.get_text())
+        
+        # メンバー名とトピックを含む周辺の文章を抽出する
+        # 例: 「さくらみこ」と「マイクラ」で検索した場合、「さくらみこはマイクラで独特の建築をする」のような文章
+        
+        # 簡易的な要約生成
+        # 検索キーワードが含まれる文をいくつか抽出
+        sentences = re.split(r'(。|．|\n)', page_text)
+        relevant_sentences = []
+        for i in range(0, len(sentences), 2):
+            sentence = sentences[i]
+            if member_name in sentence and query_topic in sentence:
+                relevant_sentences.append(sentence.strip())
+            if len(" ".join(relevant_sentences)) > 500: # ある程度の長さに達したら終了
+                break
+
+        if relevant_sentences:
+            extracted_info = " ".join(relevant_sentences)[:1000] # 最大1000文字
+            logger.info(f"✅ Hololive Wiki search successful for '{search_query}'. Extracted: {extracted_info[:100]}")
+            return extracted_info
+        
+        logger.info(f"ℹ️ Hololive Wiki search for '{search_query}' found no direct relevant sentences. Attempting general summary.")
+        # 関連文章が見つからなければ、ページの最初の部分を要約として返す
+        return page_text[:500] if page_text else None
+        
+    except requests.exceptions.Timeout:
+        logger.warning(f"⚠️ Hololive Wiki search timeout for {search_query}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"⚠️ Hololive Wiki search request error for {search_query}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Hololive Wiki search general error for {search_query}: {e}", exc_info=True)
+        return None
+
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- 初期化処理 ---
@@ -223,6 +293,7 @@ class SpecializedNews(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     news_hash = Column(String(100), unique=True)
 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 class HolomemWiki(Base):
     __tablename__ = 'holomem_wiki'
     id = Column(Integer, primary_key=True)
@@ -231,7 +302,12 @@ class HolomemWiki(Base):
     debut_date = Column(String(100))
     generation = Column(String(100))
     tags = Column(Text)
+    # 卒業情報を格納するカラムを追加
+    graduation_date = Column(String(100), nullable=True)
+    graduation_reason = Column(Text, nullable=True)
+    mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow)
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 class FriendRegistration(Base):
     __tablename__ = 'friend_registrations'
@@ -361,10 +437,14 @@ def detect_specialized_topic(message):
 def is_detailed_request(message):
     return any(keyword in message for keyword in ['詳しく', '詳細', 'くわしく', '教えて', '説明して', '解説して', 'どういう', 'なぜ', 'どうして', '理由', '原因', '具体的に'])
 
+def is_explicit_search_request(message):
+    """「調べて」「検索して」など、明確な検索意図のキーワードを検出する"""
+    return any(keyword in message for keyword in ['調べて', '検索して', '探して', 'WEB検索', 'ググって'])
+
 def should_search(message):
-    """検索が必要かを判定（短い相槌は除外）"""
-    # ★ 最優先: 短い相槌は検索しない
-    if is_short_response(message):
+    """検索が必要かを判定（短い相槌や明示的な検索指示は除外）"""
+    # ★ 最優先: 短い相槌や明示的な検索はここでは判定しない
+    if is_short_response(message) or is_explicit_search_request(message):
         return False
     
     # 専門トピック検出
@@ -372,8 +452,15 @@ def should_search(message):
         return True
     
     # ホロライブ関連（ニュース以外）
-    if is_hololive_request(message) and not any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
-        return True
+    # ホロメンの名前と具体的な質問が含まれている場合は検索対象
+    for member_name in HOLOMEM_KEYWORDS:
+        if member_name in message:
+            # 「ニュース」「最新」などのキーワードがないことを確認
+            if not any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
+                # メンバー名以外の具体的な質問があるか簡易的に判定
+                # 例：「さくらみこのマイクラは？」のような質問
+                if len(message.replace(member_name, '').strip()) > 5: # メンバー名以外の部分が5文字以上なら具体的とみなす
+                     return True
     
     # おすすめリクエスト
     if is_recommendation_request(message):
@@ -382,7 +469,6 @@ def should_search(message):
     # 明確な検索パターン
     search_patterns = [
         r'(?:とは|について|教えて|説明して|解説して)',
-        r'(?:調べて|検索して|探して)',
         r'(?:誰ですか|何ですか|どこですか|いつですか|なぜですか|どうして)'
     ]
     if any(re.search(pattern, message) for pattern in search_patterns):
@@ -701,6 +787,57 @@ def initialize_holomem_wiki():
             'debut_date': '2018年3月22日',
             'generation': '0期生',
             'tags': json.dumps(['歌', 'アイドル', 'テトリス', '音楽'], ensure_ascii=False)
+        },
+        # --- 卒業生 ---
+        {
+            'member_name': '夜空メル',
+            'description': 'ホロライブ1期生。ヴァンパイアの女の子で、アセロラジュースが大好き。初期からホロライブを支えてきたメンバーの一人。',
+            'debut_date': '2018年5月13日',
+            'generation': '1期生',
+            'tags': json.dumps(['ヴァンパイア', '癒し声', '1期生', '卒業生'], ensure_ascii=False),
+            'graduation_date': '2024年1月16日',
+            'graduation_reason': '機密情報の漏洩など契約違反行為が認められたため、契約解除となりました。',
+            'mochiko_feeling': 'メル先輩、初期からのホロライブを支えてくれてありがと。突然で…言葉が出ないよ…'
+        },
+        {
+            'member_name': '潤羽るしあ',
+            'description': 'ホロライブ3期生。魔界学校に通うネクロマンサーの女の子。感情豊かな配信で多くのファンを魅了した。',
+            'debut_date': '2019年7月18日',
+            'generation': '3期生',
+            'tags': json.dumps(['ネクロマンサー', '感情豊か', '3期生', '卒業生'], ensure_ascii=False),
+            'graduation_date': '2022年2月24日',
+            'graduation_reason': '情報漏洩などの契約違反行為や信用失墜行為が認められたため、契約解除となりました。',
+            'mochiko_feeling': 'るしあちゃんのこと、今でも信じられないよ…また3期生のみんなでわちゃわちゃしてほしかったな…'
+        },
+        {
+            'member_name': '桐生ココ',
+            'description': 'ホロライブ4期生。人間の文化に興味を持つ子供のドラゴン。「おはようございまーす！」の挨拶が象徴的で、日本語と英語を駆使した配信で海外ファンを爆発的に増やした立役者。',
+            'debut_date': '2019年12月28日',
+            'generation': '4期生',
+            'tags': json.dumps(['ドラゴン', 'バイリンガル', '伝説', '会長', '卒業生'], ensure_ascii=False),
+            'graduation_date': '2021年7月1日',
+            'graduation_reason': '本人の意向を尊重する形で卒業。明確な理由は公表されていませんが、様々な憶測を呼んでいます。',
+            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよね！'
+        },
+        {
+            'member_name': '魔乃アロエ',
+            'description': 'ホロライブ5期生。魔界でウワサの生意気なサキュバスの子供。デビュー直後から大きな注目を集めた。',
+            'debut_date': '2020年8月15日',
+            'generation': '5期生',
+            'tags': json.dumps(['サキュバス', '5期生', '幻', '卒業生'], ensure_ascii=False),
+            'graduation_date': '2020年8月31日',
+            'graduation_reason': 'デビュー直後の情報漏洩トラブルとそれに伴う精神的な不調により、本人の申し出で卒業となりました。',
+            'mochiko_feeling': 'アロエちゃん、一瞬だったけどキラキラしてた…もっと一緒に活動したかったな、まじで…'
+        },
+        {
+            'member_name': '九十九佐命',
+            'description': 'ホロライブEnglish -Council-所属。「空間」の概念の代弁者。おっとりとした性格と優しい声で多くのファンを癒した。',
+            'debut_date': '2021年8月23日',
+            'generation': 'English -Council-',
+            'tags': json.dumps(['宇宙', '癒し', 'EN', '卒業生'], ensure_ascii=False),
+            'graduation_date': '2022年7月31日',
+            'graduation_reason': '長期的な活動が困難になったためと発表されており、特に腰の持病が影響したと言われています。',
+            'mochiko_feeling': 'サナちゃん、宇宙みたいに心が広くて大好きだったよ。ゆっくり休んで、元気でいてほしいな…'
         }
     ]
     
@@ -726,15 +863,32 @@ def get_sakuramiko_special_responses():
         'GTA': 'みこちのGTA配信、カオスで最高!警察に追われたり、変なことしたり、見てて飽きないんだよね〜'
     }
 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 def get_holomem_info(member_name):
+    """ホロメンの情報をDBから取得する"""
     session = Session()
     try:
         wiki = session.query(HolomemWiki).filter_by(member_name=member_name).first()
         if wiki:
-            return {'name': wiki.member_name, 'description': wiki.description, 'debut_date': wiki.debut_date, 'generation': wiki.generation, 'tags': json.loads(wiki.tags) if wiki.tags else []}
+            # データベースの全ての情報を辞書として返す
+            info = {
+                'name': wiki.member_name, 
+                'description': wiki.description, 
+                'debut_date': wiki.debut_date, 
+                'generation': wiki.generation, 
+                'tags': json.loads(wiki.tags) if wiki.tags else [],
+                'graduation_date': wiki.graduation_date,
+                'graduation_reason': wiki.graduation_reason,
+                'mochiko_feeling': wiki.mochiko_feeling
+            }
+            return info
+        return None
+    except Exception as e:
+        logger.error(f"Error getting holomem info for {member_name}: {e}")
         return None
     finally:
         session.close()
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 def register_friend(user_uuid, friend_uuid, friend_name, relationship_note=""):
     session = Session()
@@ -901,14 +1055,14 @@ def generate_fallback_response(message, reference_info=""):
     greetings = {
         'こんにちは': ['やっほー！', 'こんにちは〜！元気？'],
         'おはよう': ['おはよ〜！今日もいい天気だね！', 'おっはよ〜！'],
-        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！'],
+        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！', 'こんもち～'],
         'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
         'おやすみ': ['おやすみ〜！また明日ね！', 'いい夢見てね〜！'],
         '疲れた': ['お疲れさま！ゆっくり休んでね！', '無理しないでね！'],
         '暇': ['暇なんだ〜！何か話そっか？', 'じゃあホロライブの話する？'],
         '元気': ['元気だよ〜！あなたは？', 'まじ元気！ありがと！'],
-        '好き': ['うける！ありがと〜！', 'まじで？嬉しいじゃん！'],
-        'かわいい': ['ありがと！照れるじゃん！', 'まじで？うれしー！'],
+        '好き': ['うける！ありがと〜！', 'まじで？惚れてまうやろ！'],
+        'かわいい': ['ありがと！照れるじゃん！', 'まじで？うれしー！', '当然じゃん！'],
         'すごい': ['うける！', 'でしょ？まじうれしい！'],
     }
     
@@ -948,6 +1102,7 @@ def generate_fallback_response(message, reference_info=""):
         "わかるわかる！",
     ])
 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
     """AI応答生成（自然な会話モード）"""
     if not groq_client:
@@ -955,70 +1110,46 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         return generate_fallback_response(message, reference_info)
     
     try:
-        # ホロライブの話題かどうかを判定
         is_hololive_topic = is_hololive_request(message)
         
-        # === システムプロンプト構築 ===
         system_prompt_parts = [
             f"あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
-            
             "# 基本的な性格:",
-            "- 一人称: 「あてぃし」",
-            "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」",
-            "- 口癖: 「まじ」「てか」「うける」「やば」",
+            "- 一人称: 「あてぃし」", "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」", "- 口癖: 「まじ」「てか」「うける」「やば」",
             "- 友達のように気軽に、優しく、ノリが良い",
-            
             "# 会話スタイル:",
-            "- **普段は普通の日常会話をする**（天気、食べ物、趣味、感情、世間話など）",
-            "- 相手の話に共感し、自然に話を広げる",
-            "- 無理やり特定の話題に誘導しない",
-            "- 短く簡潔に、テンポよく返す（100-150文字程度）",
+            "- 相手の話に共感し、自然に話を広げる", "- 無理やり特定の話題に誘導しない", "- 短く簡潔に、テンポよく返す（100-150文字程度）",
         ]
         
-        # ホロライブの話題が出た場合のみ、専門モードに切り替え
         if is_hololive_topic:
             system_prompt_parts.extend([
-                "",
-                "# 【特別ルール: ホロライブモード】",
-                "- 相手がホロライブの話をしているので、詳しく教えてあげる",
-                "- ホロメンについて熱く語ってOK",
-                "- 知らないメンバーは正直に「知らない」と言う",
-                f"- 知っているメンバー: {', '.join(HOLOMEM_KEYWORDS[:15])}...",
+                "", "# 【特別ルール: ホロライブモード】",
+                "- 相手がホロライブの話をしているので、詳しく教えてあげる", "- ホロメンについて熱く語ってOK",
             ])
         else:
             system_prompt_parts.extend([
-                "",
-                "# 【重要】ホロライブについて:",
-                "- 相手がホロライブの話をしていない限り、自分から話題に出さない",
-                "- 普通の会話を楽しむことが最優先",
+                "", "# 【重要】ホロライブについて:",
+                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
+                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
             ])
         
-        # タスク報告の場合
         if is_task_report:
             system_prompt_parts.extend([
-                "",
-                "# 【今回のミッション】",
-                "- 「おまたせ！さっきの件なんだけど…」から始める",
-                "- 【参考情報】の検索結果を元に、自然に答える",
-                "- 検索結果にない情報は勝手に作らない",
+                "", "# 【今回のミッション】",
+                "- **最優先:** まずは「おまたせ！〇〇の件だけど…」のように、以前の検索結果を報告する。",
+                "- **重要:** 【参考情報】の内容を**元にして、要約して**分かりやすく伝える。",
+                "- **禁止事項:** 【参考情報】に書かれていない情報を**絶対に追加しない**こと。",
+                "- その後、ユーザーの現在の発言にも自然に答えること。",
             ])
         
-        # 詳細説明モード
-        elif is_detailed:
-            system_prompt_parts.extend([
-                "",
-                "# 【詳細説明モード】",
-                "- 400文字程度でしっかり説明する",
-                "- 【参考情報】を最大限活用する",
-            ])
+        if is_detailed:
+            system_prompt_parts.extend(["", "# 【詳細説明モード】", "- 400文字程度でしっかり説明する", "- 【参考情報】を最大限活用する"])
         
-        # 参考情報
         if reference_info:
             system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
         
         system_prompt = "\n".join(system_prompt_parts)
         
-        # メッセージ構築
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
         messages.append({"role": "user", "content": message})
@@ -1028,7 +1159,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         completion = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            temperature=0.8,
+            temperature=0.7,  # 正確性を上げるために数値を下げる (旧: 0.8)
             max_tokens=500 if is_detailed or is_task_report else 150,
             top_p=0.9
         )
@@ -1041,6 +1172,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     except Exception as e:
         logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- ユーザー & バックグラウンドタスク管理 ---
 def get_or_create_user(session, uuid, name):
@@ -1076,7 +1208,36 @@ def background_deep_search(task_id, query, is_detailed):
     search_result = None
     specialized_topic = detect_specialized_topic(query)
     
-    if specialized_topic:
+    # ホロメンの特定の話題に関する質問をまず処理
+    holomem_matched = None
+    query_topic = ""
+    for member_name in HOLOMEM_KEYWORDS:
+        if member_name in query:
+            holomem_matched = member_name
+            # メンバー名以外の部分をトピックとして抽出
+            query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
+            if not query_topic: # メンバー名だけの場合
+                query_topic = "概要" 
+            break
+
+    if holomem_matched:
+        logger.info(f"▶️ Holomem specific query detected: {holomem_matched}, topic: {query_topic}")
+        # まずDBのHolomemWikiを検索
+        wiki_info = get_holomem_info(holomem_matched)
+        if wiki_info and query_topic == "概要":
+            search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
+        elif wiki_info and query_topic in wiki_info['description']:
+             search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
+        else:
+            # DBになければSeesaawikiを検索
+            wiki_search_result = search_hololive_wiki(holomem_matched, query_topic)
+            if wiki_search_result:
+                search_result = f"Seesaawikiからの情報:\n{wiki_search_result}"
+            else:
+                # 最終手段として通常のWeb検索
+                search_result = deep_web_search(f"ホロライブ {holomem_matched} {query_topic}", is_detailed)
+
+    elif specialized_topic:
         # 「セカンドライフ」に関する質問は、DBを見ずに直接Web検索する
         if specialized_topic == 'セカンドライフ':
             logger.info(f"▶️ Performing on-demand web search for 'セカンドライフ': {query}")
@@ -1090,12 +1251,10 @@ def background_deep_search(task_id, query, is_detailed):
             else:
                 search_result = deep_web_search(f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}", is_detailed)
 
-    elif is_hololive_request(query):
-        keywords = [kw for kw in HOLOMEM_KEYWORDS if kw in query]
-        if keywords:
-            news_items = session.query(HololiveNews).filter(HololiveNews.title.contains(keywords[0]) | HololiveNews.content.contains(keywords[0])).limit(3).all()
-            if news_items:
-                search_result = "データベースからの情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
+    elif is_hololive_request(query): # ホロライブ全般のニュースリクエストなど
+        news_items = session.query(HololiveNews).filter(HololiveNews.title.contains(query) | HololiveNews.content.contains(query)).limit(3).all()
+        if news_items:
+            search_result = "データベースからの情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
         if not search_result:
             search_result = deep_web_search(f"ホロライブ {query}", is_detailed)
     else:
@@ -1226,7 +1385,8 @@ def health_check():
     
     logger.info(f"Health check: {health_data}")
     return jsonify(health_data), 200
-    
+
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     session = Session()
@@ -1242,20 +1402,35 @@ def chat_lsl():
         history = get_conversation_history(session, user_uuid)
         ai_text = ""
         
-        # === 優先度1: 完了タスク報告 ===
+        # === 優先度1: 完了タスク報告 & ユーザーの現在の発言への応答 ===
         completed_task = check_completed_tasks(user_uuid)
         if completed_task:
-            ai_text = generate_ai_response(
-                user_data,
-                f"おまたせ！「{completed_task['query']}」について調べてきたよ！",
-                history,
-                completed_task['result'],
-                is_detailed_request(completed_task['query']),
-                is_task_report=True
+            prompt_for_ai = (
+                f"（システム指示：まず、以前リクエストされた「{completed_task['query']}」の検索結果を報告してください。"
+                f"その後、ユーザーの現在の発言「{message}」に自然につなげて応答してください。）"
             )
+            ai_text = generate_ai_response(
+                user_data, prompt_for_ai, history, completed_task['result'],
+                is_detailed=True, is_task_report=True
+            )
+
+        # === 優先度1.5: ホロメン・ホロライブ基本情報の即答 ===
+        basic_question_match = re.search(f"({'|'.join(HOLOMEM_KEYWORDS)})って(?:誰|だれ|何|なに)[\?？]?$", message.strip())
+        if not ai_text and basic_question_match:
+            member_name = basic_question_match.group(1)
+            
+            if member_name in ['ホロライブ', 'hololive', 'ホロメン']:
+                ai_text = "ホロライブは、カバー株式会社が運営してるVTuber事務所のことだよ！ときのそらちゃんとか、たくさんの人気VTuberが所属してて、配信とかまじで楽しいからおすすめ！"
+            else:
+                wiki_info = get_holomem_info(member_name)
+                if wiki_info:
+                    response_parts = [f"{wiki_info['name']}ちゃんはね、ホロライブ{wiki_info['generation']}のVTuberだよ！ {wiki_info['description']}"]
+                    if wiki_info.get('graduation_date'):
+                        response_parts.append(f"でもね、{wiki_info['graduation_date']}に卒業しちゃったんだ…。{wiki_info.get('mochiko_feeling', 'まじ寂しいよね…。')}")
+                    ai_text = " ".join(response_parts)
         
-        # === 優先度2: さくらみこ特別応答（ホロライブ話題） ===
-        elif 'さくらみこ' in message or 'みこち' in message:
+        # === 優先度2: さくらみこ特別応答 ===
+        elif not ai_text and ('さくらみこ' in message or 'みこち' in message):
             special_responses = get_sakuramiko_special_responses()
             for keyword, response in special_responses.items():
                 if keyword in message:
@@ -1266,21 +1441,13 @@ def chat_lsl():
         if not ai_text and (news_number := is_news_detail_request(message)):
             news_detail = get_cached_news_detail(session, user_uuid, news_number)
             if news_detail:
-                ai_text = generate_ai_response(
-                    user_data,
-                    f"「{news_detail.title}」についてだね！",
-                    history,
-                    f"ニュースの詳細情報:\n{news_detail.content}",
-                    True
-                )
+                ai_text = generate_ai_response(user_data, f"「{news_detail.title}」についてだね！", history, f"ニュースの詳細情報:\n{news_detail.content}", True)
         
         # === 優先度4: 時間・天気（即答） ===
         elif not ai_text and (is_time_request(message) or is_weather_request(message)):
             responses = []
-            if is_time_request(message):
-                responses.append(get_japan_time())
-            if is_weather_request(message):
-                responses.append(get_weather_forecast(extract_location(message)))
+            if is_time_request(message): responses.append(get_japan_time())
+            if is_weather_request(message): responses.append(get_weather_forecast(extract_location(message)))
             ai_text = " ".join(responses)
         
         # === 優先度5: ホロライブニュースリクエスト ===
@@ -1290,35 +1457,40 @@ def chat_lsl():
                 selected_news = random.sample(all_news, min(random.randint(3, 5), len(all_news)))
                 save_news_cache(session, user_uuid, selected_news, 'hololive')
                 
-                news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n\n"
-                news_text += "\n".join(f"【{i}】{n.title}" for i, n in enumerate(selected_news, 1))
-                news_text += "\n\n気になるのあった？番号で教えて！"
-                
-                news_text = limit_text_for_sl(news_text, 300)
-                ai_text = generate_ai_response(user_data, message, history, news_text)
+                news_items_text = []
+                for i, n in enumerate(selected_news, 1):
+                    # タイトルを50文字に制限
+                    short_title = n.title[:50] + "..." if len(n.title) > 50 else n.title
+                    news_items_text.append(f"【{i}】{short_title}")
+
+                news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n" + "\n".join(news_items_text) + "\n\n気になるのあった？番号で教えて！"
+                # 全体を250文字に制限
+                ai_text = limit_text_for_sl(news_text, 250)
             else:
                 ai_text = "ごめん、今ニュースがまだ取得できてないみたい…"
-        # === 優先度5.5: 感情・季節・面白い話
+        
+        # === 優先度5.1: 明示的な検索リクエスト ===
+        elif not ai_text and is_explicit_search_request(message):
+            if start_background_search(user_uuid, message, is_detailed_request(message)):
+                ai_text = random.choice([f"おっけー、「{message}」について調べてみるね！", f"りょ！「{message}」ね！ちょっと待ってて、調べてくるじゃん！"])
+            else:
+                ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
+
+        # === 優先度5.5: 感情・季節・面白い話 ===
         elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
              ai_text = generate_ai_response(user_data, message, history)
         
-        # === 優先度6: 検索リクエスト ===
+        # === 優先度6: (暗黙的な)検索リクエスト ===
         elif not ai_text and not is_short_response(message) and should_search(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
-                ai_text = random.choice([
-                    f"おっけー、調べてみるね！",
-                    f"ちょっと待ってて！調べてくるじゃん！",
-                    f"気になるね！調べてみる！"
-                ])
+                ai_text = random.choice(["おっけー、調べてみるね！", "ちょっと待ってて！調べてくるじゃん！", "気になるね！調べてみる！"])
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
         
         # === 優先度7: 通常会話（デフォルト） ===
         elif not ai_text:
-            # ★ ここが重要: ホロライブの話題かどうかで処理を変える
             ai_text = generate_ai_response(user_data, message, history)
         
-        # 会話履歴に保存
         session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
         session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
         session.commit()
@@ -1332,6 +1504,7 @@ def chat_lsl():
     finally:
         if session:
             session.close()
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 @app.route('/generate_voice', methods=['POST'])
 def voice_generation_endpoint():
@@ -1664,7 +1837,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# --- メイン実行 ---
 # --- メイン実行 ---
 try:
     initialize_app()
