@@ -1450,6 +1450,22 @@ def generate_fallback_response(message, reference_info=""):
 # ===== 【修正】generate_ai_response 関数 =====
 # 心理分析結果を考慮した応答生成
 
+# ===== 【修正1】get_or_create_user 関数 =====
+def get_or_create_user(session, uuid, name):
+    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
+    if user:
+        user.interaction_count += 1
+        user.last_interaction = datetime.utcnow()
+        if user.user_name != name: user.user_name = name
+    else:
+        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
+    session.add(user)
+    session.commit()
+    # ★ 修正: uuidを含める
+    return {'name': user.user_name, 'uuid': uuid}
+
+
+# ===== 【修正2】generate_ai_response 関数（完全版） =====
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
     """AI応答生成（心理プロファイル対応版）"""
     if not groq_client:
@@ -1471,6 +1487,10 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
             "- 一人称: 「あてぃし」", "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」",
             "- 口癖: 「まじ」「てか」「うける」「やば」",
             "- 友達のように気軽に、優しく、ノリが良い",
+            "# 会話スタイル:",
+            "- 相手の話に共感し、自然に話を広げる", 
+            "- 無理やり特定の話題に誘導しない", 
+            "- 短く簡潔に、テンポよく返す（100-150文字程度）",
         ]
         
         # Step 2: 心理プロファイルを考慮したプロンプト調整
@@ -1486,10 +1506,52 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
                 "   （例: 外向的な人には元気に、内向的な人には優しく）"
             ])
         
-        # 既存のプロンプトロジック（省略 - 前回のコードと同じ）
-        # ...
+        # Step 3: ホロライブモード判定
+        if is_hololive_topic:
+            system_prompt_parts.extend([
+                "", "# 【特別ルール: ホロライブモード】",
+                "- 相手がホロライブの話をしているので、詳しく教えてあげる", 
+                "- ホロメンについて熱く語ってOK",
+            ])
+        else:
+            system_prompt_parts.extend([
+                "", "# 【重要】ホロライブについて:",
+                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
+                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
+            ])
         
-        # Step 3: AI応答生成
+        # Step 4: タスク報告モード
+        if is_task_report:
+            system_prompt_parts.extend([
+                "", "# 【今回のミッション】",
+                "- **最優先:** まずは「おまたせ！〇〇の件だけど…」のように、以前の検索結果を報告する。",
+                "- **重要:** 【参考情報】の内容を**元にして、要約して**分かりやすく伝える。",
+                "- **禁止事項:** 【参考情報】に書かれていない情報を**絶対に追加しない**こと。",
+                "- その後、ユーザーの現在の発言にも自然に答えること。",
+            ])
+        
+        # Step 5: 詳細説明モード
+        if is_detailed:
+            system_prompt_parts.extend([
+                "", "# 【詳細説明モード】", 
+                "- 400文字程度でしっかり説明する", 
+                "- 【参考情報】を最大限活用する"
+            ])
+        
+        # Step 6: 参考情報の追加
+        if reference_info:
+            system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
+        
+        system_prompt = "\n".join(system_prompt_parts)
+        
+        # ★ 修正: messages を正しく構築
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
+        messages.append({"role": "user", "content": message})
+        
+        logger.info(f"🤖 Generating AI response (Hololive mode: {is_hololive_topic})")
+        
+        # Step 7: AI応答生成
         completion = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
@@ -1507,9 +1569,11 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
 
+
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- ユーザー & バックグラウンドタスク管理 ---
+# ===== 【修正1】get_or_create_user 関数 =====
 def get_or_create_user(session, uuid, name):
     user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
     if user:
@@ -1520,7 +1584,9 @@ def get_or_create_user(session, uuid, name):
         user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
     session.add(user)
     session.commit()
-    return {'name': user.user_name}
+    # ★ 修正: uuidを含める
+    return {'name': user.user_name, 'uuid': uuid}
+
 
 def get_conversation_history(session, uuid):
     return session.query(ConversationHistory).filter_by(user_uuid=uuid).order_by(ConversationHistory.timestamp.desc()).limit(4).all()
@@ -1748,8 +1814,92 @@ def health_check():
     
     logger.info(f"Health check: {health_data}")
     return jsonify(health_data), 200
+# ===== 【追加】check_task エンドポイント =====
+@app.route('/check_task', methods=['POST'])
+def check_task():
+    """
+    バックグラウンドタスクの完了チェック（LSLから定期的に呼ばれる）
+    """
+    try:
+        data = request.json
+        if not data:
+            logger.error("❌ check_task: Empty request body")
+            return jsonify({'status': 'error', 'message': 'リクエストボディが空です'}), 400
+        
+        user_uuid = data.get('uuid', '')
+        
+        if not user_uuid:
+            logger.error("❌ check_task: UUID missing")
+            return jsonify({'status': 'error', 'message': 'UUID required'}), 400
+        
+        logger.info(f"🔍 Checking tasks for user: {user_uuid}")
+        
+        # 完了タスクを確認
+        completed_task = check_completed_tasks(user_uuid)
+        
+        if completed_task:
+            logger.info(f"✅ Task completed for {user_uuid}: {completed_task['query']}")
+            
+            # AIによる報告メッセージ生成
+            session = Session()
+            try:
+                user_data = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+                if not user_data:
+                    user_name = "あなた"
+                    user_uuid_for_response = user_uuid
+                else:
+                    user_name = user_data.user_name
+                    user_uuid_for_response = user_data.user_uuid
+                
+                # 履歴を取得
+                history = get_conversation_history(session, user_uuid)
+                
+                # 報告メッセージを生成
+                report_message = generate_ai_response(
+                    {'name': user_name, 'uuid': user_uuid_for_response},
+                    f"（検索完了報告）以前リクエストされた「{completed_task['query']}」の結果を報告してください。",
+                    history,
+                    completed_task['result'],
+                    is_detailed=True,
+                    is_task_report=True
+                )
+                
+                # 会話履歴に保存
+                session.add(ConversationHistory(
+                    user_uuid=user_uuid,
+                    role='assistant',
+                    content=report_message
+                ))
+                session.commit()
+                
+                return jsonify({
+                    'status': 'completed',
+                    'query': completed_task['query'],
+                    'message': report_message
+                }), 200
+                
+            except Exception as e:
+                logger.error(f"❌ Report generation error: {e}", exc_info=True)
+                session.rollback()
+                return jsonify({
+                    'status': 'completed',
+                    'query': completed_task['query'],
+                    'message': f"検索結果が見つかったんだけど、報告の生成でエラーが出ちゃった…！\n\n{completed_task['result'][:200]}"
+                }), 200
+            finally:
+                session.close()
+        
+        # タスクがまだ完了していない場合
+        logger.info(f"⏳ Task pending for {user_uuid}")
+        return jsonify({'status': 'pending'}), 200
+        
+    except Exception as e:
+        logger.error(f"❌ check_task critical error: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': 'サーバーエラー'}), 500
+
 
 # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# ===== 【修正3】chat_lsl エンドポイント（完了タスク報告削除版） =====
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     session = Session()
@@ -1765,19 +1915,9 @@ def chat_lsl():
         history = get_conversation_history(session, user_uuid)
         ai_text = ""
         
-        # === 優先度1: 完了タスク報告 & ユーザーの現在の発言への応答 ===
-        completed_task = check_completed_tasks(user_uuid)
-        if completed_task:
-            prompt_for_ai = (
-                f"（システム指示：まず、以前リクエストされた「{completed_task['query']}」の検索結果を報告してください。"
-                f"その後、ユーザーの現在の発言「{message}」に自然につなげて応答してください。）"
-            )
-            ai_text = generate_ai_response(
-                user_data, prompt_for_ai, history, completed_task['result'],
-                is_detailed=True, is_task_report=True
-            )
-
-        # === 優先度1.5: ホロメン・ホロライブ基本情報の即答 ===
+        # ===【削除】完了タスク報告処理（check_taskで処理するため） ===
+        
+        # === 優先度1: ホロメン・ホロライブ基本情報の即答 ===
         basic_question_match = re.search(f"({'|'.join(HOLOMEM_KEYWORDS)})って(?:誰|だれ|何|なに)[\?？]?$", message.strip())
         if not ai_text and basic_question_match:
             member_name = basic_question_match.group(1)
@@ -1822,38 +1962,37 @@ def chat_lsl():
                 
                 news_items_text = []
                 for i, n in enumerate(selected_news, 1):
-                    # タイトルを50文字に制限
                     short_title = n.title[:50] + "..." if len(n.title) > 50 else n.title
                     news_items_text.append(f"【{i}】{short_title}")
 
                 news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n" + "\n".join(news_items_text) + "\n\n気になるのあった？番号で教えて！"
-                # 全体を250文字に制限
                 ai_text = limit_text_for_sl(news_text, 250)
             else:
                 ai_text = "ごめん、今ニュースがまだ取得できてないみたい…"
         
-        # === 優先度5.1: 明示的な検索リクエスト ===
+        # === 優先度6: 明示的な検索リクエスト ===
         elif not ai_text and is_explicit_search_request(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
-                ai_text = random.choice([f"おっけー、「{message}」について調べてみるね！", f"りょ！「{message}」ね！ちょっと待ってて、調べてくるじゃん！"])
+                ai_text = "おっけー、調べてみるね！ちょっと待ってて！"
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
 
-        # === 優先度5.5: 感情・季節・面白い話 ===
+        # === 優先度7: 感情・季節・面白い話 ===
         elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
              ai_text = generate_ai_response(user_data, message, history)
         
-        # === 優先度6: (暗黙的な)検索リクエスト ===
+        # === 優先度8: (暗黙的な)検索リクエスト ===
         elif not ai_text and not is_short_response(message) and should_search(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
-                ai_text = random.choice(["おっけー、調べてみるね！", "ちょっと待ってて！調べてくるじゃん！", "気になるね！調べてみる！"])
+                ai_text = "おっけー、調べてみるね！結果が出るまでちょっと待ってて！"
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
         
-        # === 優先度7: 通常会話（デフォルト） ===
+        # === 優先度9: 通常会話（デフォルト） ===
         elif not ai_text:
             ai_text = generate_ai_response(user_data, message, history)
         
+        # 会話履歴に保存
         session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
         session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
         session.commit()
