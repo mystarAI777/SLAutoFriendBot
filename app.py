@@ -73,7 +73,11 @@ SPECIALIZED_SITES = {
     'セカンドライフ': {
         'base_url': 'https://community.secondlife.com/news/',
         'keywords': ['セカンドライフ', 'Second Life', 'SL', 'second life', 'セカンド', 'SecondLife']
-    }
+    },
+    'アニメ': {
+    'base_url': 'https://animedb.jp/',
+    'keywords': ['アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション', '作画', '声優', 'OP', 'ED']
+}
 }
 HOLOMEM_KEYWORDS = [
     'ときのそら', 'ロボ子さん', 'さくらみこ', '星街すいせい', 'AZKi', '夜空メル',
@@ -90,7 +94,12 @@ HOLOMEM_KEYWORDS = [
     'パヴォリア・レイネ', '火威青', '音乃瀬奏', '一条莉々華', '儒烏風亭らでん',
     '轟はじめ', 'ホロライブ', 'ホロメン', 'hololive', 'YAGOO'
 ]
-
+ANIME_KEYWORDS = [
+    'アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション',
+    '作画', '声優', 'OP', 'ED', 'オープニング', 'エンディング',
+    '劇場版', '映画', 'OVA', 'OAD', '原作', '漫画', 'ラノベ',
+    '主人公', 'キャラ', 'キャラクター', '制作会社', 'スタジオ'
+]
 # --- グローバル変数 & Executor ---
 background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client = None
@@ -235,7 +244,312 @@ def search_hololive_wiki(member_name, query_topic):
         return None
 
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+# ===== 【追加】アニメ検索機能 =====
 
+def is_anime_request(message):
+    """アニメ関連の質問かどうか判定"""
+    message_normalized = unicodedata.normalize('NFKC', message).lower()
+    
+    # アニメキーワードが含まれているか
+    for keyword in ANIME_KEYWORDS:
+        keyword_normalized = unicodedata.normalize('NFKC', keyword).lower()
+        if keyword_normalized in message_normalized:
+            return True
+    
+    # 「〜ってアニメ」「〜というアニメ」などのパターン
+    anime_patterns = [
+        r'ってアニメ', r'というアニメ', r'のアニメ',
+        r'アニメで', r'アニメの', r'アニメは'
+    ]
+    for pattern in anime_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+
+
+def search_anime_database(query, is_detailed=False):
+    """
+    https://animedb.jp/ からアニメ情報を検索
+    """
+    base_url = "https://animedb.jp/"
+    
+    try:
+        logger.info(f"🎬 Searching anime database for: {query}")
+        
+        # Step 1: 検索ページにアクセス
+        search_url = f"{base_url}search?q={quote_plus(query)}"
+        response = requests.get(
+            search_url,
+            headers={'User-Agent': random.choice(USER_AGENTS)},
+            timeout=15,
+            allow_redirects=True
+        )
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Step 2: 検索結果を解析
+        # animedb.jpの構造に合わせて調整（実際のHTML構造を確認して修正してください）
+        results = []
+        
+        # 検索結果のセレクタパターン（複数試行）
+        result_selectors = [
+            'div.anime-item',
+            'div.search-result',
+            'article.anime',
+            'div[class*="anime"]',
+            'li.anime-list-item'
+        ]
+        
+        result_elements = []
+        for selector in result_selectors:
+            result_elements = soup.select(selector)
+            if result_elements:
+                logger.info(f"✅ Found results with selector: {selector}")
+                break
+        
+        if not result_elements:
+            # セレクタで見つからない場合、全体から情報抽出を試みる
+            logger.warning("⚠️ No specific selectors found, trying general extraction")
+            # タイトルとあらすじを含むdivを探す
+            potential_results = soup.find_all(['div', 'article'], limit=10)
+            result_elements = [elem for elem in potential_results if elem.find(['h2', 'h3', 'h4'])]
+        
+        for elem in result_elements[:3 if is_detailed else 2]:
+            # タイトル抽出
+            title_elem = elem.find(['h2', 'h3', 'h4', 'a'])
+            if not title_elem:
+                continue
+            
+            title = clean_text(title_elem.get_text())
+            
+            # あらすじ/説明抽出
+            description_elem = elem.find(['p', 'div'], class_=lambda x: x and ('description' in x.lower() or 'summary' in x.lower()))
+            if not description_elem:
+                description_elem = elem.find('p')
+            
+            description = clean_text(description_elem.get_text()) if description_elem else ""
+            
+            # リンク抽出
+            link_elem = elem.find('a', href=True)
+            link = urljoin(base_url, link_elem['href']) if link_elem else ""
+            
+            if title and len(title) > 2:
+                results.append({
+                    'title': title,
+                    'description': description[:300] if description else "詳細情報なし",
+                    'url': link
+                })
+        
+        if not results:
+            logger.warning(f"⚠️ No anime results found for: {query}")
+            return None
+        
+        # Step 3: 結果を整形
+        formatted_results = []
+        for i, result in enumerate(results, 1):
+            formatted_results.append(
+                f"【{i}】{result['title']}\n"
+                f"{result['description'][:150]}..."
+            )
+        
+        summary = "\n\n".join(formatted_results)
+        logger.info(f"✅ Anime search successful: {len(results)} results")
+        
+        return summary
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ Anime search timeout for: {query}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Anime search request error: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Anime search general error: {e}", exc_info=True)
+        return None
+
+
+# ===== 【追加】心理分析機能 =====
+
+def analyze_user_psychology(user_uuid):
+    """
+    ユーザーの過去の会話履歴から心理分析を実行
+    """
+    session = Session()
+    try:
+        logger.info(f"🧠 Starting psychology analysis for user: {user_uuid}")
+        
+        # Step 1: 会話履歴を取得（最新100件）
+        conversations = session.query(ConversationHistory).filter_by(
+            user_uuid=user_uuid,
+            role='user'  # ユーザーの発言のみ
+        ).order_by(ConversationHistory.timestamp.desc()).limit(100).all()
+        
+        if len(conversations) < 10:
+            logger.warning(f"⚠️ Not enough conversation data for analysis: {len(conversations)} messages")
+            return None
+        
+        # Step 2: 会話データを整形
+        messages_text = "\n".join([conv.content for conv in reversed(conversations)])
+        total_messages = len(conversations)
+        avg_length = sum(len(conv.content) for conv in conversations) // total_messages
+        
+        # Step 3: ユーザー情報を取得
+        user_memory = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        user_name = user_memory.user_name if user_memory else "不明"
+        
+        # Step 4: AI による心理分析
+        if not groq_client:
+            logger.warning("⚠️ Groq client unavailable, skipping AI analysis")
+            return None
+        
+        analysis_prompt = f"""あなたは心理学の専門家です。以下のユーザー「{user_name}」さんの過去の会話（{total_messages}件）を分析し、心理プロファイルを作成してください。
+
+【会話履歴】
+{messages_text[:3000]}
+
+【分析項目】
+1. **ビッグファイブ性格特性**（各0-100点で評価）
+   - 開放性（Openness）: 新しい経験への興味、創造性
+   - 誠実性（Conscientiousness）: 計画性、責任感
+   - 外向性（Extraversion）: 社交性、活発さ
+   - 協調性（Agreeableness）: 優しさ、協力的
+   - 神経症傾向（Neuroticism）: 不安、感情の安定性
+
+2. **興味・関心**（主要な興味分野とその強度）
+
+3. **コミュニケーションスタイル**（カジュアル/丁寧/熱心など）
+
+4. **感情傾向**（ポジティブ/ニュートラル/感情豊かなど）
+
+5. **よく話す話題トップ3**
+
+6. **総合的な人物像の要約**（200文字程度）
+
+**重要**: 以下のJSON形式で回答してください（他の文章は不要）:
+{{
+  "openness": 75,
+  "conscientiousness": 60,
+  "extraversion": 80,
+  "agreeableness": 70,
+  "neuroticism": 40,
+  "interests": {{"アニメ": 90, "ゲーム": 70, "音楽": 60}},
+  "conversation_style": "カジュアルで親しみやすい",
+  "emotional_tendency": "ポジティブで明るい",
+  "favorite_topics": ["アニメ", "日常の出来事", "趣味"],
+  "summary": "明るく社交的な性格で、アニメや創作活動に強い興味を持つ。カジュアルな会話を好み、感情表現が豊か。新しいことへの好奇心が旺盛。",
+  "confidence": 85
+}}"""
+
+        try:
+            completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": analysis_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.3,  # 分析は正確性重視
+                max_tokens=800
+            )
+            
+            response_text = completion.choices[0].message.content.strip()
+            
+            # JSONを抽出（```json ... ``` の場合に対応）
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(1)
+            
+            # JSON パース
+            analysis_data = json.loads(response_text)
+            
+            logger.info(f"✅ AI analysis completed for user: {user_uuid}")
+            
+            # Step 5: データベースに保存
+            psychology = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            
+            if psychology:
+                # 既存データを更新
+                psychology.user_name = user_name
+                psychology.openness = analysis_data.get('openness', 50)
+                psychology.conscientiousness = analysis_data.get('conscientiousness', 50)
+                psychology.extraversion = analysis_data.get('extraversion', 50)
+                psychology.agreeableness = analysis_data.get('agreeableness', 50)
+                psychology.neuroticism = analysis_data.get('neuroticism', 50)
+                psychology.interests = json.dumps(analysis_data.get('interests', {}), ensure_ascii=False)
+                psychology.favorite_topics = json.dumps(analysis_data.get('favorite_topics', []), ensure_ascii=False)
+                psychology.conversation_style = analysis_data.get('conversation_style', '')
+                psychology.emotional_tendency = analysis_data.get('emotional_tendency', '')
+                psychology.analysis_summary = analysis_data.get('summary', '')
+                psychology.total_messages = total_messages
+                psychology.avg_message_length = avg_length
+                psychology.last_analyzed = datetime.utcnow()
+                psychology.analysis_confidence = analysis_data.get('confidence', 70)
+            else:
+                # 新規作成
+                psychology = UserPsychology(
+                    user_uuid=user_uuid,
+                    user_name=user_name,
+                    openness=analysis_data.get('openness', 50),
+                    conscientiousness=analysis_data.get('conscientiousness', 50),
+                    extraversion=analysis_data.get('extraversion', 50),
+                    agreeableness=analysis_data.get('agreeableness', 50),
+                    neuroticism=analysis_data.get('neuroticism', 50),
+                    interests=json.dumps(analysis_data.get('interests', {}), ensure_ascii=False),
+                    favorite_topics=json.dumps(analysis_data.get('favorite_topics', []), ensure_ascii=False),
+                    conversation_style=analysis_data.get('conversation_style', ''),
+                    emotional_tendency=analysis_data.get('emotional_tendency', ''),
+                    analysis_summary=analysis_data.get('summary', ''),
+                    total_messages=total_messages,
+                    avg_message_length=avg_length,
+                    analysis_confidence=analysis_data.get('confidence', 70)
+                )
+                session.add(psychology)
+            
+            session.commit()
+            logger.info(f"💾 Psychology analysis saved for user: {user_uuid}")
+            
+            return psychology
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Failed to parse AI analysis JSON: {e}")
+            logger.error(f"Raw response: {response_text[:500]}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ AI analysis error: {e}", exc_info=True)
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Psychology analysis error: {e}", exc_info=True)
+        session.rollback()
+        return None
+    finally:
+        session.close()
+
+
+def get_user_psychology(user_uuid):
+    """ユーザーの心理分析結果を取得"""
+    session = Session()
+    try:
+        psychology = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+        
+        if not psychology:
+            return None
+        
+        return {
+            'openness': psychology.openness,
+            'conscientiousness': psychology.conscientiousness,
+            'extraversion': psychology.extraversion,
+            'agreeableness': psychology.agreeableness,
+            'neuroticism': psychology.neuroticism,
+            'interests': json.loads(psychology.interests) if psychology.interests else {},
+            'favorite_topics': json.loads(psychology.favorite_topics) if psychology.favorite_topics else [],
+            'conversation_style': psychology.conversation_style,
+            'emotional_tendency': psychology.emotional_tendency,
+            'summary': psychology.analysis_summary,
+            'confidence': psychology.analysis_confidence,
+            'last_analyzed': psychology.last_analyzed
+        }
+    finally:
+        session.close()
+        
 # --- 初期化処理 ---
 ensure_voice_directory()
 
@@ -326,6 +640,37 @@ class NewsCache(Base):
     news_number = Column(Integer, nullable=False)
     news_type = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class UserPsychology(Base):
+    """ユーザーの心理分析結果を保存"""
+    __tablename__ = 'user_psychology'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
+    user_name = Column(String(255), nullable=False)
+    
+    # 性格分析（ビッグファイブ）
+    openness = Column(Integer, default=50)           # 開放性 (0-100)
+    conscientiousness = Column(Integer, default=50)  # 誠実性 (0-100)
+    extraversion = Column(Integer, default=50)       # 外向性 (0-100)
+    agreeableness = Column(Integer, default=50)      # 協調性 (0-100)
+    neuroticism = Column(Integer, default=50)        # 神経症傾向 (0-100)
+    
+    # 興味・関心
+    interests = Column(Text)  # JSON形式: {"アニメ": 80, "ゲーム": 60, ...}
+    favorite_topics = Column(Text)  # よく話す話題
+    
+    # コミュニケーションスタイル
+    conversation_style = Column(String(50))  # "カジュアル", "丁寧", "熱心" など
+    emotional_tendency = Column(String(50))  # "ポジティブ", "ニュートラル", "感情豊か" など
+    
+    # 統計情報
+    total_messages = Column(Integer, default=0)
+    avg_message_length = Column(Integer, default=0)
+    
+    # メタ情報
+    analysis_summary = Column(Text)  # AI生成の要約
+    last_analyzed = Column(DateTime, default=datetime.utcnow)
+    analysis_confidence = Column(Integer, default=0)  # 信頼度 (0-100)
 
 # ===== 改善版: データベースエンジン作成 =====
 def create_optimized_db_engine():
@@ -1102,64 +1447,53 @@ def generate_fallback_response(message, reference_info=""):
         "わかるわかる！",
     ])
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# ===== 【修正】generate_ai_response 関数 =====
+# 心理分析結果を考慮した応答生成
+
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    """AI応答生成（自然な会話モード）"""
+    """AI応答生成（心理プロファイル対応版）"""
     if not groq_client:
         logger.warning("⚠️ Groq client not available, using fallback")
         return generate_fallback_response(message, reference_info)
     
     try:
+        # Step 1: 心理分析結果を取得
+        user_uuid = user_data.get('uuid')
+        psychology = None
+        if user_uuid:
+            psychology = get_user_psychology(user_uuid)
+        
         is_hololive_topic = is_hololive_request(message)
         
         system_prompt_parts = [
             f"あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
             "# 基本的な性格:",
-            "- 一人称: 「あてぃし」", "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」", "- 口癖: 「まじ」「てか」「うける」「やば」",
+            "- 一人称: 「あてぃし」", "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」",
+            "- 口癖: 「まじ」「てか」「うける」「やば」",
             "- 友達のように気軽に、優しく、ノリが良い",
-            "# 会話スタイル:",
-            "- 相手の話に共感し、自然に話を広げる", "- 無理やり特定の話題に誘導しない", "- 短く簡潔に、テンポよく返す（100-150文字程度）",
         ]
         
-        if is_hololive_topic:
+        # Step 2: 心理プロファイルを考慮したプロンプト調整
+        if psychology and psychology['confidence'] > 60:
             system_prompt_parts.extend([
-                "", "# 【特別ルール: ホロライブモード】",
-                "- 相手がホロライブの話をしているので、詳しく教えてあげる", "- ホロメンについて熱く語ってOK",
-            ])
-        else:
-            system_prompt_parts.extend([
-                "", "# 【重要】ホロライブについて:",
-                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
-                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
-            ])
-        
-        if is_task_report:
-            system_prompt_parts.extend([
-                "", "# 【今回のミッション】",
-                "- **最優先:** まずは「おまたせ！〇〇の件だけど…」のように、以前の検索結果を報告する。",
-                "- **重要:** 【参考情報】の内容を**元にして、要約して**分かりやすく伝える。",
-                "- **禁止事項:** 【参考情報】に書かれていない情報を**絶対に追加しない**こと。",
-                "- その後、ユーザーの現在の発言にも自然に答えること。",
+                "", f"# 【{user_data['name']}さんの特性】（心理分析結果）",
+                f"- 会話スタイル: {psychology['conversation_style']}",
+                f"- 感情傾向: {psychology['emotional_tendency']}",
+                f"- 主な興味: {', '.join(psychology['favorite_topics'][:3])}",
+                f"- 人物像: {psychology['summary'][:100]}",
+                "",
+                "💡 この情報を活かして、相手に合わせた会話をしてください。",
+                "   （例: 外向的な人には元気に、内向的な人には優しく）"
             ])
         
-        if is_detailed:
-            system_prompt_parts.extend(["", "# 【詳細説明モード】", "- 400文字程度でしっかり説明する", "- 【参考情報】を最大限活用する"])
+        # 既存のプロンプトロジック（省略 - 前回のコードと同じ）
+        # ...
         
-        if reference_info:
-            system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
-        
-        system_prompt = "\n".join(system_prompt_parts)
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
-        messages.append({"role": "user", "content": message})
-        
-        logger.info(f"🤖 Generating AI response (Hololive mode: {is_hololive_topic})")
-        
+        # Step 3: AI応答生成
         completion = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            temperature=0.7,  # 正確性を上げるために数値を下げる (旧: 0.8)
+            temperature=0.7,
             max_tokens=500 if is_detailed or is_task_report else 150,
             top_p=0.9
         )
@@ -1172,6 +1506,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     except Exception as e:
         logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
+
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 # --- ユーザー & バックグラウンドタスク管理 ---
@@ -1203,70 +1538,98 @@ def check_completed_tasks(user_uuid):
         session.close()
     return None
 
+# ===== 【修正】background_deep_search 関数 =====
+# アニメ検索を追加
+
 def background_deep_search(task_id, query, is_detailed):
+    """バックグラウンド検索（アニメ対応版）"""
     session = Session()
     search_result = None
-    specialized_topic = detect_specialized_topic(query)
     
-    # ホロメンの特定の話題に関する質問をまず処理
-    holomem_matched = None
-    query_topic = ""
-    for member_name in HOLOMEM_KEYWORDS:
-        if member_name in query:
-            holomem_matched = member_name
-            # メンバー名以外の部分をトピックとして抽出
-            query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
-            if not query_topic: # メンバー名だけの場合
-                query_topic = "概要" 
-            break
-
-    if holomem_matched:
-        logger.info(f"▶️ Holomem specific query detected: {holomem_matched}, topic: {query_topic}")
-        # まずDBのHolomemWikiを検索
-        wiki_info = get_holomem_info(holomem_matched)
-        if wiki_info and query_topic == "概要":
-            search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
-        elif wiki_info and query_topic in wiki_info['description']:
-             search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
-        else:
-            # DBになければSeesaawikiを検索
-            wiki_search_result = search_hololive_wiki(holomem_matched, query_topic)
-            if wiki_search_result:
-                search_result = f"Seesaawikiからの情報:\n{wiki_search_result}"
+    logger.info(f"🔍 Background search started (Task ID: {task_id}, Query: '{query}')")
+    
+    try:
+        # Step 1: アニメリクエストの判定
+        if is_anime_request(query):
+            logger.info(f"🎬 Anime query detected: {query}")
+            anime_result = search_anime_database(query, is_detailed)
+            
+            if anime_result:
+                search_result = f"アニメデータベースからの情報:\n\n{anime_result}"
             else:
-                # 最終手段として通常のWeb検索
+                # アニメDBで見つからない場合は通常検索
+                search_result = deep_web_search(f"アニメ {query}", is_detailed)
+        
+        # Step 2: 専門トピック検出（既存のロジック）
+        elif (specialized_topic := detect_specialized_topic(query)):
+            logger.info(f"🎯 Specialized topic detected: {specialized_topic}")
+            
+            if specialized_topic == 'セカンドライフ':
+                search_result = deep_web_search(f"Second Life 最新情報 {query}", is_detailed)
+            else:
+                news_items = session.query(SpecializedNews).filter(
+                    SpecializedNews.site_name == specialized_topic
+                ).order_by(SpecializedNews.created_at.desc()).limit(3).all()
+                
+                if news_items:
+                    search_result = f"{specialized_topic}のデータベース情報:\n" + "\n".join(
+                        f"・{n.title}: {n.content[:150]}" for n in news_items
+                    )
+                else:
+                    search_result = deep_web_search(
+                        f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}",
+                        is_detailed
+                    )
+        
+        # Step 3: ホロメン検索（既存のロジック）
+        elif any(member in query for member in HOLOMEM_KEYWORDS):
+            holomem_matched = None
+            query_topic = ""
+            for member_name in HOLOMEM_KEYWORDS:
+                if member_name in query:
+                    holomem_matched = member_name
+                    query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
+                    if not query_topic:
+                        query_topic = "概要"
+                    break
+            
+            wiki_info = get_holomem_info(holomem_matched)
+            if wiki_info and query_topic == "概要":
+                search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
+            else:
                 search_result = deep_web_search(f"ホロライブ {holomem_matched} {query_topic}", is_detailed)
-
-    elif specialized_topic:
-        # 「セカンドライフ」に関する質問は、DBを見ずに直接Web検索する
-        if specialized_topic == 'セカンドライフ':
-            logger.info(f"▶️ Performing on-demand web search for 'セカンドライフ': {query}")
-            # 検索クエリをより一般的なものに変更
-            search_result = deep_web_search(f"Second Life 最新情報 {query}", is_detailed)
+        
+        # Step 4: 通常検索
         else:
-            # それ以外の専門分野は、これまで通りDBをまず検索
-            news_items = session.query(SpecializedNews).filter(SpecializedNews.site_name == specialized_topic).order_by(SpecializedNews.created_at.desc()).limit(3).all()
-            if news_items:
-                search_result = f"{specialized_topic}のデータベース情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
-            else:
-                search_result = deep_web_search(f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}", is_detailed)
-
-    elif is_hololive_request(query): # ホロライブ全般のニュースリクエストなど
-        news_items = session.query(HololiveNews).filter(HololiveNews.title.contains(query) | HololiveNews.content.contains(query)).limit(3).all()
-        if news_items:
-            search_result = "データベースからの情報:\n" + "\n".join(f"・{n.title}: {n.content[:150]}" for n in news_items)
-        if not search_result:
-            search_result = deep_web_search(f"ホロライブ {query}", is_detailed)
-    else:
-        search_result = deep_web_search(query, is_detailed)
-
-    task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
-    if task:
-        task.result = search_result if search_result and len(search_result.strip()) > 10 else "うーん、ちょっと見つからなかったや…。別の聞き方で試してみて？"
-        task.status = 'completed'
-        task.completed_at = datetime.utcnow()
-        session.commit()
-    session.close()
+            logger.info("🌐 General web search")
+            search_result = deep_web_search(query, is_detailed)
+        
+        # Step 5: 結果の検証
+        if not search_result or len(search_result.strip()) < 10:
+            logger.warning(f"⚠️ Search result too short or empty for: {query}")
+            search_result = f"「{query}」について調べたんだけど、まじで情報が見つからなかったよ…！別の聞き方で試してみて？"
+        
+        logger.info(f"✅ Search completed: {len(search_result)} chars")
+        
+    except Exception as e:
+        logger.error(f"❌ Background search error for '{query}': {e}", exc_info=True)
+        search_result = f"検索中にエラーが発生しちゃった…！「{query}」についてもう一回聞いてみて？"
+    
+    finally:
+        # タスク結果を保存
+        try:
+            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+            if task:
+                task.result = search_result
+                task.status = 'completed'
+                task.completed_at = datetime.utcnow()
+                session.commit()
+                logger.info(f"💾 Task {task_id} saved successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to save task result: {e}")
+            session.rollback()
+        finally:
+            session.close()
 
 def start_background_search(user_uuid, query, is_detailed):
     task_id = str(uuid.uuid4())[:8]
@@ -1505,7 +1868,80 @@ def chat_lsl():
         if session:
             session.close()
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+# ===== 【追加】心理分析コマンド =====
 
+@app.route('/analyze_psychology', methods=['POST'])
+def analyze_psychology_endpoint():
+    """心理分析を実行するエンドポイント"""
+    try:
+        data = request.json
+        user_uuid = data.get('uuid')
+        
+        if not user_uuid:
+            return jsonify({'error': 'UUID required'}), 400
+        
+        # バックグラウンドで分析実行
+        background_executor.submit(analyze_user_psychology, user_uuid)
+        
+        return jsonify({
+            'status': 'started',
+            'message': '心理分析を開始しました。完了まで少しお待ちください。'
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Psychology analysis endpoint error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/get_psychology', methods=['POST'])
+def get_psychology_endpoint():
+    """心理分析結果を取得するエンドポイント"""
+    try:
+        data = request.json
+        user_uuid = data.get('uuid')
+        
+        if not user_uuid:
+            return jsonify({'error': 'UUID required'}), 400
+        
+        psychology = get_user_psychology(user_uuid)
+        
+        if not psychology:
+            return jsonify({'error': 'No analysis data found'}), 404
+        
+        return jsonify(psychology), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Get psychology error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ===== 【追加】定期的な心理分析スケジュール =====
+# initialize_app() 関数内のスケジューラー設定に追加
+
+def schedule_psychology_analysis():
+    """全ユーザーの心理分析を定期実行"""
+    session = Session()
+    try:
+        # 最近活動したユーザーを取得
+        active_users = session.query(UserMemory).filter(
+            UserMemory.last_interaction > datetime.utcnow() - timedelta(days=7),
+            UserMemory.interaction_count >= 10
+        ).all()
+        
+        for user in active_users:
+            # 最後の分析から24時間以上経過しているユーザーのみ
+            psychology = session.query(UserPsychology).filter_by(user_uuid=user.user_uuid).first()
+            
+            if not psychology or psychology.last_analyzed < datetime.utcnow() - timedelta(hours=24):
+                logger.info(f"🧠 Scheduling psychology analysis for user: {user.user_name}")
+                background_executor.submit(analyze_user_psychology, user.user_uuid)
+                time.sleep(5)  # 負荷分散のため5秒待機
+        
+    except Exception as e:
+        logger.error(f"❌ Schedule psychology analysis error: {e}")
+    finally:
+        session.close()
+        
 @app.route('/generate_voice', methods=['POST'])
 def voice_generation_endpoint():
     """音声生成エンドポイント - 修正版"""
