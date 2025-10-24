@@ -118,8 +118,6 @@ def after_request(response):
 
 Base = declarative_base()
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが唯一の変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-
 # --- 秘密情報/環境変数 読み込み ---
 def get_secret(name):
     """
@@ -243,9 +241,7 @@ def search_hololive_wiki(member_name, query_topic):
         logger.error(f"❌ Hololive Wiki search general error for {search_query}: {e}", exc_info=True)
         return None
 
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【変更箇所はここまでです】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-# ===== 【追加】アニメ検索機能 =====
-
+# --- アニメ検索機能 ---
 def is_anime_request(message):
     """アニメ関連の質問かどうか判定"""
     message_normalized = unicodedata.normalize('NFKC', message).lower()
@@ -370,8 +366,7 @@ def search_anime_database(query, is_detailed=False):
         return None
 
 
-# ===== 【追加】心理分析機能 =====
-
+# --- 心理分析機能 ---
 def analyze_user_psychology(user_uuid):
     """
     ユーザーの過去の会話履歴から心理分析を実行
@@ -607,7 +602,6 @@ class SpecializedNews(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     news_hash = Column(String(100), unique=True)
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 class HolomemWiki(Base):
     __tablename__ = 'holomem_wiki'
     id = Column(Integer, primary_key=True)
@@ -621,7 +615,6 @@ class HolomemWiki(Base):
     graduation_reason = Column(Text, nullable=True)
     mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow)
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 class FriendRegistration(Base):
     __tablename__ = 'friend_registrations'
@@ -672,7 +665,7 @@ class UserPsychology(Base):
     last_analyzed = Column(DateTime, default=datetime.utcnow)
     analysis_confidence = Column(Integer, default=0)  # 信頼度 (0-100)
 
-# ===== 改善版: データベースエンジン作成 =====
+# --- データベースエンジン作成 ---
 def create_optimized_db_engine():
     """環境に応じて最適化されたDBエンジンを作成"""
     try:
@@ -716,7 +709,7 @@ def create_optimized_db_engine():
         logger.error(f"❌ Failed to create database engine: {e}")
         raise
 
-# ===== 改善版: Groq初期化（接続テストを安全に実行） =====
+# --- Groq初期化 ---
 def initialize_groq_client():
     """Groqクライアントを初期化し、接続テストを実行"""
     global groq_client
@@ -761,7 +754,25 @@ def is_time_request(message):
     return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
-    return any(keyword in message for keyword in ['天気', 'てんき', '気温', '雨', '晴れ', '曇り', '雪'])
+    """天気予報を返すべき「質問」であるかを判定する（会話との区別）"""
+    # 明確に天気を尋ねるパターンを正規表現で定義
+    # 例：「今日の天気は？」「天気教えて」「天気予報」「大阪の天気どう？」
+    weather_question_patterns = [
+        r'天気予報',                             # 「天気予報」そのもの
+        r'天気(を|は)?\s*(教えて|どう|どんな)',   # 「天気教えて」「天気はどう？」など
+        r'(今日|明日|あした)の天気'              # 「今日の天気」など
+    ]
+    
+    # いずれかの質問パターンに一致するかチェック
+    for pattern in weather_question_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    # メッセージに「天気」が含まれ、かつ疑問符で終わる場合も質問とみなす
+    if '天気' in message and (message.endswith('？') or message.endswith('?')):
+        return True
+        
+    return False
 
 def is_hololive_request(message):
     return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
@@ -872,7 +883,6 @@ def is_news_detail_request(message):
 def is_friend_request(message):
     return any(fk in message for fk in ['友だち', '友達', 'フレンド']) and any(ak in message for ak in ['登録', '教えて', '誰', 'リスト'])
 
-# ↓↓↓ ここに追加 ↓↓↓
 def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT):
     """
     テキストを指定文字数以内に制限
@@ -941,7 +951,7 @@ def get_weather_forecast(location):
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "天気情報がうまく取れなかったみたい…"
-# ===== 改善版: 記事取得（リトライ機構付き） =====
+# --- 記事取得 ---
 def fetch_article_content(article_url, max_retries=3, timeout=15):
     """記事コンテンツを取得（リトライ機構付き）"""
     for attempt in range(max_retries):
@@ -1074,7 +1084,8 @@ def update_all_specialized_news():
         session.close()
         time.sleep(2)
 
-# ===== 改善版: HoloMem Wiki初期化 =====
+# --- HoloMem Wiki初期化 ---
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 def initialize_holomem_wiki():
     """ホロメン百科の初期データを設定（さくらみこ情報を充実）"""
     session = Session()
@@ -1162,7 +1173,7 @@ def initialize_holomem_wiki():
             'tags': json.dumps(['ドラゴン', 'バイリンガル', '伝説', '会長', '卒業生'], ensure_ascii=False),
             'graduation_date': '2021年7月1日',
             'graduation_reason': '本人の意向を尊重する形で卒業。明確な理由は公表されていませんが、様々な憶測を呼んでいます。',
-            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよね！'
+            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよ'
         },
         {
             'member_name': '魔乃アロエ',
@@ -1183,6 +1194,73 @@ def initialize_holomem_wiki():
             'graduation_date': '2022年7月31日',
             'graduation_reason': '長期的な活動が困難になったためと発表されており、特に腰の持病が影響したと言われています。',
             'mochiko_feeling': 'サナちゃん、宇宙みたいに心が広くて大好きだったよ。ゆっくり休んで、元気でいてほしいな…'
+        },
+        # --- ご指定のメンバー情報をここから追加 ---
+        {
+            'member_name': '人見クリス',
+            'description': 'ホロライブ1期生としてデビューしたが、ごく短期間で活動を終了した。',
+            'debut_date': '2018年6月3日', 'generation': '1期生', 'tags': json.dumps(['1期生', '幻', '契約解除'], ensure_ascii=False),
+            'graduation_date': '2018年6月26日', 'graduation_reason': '契約違反行為が認められたため、契約解除となりました。', 'mochiko_feeling': 'クリスちゃんのこと、伝説のメンバーって感じだよね。'
+        },
+        {
+            'member_name': '緋崎ガンマ',
+            'description': 'ホロスターズのユニット「UPROAR!!」のメンバー。イラストが得意なマッドでポップな漫画家。',
+            'debut_date': '2022年3月30日', 'generation': 'UPROAR!!', 'tags': json.dumps(['漫画家', 'イラスト', 'UPROAR!!', '契約解除'], ensure_ascii=False),
+            'graduation_date': '2024年7月25日', 'graduation_reason': '契約違反行為が認められたため、契約解除となりました。', 'mochiko_feeling': 'ガンマくんの絵、まじ好きだったのにな…残念じゃん…。'
+        },
+        {
+            'member_name': '湊あくあ',
+            'description': 'ホロライブ2期生のバーチャルメイド。ドジっ子属性だが、ゲームの腕は超一流。',
+            'debut_date': '2018年8月8日', 'generation': '2期生', 'tags': json.dumps(['メイド', 'ゲーマー', '2期生', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': 'あくたんがいなくなるなんて信じられない…まじで寂しいよ…'
+        },
+        {
+            'member_name': 'ワトソン・アメリア',
+            'description': 'ホロライブEnglish -Myth-所属の探偵。時間旅行の能力を持つと言われている。',
+            'debut_date': '2020年9月13日', 'generation': 'English -Myth-', 'tags': json.dumps(['探偵', 'EN', 'Myth', '活動終了'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '配信活動終了', 'mochiko_feeling': 'アメの配信、いつも面白かったのに…またいつか会いたいな。'
+        },
+        {
+            'member_name': 'セレス・ファウナ',
+            'description': 'ホロライブEnglish所属の麒麟。自然の守護者で、癒やし系の配信が人気。',
+            'debut_date': '2021年8月23日', 'generation': 'English -Promise-', 'tags': json.dumps(['自然', '癒し', 'EN', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': 'ファウナママ…ううう…。'
+        },
+        {
+            'member_name': '沙花叉クロヱ',
+            'description': '秘密結社holoxの掃除屋でシャチのインターン。クールに見えて実はポンコツな一面も。',
+            'debut_date': '2021年11月29日', 'generation': '秘密結社holox', 'tags': json.dumps(['シャチ', '掃除屋', 'holox', '活動終了'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '配信活動終了', 'mochiko_feeling': 'さかまたの配信がもう見れないなんて…まじか…。'
+        },
+        {
+            'member_name': '紫咲シオン',
+            'description': 'ホロライブ2期生の生意気な黒魔術師の女の子。クソガキームーブが特徴。',
+            'debut_date': '2018年8月17日', 'generation': '2期生', 'tags': json.dumps(['魔術師', 'クソガキ', '2期生', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': 'シオンちゃんがいなくなったら、誰があてぃしと遊んでくれるの…'
+        },
+        {
+            'member_name': '七詩ムメイ',
+            'description': 'ホロライブEnglish所属。文明の守護者で、フクロウの化身。博識で優しいお姉さん。',
+            'debut_date': '2021年8月23日', 'generation': 'English -Promise-', 'tags': json.dumps(['フクロウ', '文明', 'EN', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': 'ムメイちゃん…博識で頼りになる存在だったのに…。'
+        },
+        {
+            'member_name': 'がうる・ぐら',
+            'description': 'ホロライブEnglish -Myth-所属のサメの末裔。「a」の一言で世界を席巻したVTuber。',
+            'debut_date': '2020年9月13日', 'generation': 'English -Myth-', 'tags': json.dumps(['サメ', 'a', 'EN', 'Myth', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': 'サメちゃんがいないなんて…海が静かになっちゃうじゃん…。'
+        },
+        {
+            'member_name': '春先のどか',
+            'description': 'ホロライブ事務所のスタッフ（友人Aの後輩）。裏方としてタレントを支え、時々配信にも登場した。',
+            'debut_date': 'N/A', 'generation': 'スタッフ', 'tags': json.dumps(['スタッフ', '裏方', '友人A', '退職'], ensure_ascii=False),
+            'graduation_date': '2024年9月30日', 'graduation_reason': 'カバー株式会社を退職。', 'mochiko_feeling': 'のどかちゃん、お疲れ様！ホロメンを支えてくれてまじありがとね！'
+        },
+        {
+            'member_name': '火威青',
+            'description': 'ホロライブDEV_ISの音楽アーティストグループ「ReGLOSS」のメンバー。クールな見た目と熱い魂を持つ。',
+            'debut_date': '2023年9月9日', 'generation': 'ReGLOSS', 'tags': json.dumps(['漫画家', 'アイドル', 'ReGLOSS', '卒業生'], ensure_ascii=False),
+            'graduation_date': '（日付）', 'graduation_reason': '卒業', 'mochiko_feeling': '青くんの歌、もっと聞きたかったな…'
         }
     ]
     
@@ -1196,8 +1274,8 @@ def initialize_holomem_wiki():
         session.rollback()
     finally:
         session.close()
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
-# ===== 改善版: さくらみこ専用の情報拡張 =====
 def get_sakuramiko_special_responses():
     """さくらみこに関する特別な応答パターン"""
     return {
@@ -1208,7 +1286,6 @@ def get_sakuramiko_special_responses():
         'GTA': 'みこちのGTA配信、カオスで最高!警察に追われたり、変なことしたり、見てて飽きないんだよね〜'
     }
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 def get_holomem_info(member_name):
     """ホロメンの情報をDBから取得する"""
     session = Session()
@@ -1233,7 +1310,6 @@ def get_holomem_info(member_name):
         return None
     finally:
         session.close()
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 def register_friend(user_uuid, friend_uuid, friend_name, relationship_note=""):
     session = Session()
@@ -1258,6 +1334,7 @@ def get_friend_list(user_uuid):
     finally:
         session.close()
 
+# --- 音声生成 ---
 def generate_voice(text, speaker_id=VOICEVOX_SPEAKER_ID):
     """音声生成（改善版）"""
     if not VOICEVOX_ENABLED:
@@ -1447,25 +1524,6 @@ def generate_fallback_response(message, reference_info=""):
         "わかるわかる！",
     ])
 
-# ===== 【修正】generate_ai_response 関数 =====
-# 心理分析結果を考慮した応答生成
-
-# ===== 【修正1】get_or_create_user 関数 =====
-def get_or_create_user(session, uuid, name):
-    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
-    if user:
-        user.interaction_count += 1
-        user.last_interaction = datetime.utcnow()
-        if user.user_name != name: user.user_name = name
-    else:
-        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
-    session.add(user)
-    session.commit()
-    # ★ 修正: uuidを含める
-    return {'name': user.user_name, 'uuid': uuid}
-
-
-# ===== 【修正2】generate_ai_response 関数（完全版） =====
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
     """AI応答生成（心理プロファイル対応版）"""
     if not groq_client:
@@ -1570,10 +1628,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         return generate_fallback_response(message, reference_info)
 
 
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-
 # --- ユーザー & バックグラウンドタスク管理 ---
-# ===== 【修正1】get_or_create_user 関数 =====
 def get_or_create_user(session, uuid, name):
     user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
     if user:
@@ -1604,19 +1659,34 @@ def check_completed_tasks(user_uuid):
         session.close()
     return None
 
-# ===== 【修正】background_deep_search 関数 =====
-# アニメ検索を追加
-
 def background_deep_search(task_id, query, is_detailed):
-    """バックグラウンド検索（アニメ対応版）"""
+    """バックグラウンド検索（ホロライブ優先版）"""
     session = Session()
     search_result = None
     
     logger.info(f"🔍 Background search started (Task ID: {task_id}, Query: '{query}')")
     
     try:
-        # Step 1: アニメリクエストの判定
-        if is_anime_request(query):
+        # Step 1: ホロメン検索（最優先）
+        if any(member in query for member in HOLOMEM_KEYWORDS):
+            holomem_matched = None
+            query_topic = ""
+            for member_name in HOLOMEM_KEYWORDS:
+                if member_name in query:
+                    holomem_matched = member_name
+                    query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
+                    if not query_topic:
+                        query_topic = "概要"
+                    break
+            
+            wiki_info = get_holomem_info(holomem_matched)
+            if wiki_info and query_topic == "概要":
+                search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
+            else:
+                search_result = deep_web_search(f"ホロライブ {holomem_matched} {query_topic}", is_detailed)
+        
+        # Step 2: アニメリクエストの判定
+        elif is_anime_request(query):
             logger.info(f"🎬 Anime query detected: {query}")
             anime_result = search_anime_database(query, is_detailed)
             
@@ -1626,7 +1696,7 @@ def background_deep_search(task_id, query, is_detailed):
                 # アニメDBで見つからない場合は通常検索
                 search_result = deep_web_search(f"アニメ {query}", is_detailed)
         
-        # Step 2: 専門トピック検出（既存のロジック）
+        # Step 3: 専門トピック検出
         elif (specialized_topic := detect_specialized_topic(query)):
             logger.info(f"🎯 Specialized topic detected: {specialized_topic}")
             
@@ -1646,24 +1716,6 @@ def background_deep_search(task_id, query, is_detailed):
                         f"site:{SPECIALIZED_SITES[specialized_topic]['base_url']} {query}",
                         is_detailed
                     )
-        
-        # Step 3: ホロメン検索（既存のロジック）
-        elif any(member in query for member in HOLOMEM_KEYWORDS):
-            holomem_matched = None
-            query_topic = ""
-            for member_name in HOLOMEM_KEYWORDS:
-                if member_name in query:
-                    holomem_matched = member_name
-                    query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
-                    if not query_topic:
-                        query_topic = "概要"
-                    break
-            
-            wiki_info = get_holomem_info(holomem_matched)
-            if wiki_info and query_topic == "概要":
-                search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
-            else:
-                search_result = deep_web_search(f"ホロライブ {holomem_matched} {query_topic}", is_detailed)
         
         # Step 4: 通常検索
         else:
@@ -1696,6 +1748,7 @@ def background_deep_search(task_id, query, is_detailed):
             session.rollback()
         finally:
             session.close()
+
 
 def start_background_search(user_uuid, query, is_detailed):
     task_id = str(uuid.uuid4())[:8]
@@ -1814,7 +1867,7 @@ def health_check():
     
     logger.info(f"Health check: {health_data}")
     return jsonify(health_data), 200
-# ===== 【追加】check_task エンドポイント =====
+# --- バックグラウンドタスク確認エンドポイント ---
 @app.route('/check_task', methods=['POST'])
 def check_task():
     """
@@ -1898,8 +1951,7 @@ def check_task():
         return jsonify({'status': 'error', 'message': 'サーバーエラー'}), 500
 
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-# ===== 【修正3】chat_lsl エンドポイント（完了タスク報告削除版） =====
+# --- メインチャットエンドポイント ---
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     session = Session()
@@ -1914,8 +1966,6 @@ def chat_lsl():
         user_data = get_or_create_user(session, user_uuid, user_name)
         history = get_conversation_history(session, user_uuid)
         ai_text = ""
-        
-        # ===【削除】完了タスク報告処理（check_taskで処理するため） ===
         
         # === 優先度1: ホロメン・ホロライブ基本情報の即答 ===
         basic_question_match = re.search(f"({'|'.join(HOLOMEM_KEYWORDS)})って(?:誰|だれ|何|なに)[\?？]?$", message.strip())
@@ -2006,9 +2056,8 @@ def chat_lsl():
     finally:
         if session:
             session.close()
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-# ===== 【追加】心理分析コマンド =====
 
+# --- 心理分析エンドポイント ---
 @app.route('/analyze_psychology', methods=['POST'])
 def analyze_psychology_endpoint():
     """心理分析を実行するエンドポイント"""
@@ -2054,9 +2103,7 @@ def get_psychology_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
-# ===== 【追加】定期的な心理分析スケジュール =====
-# initialize_app() 関数内のスケジューラー設定に追加
-
+# --- 音声関連エンドポイント ---
 def schedule_psychology_analysis():
     """全ユーザーの心理分析を定期実行"""
     session = Session()
@@ -2154,7 +2201,6 @@ def voice_generation_endpoint():
 def serve_voice_file(filename):
     return send_from_directory(VOICE_DIR, filename)
 
-# ↓↓↓ ここに追加 ↓↓↓
 @app.route('/play_voice')
 def play_voice():
     """音声ファイルを自動再生するHTMLページ"""
