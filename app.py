@@ -106,8 +106,10 @@ groq_client = None
 VOICEVOX_ENABLED = True
 app = Flask(__name__)
 CORS(app)
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+app.config['JSON_AS_ASCII'] = False
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
-# ↓↓↓ ここに追加 ↓↓↓
 @app.after_request
 def after_request(response):
     """CORSヘッダーを全レスポンスに追加"""
@@ -1173,7 +1175,7 @@ def initialize_holomem_wiki():
             'tags': json.dumps(['ドラゴン', 'バイリンガル', '伝説', '会長', '卒業生'], ensure_ascii=False),
             'graduation_date': '2021年7月1日',
             'graduation_reason': '本人の意向を尊重する形で卒業。明確な理由は公表されていませんが、様々な憶測を呼んでいます。',
-            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよ'
+            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよね！'
         },
         {
             'member_name': '魔乃アロエ',
@@ -1195,7 +1197,6 @@ def initialize_holomem_wiki():
             'graduation_reason': '長期的な活動が困難になったためと発表されており、特に腰の持病が影響したと言われています。',
             'mochiko_feeling': 'サナちゃん、宇宙みたいに心が広くて大好きだったよ。ゆっくり休んで、元気でいてほしいな…'
         },
-        # --- ご指定のメンバー情報をここから追加 ---
         {
             'member_name': '人見クリス',
             'description': 'ホロライブ1期生としてデビューしたが、ごく短期間で活動を終了した。',
@@ -1524,8 +1525,9 @@ def generate_fallback_response(message, reference_info=""):
         "わかるわかる！",
     ])
 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    """AI応答生成（心理プロファイル対応版）"""
+    """AI応答生成（心理プロファイル・タスク報告強化版）"""
     if not groq_client:
         logger.warning("⚠️ Groq client not available, using fallback")
         return generate_fallback_response(message, reference_info)
@@ -1551,7 +1553,29 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
             "- 短く簡潔に、テンポよく返す（100-150文字程度）",
         ]
         
-        # Step 2: 心理プロファイルを考慮したプロンプト調整
+        # Step 2: 応答モードに応じたプロンプト調整
+        if is_task_report:
+            system_prompt_parts.extend([
+                "", "# 【最優先ミッション：検索結果の報告】",
+                "- **最重要**: まず「おまたせ！〇〇の件だけど…」のように、以前の検索結果の報告から会話を始めること。",
+                "- **厳守**: 【参考情報】として提供された検索結果**のみ**を要約し、分かりやすく伝える。",
+                "- **禁止事項**: 【参考情報】に記載されていない情報や、あなた自身の知識（特にホロライブに関する知識）を**絶対に付け加えてはならない**。",
+                "- 報告後、ユーザーの現在の発言にも自然に答えること。",
+            ])
+        elif is_hololive_topic:
+            system_prompt_parts.extend([
+                "", "# 【特別ルール: ホロライブモード】",
+                "- 相手がホロライブの話をしているので、詳しく教えてあげる", 
+                "- ホロメンについて熱く語ってOK",
+            ])
+        else:
+            system_prompt_parts.extend([
+                "", "# 【重要】ホロライブについて:",
+                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
+                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
+            ])
+
+        # Step 3: 心理プロファイルを考慮したプロンプト調整
         if psychology and psychology['confidence'] > 60:
             system_prompt_parts.extend([
                 "", f"# 【{user_data['name']}さんの特性】（心理分析結果）",
@@ -1564,31 +1588,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
                 "   （例: 外向的な人には元気に、内向的な人には優しく）"
             ])
         
-        # Step 3: ホロライブモード判定
-        if is_hololive_topic:
-            system_prompt_parts.extend([
-                "", "# 【特別ルール: ホロライブモード】",
-                "- 相手がホロライブの話をしているので、詳しく教えてあげる", 
-                "- ホロメンについて熱く語ってOK",
-            ])
-        else:
-            system_prompt_parts.extend([
-                "", "# 【重要】ホロライブについて:",
-                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
-                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
-            ])
-        
-        # Step 4: タスク報告モード
-        if is_task_report:
-            system_prompt_parts.extend([
-                "", "# 【今回のミッション】",
-                "- **最優先:** まずは「おまたせ！〇〇の件だけど…」のように、以前の検索結果を報告する。",
-                "- **重要:** 【参考情報】の内容を**元にして、要約して**分かりやすく伝える。",
-                "- **禁止事項:** 【参考情報】に書かれていない情報を**絶対に追加しない**こと。",
-                "- その後、ユーザーの現在の発言にも自然に答えること。",
-            ])
-        
-        # Step 5: 詳細説明モード
+        # Step 4: 詳細説明モード
         if is_detailed:
             system_prompt_parts.extend([
                 "", "# 【詳細説明モード】", 
@@ -1596,20 +1596,20 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
                 "- 【参考情報】を最大限活用する"
             ])
         
-        # Step 6: 参考情報の追加
+        # Step 5: 参考情報の追加
         if reference_info:
             system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
         
         system_prompt = "\n".join(system_prompt_parts)
         
-        # ★ 修正: messages を正しく構築
+        # messages を正しく構築
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
         messages.append({"role": "user", "content": message})
         
-        logger.info(f"🤖 Generating AI response (Hololive mode: {is_hololive_topic})")
+        logger.info(f"🤖 Generating AI response (TaskReport: {is_task_report}, HoloMode: {is_hololive_topic})")
         
-        # Step 7: AI応答生成
+        # Step 6: AI応答生成
         completion = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
@@ -1626,6 +1626,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     except Exception as e:
         logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
 
 # --- ユーザー & バックグラウンドタスク管理 ---
@@ -1960,7 +1961,7 @@ def chat_lsl():
         user_uuid, user_name, message = data.get('uuid', ''), data.get('name', ''), data.get('message', '')
         
         if not all([user_uuid, user_name, message]):
-            return "エラー: 必要な情報が足りないみたい…|", 400
+            return jsonify(error="必要な情報が足りないみたい…"), 400
         
         logger.info(f"💬 Received: {message} (from: {user_name})")
         user_data = get_or_create_user(session, user_uuid, user_name)
@@ -2048,11 +2049,12 @@ def chat_lsl():
         session.commit()
         
         logger.info(f"✅ Responded: {ai_text[:80]}")
-        return f"{ai_text}|", 200
+        # LSL側でパースしやすいようにJSON形式で返す
+        return jsonify(message=ai_text), 200
         
     except Exception as e:
         logger.error(f"❌ Unhandled error in chat endpoint: {e}", exc_info=True)
-        return "ごめん、システムエラーが起きちゃった…|", 500
+        return jsonify(message="ごめん、システムエラーが起きちゃった…"), 500
     finally:
         if session:
             session.close()
