@@ -1799,7 +1799,7 @@ def health_check():
 @app.route('/check_task', methods=['POST'])
 def check_task():
     """
-    バックグラウンドタスクの完了チェック（LSLから定期的に呼ばれる）
+    バックグラウンドタスクの完了チェック(LSLから定期的に呼ばれる)
     """
     try:
         data = request.json
@@ -1838,7 +1838,7 @@ def check_task():
                 # 報告メッセージを生成
                 report_message = generate_ai_response(
                     {'name': user_name, 'uuid': user_uuid_for_response},
-                    f"（検索完了報告）以前リクエストされた「{completed_task['query']}」の結果を報告してください。",
+                    f"(検索完了報告)以前リクエストされた「{completed_task['query']}」の結果を報告してください。",
                     history,
                     completed_task['result'],
                     is_detailed=True,
@@ -1853,20 +1853,33 @@ def check_task():
                 ))
                 session.commit()
                 
-                return jsonify({
+                # ★ 修正: ensure_ascii=False で日本語を正しく出力
+                response_data = {
                     'status': 'completed',
                     'query': completed_task['query'],
                     'message': report_message
-                }), 200
+                }
+                return app.response_class(
+                    response=json.dumps(response_data, ensure_ascii=False),
+                    status=200,
+                    mimetype='application/json'
+                )
                 
             except Exception as e:
                 logger.error(f"❌ Report generation error: {e}", exc_info=True)
                 session.rollback()
-                return jsonify({
+                
+                # エラー時も ensure_ascii=False
+                error_response = {
                     'status': 'completed',
                     'query': completed_task['query'],
-                    'message': f"検索結果が見つかったんだけど、報告の生成でエラーが出ちゃった…！\n\n{completed_task['result'][:200]}"
-                }), 200
+                    'message': f"検索結果が見つかったんだけど、報告の生成でエラーが出ちゃった...!\n\n{completed_task['result'][:200]}"
+                }
+                return app.response_class(
+                    response=json.dumps(error_response, ensure_ascii=False),
+                    status=200,
+                    mimetype='application/json'
+                )
             finally:
                 session.close()
         
