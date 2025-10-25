@@ -105,7 +105,7 @@ background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client = None
 VOICEVOX_ENABLED = True
 app = Flask(__name__)
-CORS(app）
+CORS(app)
 app.config['JSON_AS_ASCII'] = False
 
 @app.after_request
@@ -1445,21 +1445,6 @@ def generate_fallback_response(message, reference_info=""):
 
 # ===== 【修正】generate_ai_response 関数 =====
 # 心理分析結果を考慮した応答生成
-
-# ===== 【修正1】get_or_create_user 関数 =====
-def get_or_create_user(session, uuid, name):
-    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
-    if user:
-        user.interaction_count += 1
-        user.last_interaction = datetime.utcnow()
-        if user.user_name != name: user.user_name = name
-    else:
-        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
-    session.add(user)
-    session.commit()
-    # ★ 修正: uuidを含める
-    return {'name': user.user_name, 'uuid': uuid}
-
 
 # ===== 【修正2】generate_ai_response 関数（完全版） =====
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
