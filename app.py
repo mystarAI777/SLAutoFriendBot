@@ -3295,24 +3295,6 @@ def is_hololive_request(message):
 
 # chat_lsl 関数内の該当箇所を以下に置き換え:
 
-# === 優先度1: ホロメン基本情報 ===
-holomem_keywords = get_active_holomem_keywords()
-basic_question_pattern = f"({'|'.join(re.escape(k) for k in holomem_keywords)})って(?:誰|だれ|何|なに)[\?？]?$"
-basic_question_match = re.search(basic_question_pattern, message.strip())
-
-if not ai_text and basic_question_match:
-    member_name = basic_question_match.group(1)
-    
-    if member_name in ['ホロライブ', 'hololive', 'ホロメン']:
-        ai_text = "ホロライブは、カバー株式会社が運営してるVTuber事務所のことだよ！ときのそらちゃんとか、たくさんの人気VTuberが所属してて、配信とかまじで楽しいからおすすめ！"
-    else:
-        wiki_info = get_holomem_info(member_name)
-        if wiki_info:
-            response_parts = [f"{wiki_info['name']}ちゃんはね、ホロライブ{wiki_info['generation']}のVTuberだよ！ {wiki_info['description']}"]
-            if wiki_info.get('graduation_date'):
-                response_parts.append(f"でもね、{wiki_info['graduation_date']}に卒業しちゃったんだ…。{wiki_info.get('mochiko_feeling', 'まじ寂しいよね…。')}")
-            ai_text = " ".join(response_parts)
-
 
 # ========================================
 # 【変更10】background_deep_search のホロメン判定を動的化
