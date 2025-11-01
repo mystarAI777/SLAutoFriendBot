@@ -1606,21 +1606,6 @@ def generate_fallback_response(message, reference_info=""):
 
 
 
-# ===== 【修正1】get_or_create_user 関数 =====
-def get_or_create_user(session, uuid, name):
-    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
-    if user:
-        user.interaction_count += 1
-        user.last_interaction = datetime.utcnow()
-        if user.user_name != name: user.user_name = name
-    else:
-        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
-    session.add(user)
-    session.commit()
-    # ★ 修正: uuidを含める
-    return {'name': user.user_name, 'uuid': uuid}
-
-
 # ========================================
 # 【修正2】generate_ai_response - もちこの性格を明確化
 # ========================================
@@ -1790,19 +1775,6 @@ def is_follow_up_question(message, history):
 
 
 # --- ユーザー & バックグラウンドタスク管理 ---
-# ===== 【修正1】get_or_create_user 関数 =====
-def get_or_create_user(session, uuid, name):
-    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
-    if user:
-        user.interaction_count += 1
-        user.last_interaction = datetime.utcnow()
-        if user.user_name != name: user.user_name = name
-    else:
-        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
-    session.add(user)
-    session.commit()
-    # ★ 修正: uuidを含める
-    return {'name': user.user_name, 'uuid': uuid}
 
 
 def get_conversation_history(session, uuid):
