@@ -1,5 +1,5 @@
 #
-# Mochiko AI - Version 3.0 (Stable Task Management & UTF-8 Fix)
+# Mochiko AI - Version 3.1 (検索機能完全実装 + 文字化け対策)
 #
 
 import sys
@@ -33,11 +33,10 @@ logger = logging.getLogger(__name__)
 # --- Flask アプリケーション初期化 ---
 app = Flask(__name__)
 CORS(app)
-# ★★★ 文字化け対策: JSONで日本語をそのまま出力する設定 ★★★
 app.config['JSON_AS_ASCII'] = False
+app.config['JSONIFY_MIMETYPE'] = 'application/json; charset=utf-8'
 
 # --- 定数 ---
-# (既存の定数定義は変更なし)
 VOICE_DIR = '/tmp/voices'
 SERVER_URL = "https://slautofriendbot.onrender.com"
 HOLOMEM_KEYWORDS = [
@@ -63,7 +62,6 @@ SPECIALIZED_SITES = {
     'アニメ': {'base_url': 'https://animedb.jp/', 'keywords': ['アニメ', 'anime']}
 }
 
-
 # --- グローバル変数 & Executor ---
 background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client = None
@@ -82,7 +80,7 @@ DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 
-# --- データベースモデル (変更なし) ---
+# --- データベースモデル ---
 class UserMemory(Base):
     __tablename__ = 'user_memories'
     id = Column(Integer, primary_key=True)
@@ -104,7 +102,7 @@ class BackgroundTask(Base):
     user_uuid = Column(String(255), nullable=False, index=True)
     query = Column(Text, nullable=False)
     result = Column(Text)
-    status = Column(String(20), default='pending') # pending, completed, failed
+    status = Column(String(20), default='pending')
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
 
@@ -118,16 +116,14 @@ class UserPsychology(Base):
     favorite_topics = Column(Text)
     confidence = Column(Integer, default=0)
 
-# (その他のDBモデルは省略)
-
-# --- AIクライアント初期化 (変更なし) ---
+# --- AIクライアント初期化 ---
 def initialize_gemini_client():
     global gemini_model
     try:
         if GEMINI_API_KEY and len(GEMINI_API_KEY) > 20:
             genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("✅ Gemini 1.5 Flash client initialized.")
+            gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            logger.info("✅ Gemini 2.0 Flash Exp client initialized.")
         else:
             logger.warning("⚠️ GEMINI_API_KEY not set or invalid. Gemini disabled.")
     except Exception as e:
@@ -138,19 +134,18 @@ def initialize_groq_client():
     try:
         if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
             groq_client = Groq(api_key=GROQ_API_KEY)
-            logger.info("✅ Llama 3.1 (Groq) client initialized.")
+            logger.info("✅ Llama 3.3 70B (Groq) client initialized.")
         else:
             logger.warning("⚠️ GROQ_API_KEY not set or invalid. Llama disabled.")
     except Exception as e:
         logger.error(f"❌ Groq client initialization failed: {e}")
 
-# --- AIモデル呼び出し (変更なし) ---
+# --- AIモデル呼び出し ---
 def call_gemini(prompt, history=None, system_context=""):
-    # ... (既存のコード)
-    if not gemini_model: return None
+    if not gemini_model:
+        return None
     try:
-        # 簡略化された呼び出し
-        full_prompt = f"{system_context}\n\n[PAST CONVERSATION]\n{history}\n\n[CURRENT PROMPT]\n{prompt}"
+        full_prompt = f"{system_context}\n\n[PAST CONVERSATION]\n{history or ''}\n\n[CURRENT PROMPT]\n{prompt}"
         response = gemini_model.generate_content(full_prompt)
         return response.text.strip()
     except Exception as e:
@@ -158,27 +153,34 @@ def call_gemini(prompt, history=None, system_context=""):
         return None
 
 def call_llama_advanced(prompt, history=None, system_prompt=None):
-    # ... (既存のコード)
-    if not groq_client: return None
+    if not groq_client:
+        return None
     try:
         messages = []
-        if system_prompt: messages.append({"role": "system", "content": system_prompt})
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         if history:
-             messages.extend([{"role": "user" if msg.role == "user" else "assistant", "content": msg.content} for msg in history[-5:]])
+            messages.extend([
+                {"role": "user" if msg.role == "user" else "assistant", "content": msg.content}
+                for msg in history[-5:]
+            ])
         messages.append({"role": "user", "content": prompt})
         
         completion = groq_client.chat.completions.create(
-            messages=messages, model="llama3-70b-8192", temperature=0.7, max_tokens=600
+            messages=messages,
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
+            max_tokens=800
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"❌ Llama API error: {e}")
         return None
 
-
 # --- ユーティリティ関数 ---
 def clean_text(text):
-    if not text: return ""
+    if not text:
+        return ""
     return re.sub(r'\s+', ' ', text).strip()
 
 def is_short_response(message):
@@ -194,8 +196,10 @@ def detect_specialized_topic(message):
     return None
 
 def should_search(message):
-    if is_short_response(message) or is_explicit_search_request(message):
+    if is_short_response(message):
         return False
+    if is_explicit_search_request(message):
+        return True
     if detect_specialized_topic(message) or is_hololive_request(message):
         return True
     search_patterns = [r'とは', r'について', r'教えて', r'誰', r'何', r'なぜ', r'詳しく']
@@ -203,12 +207,13 @@ def should_search(message):
 
 def is_hololive_request(message):
     return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
-    
+
 def get_user_psychology(user_uuid):
     session = Session()
     try:
         psychology = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-        if not psychology: return None
+        if not psychology:
+            return None
         return {
             'conversation_style': psychology.conversation_style,
             'emotional_tendency': psychology.emotional_tendency,
@@ -218,8 +223,84 @@ def get_user_psychology(user_uuid):
     finally:
         session.close()
 
-# --- コアロジック ---
+# --- 🔍 検索機能の完全実装 ---
+def scrape_google_search(query, max_results=5):
+    """Google検索のスクレイピング"""
+    results = []
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        url = f"https://www.google.com/search?q={quote_plus(query)}&hl=ja"
+        response = requests.get(url, headers=headers, timeout=10)
+        response.encoding = 'utf-8'
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for g in soup.find_all('div', class_='g')[:max_results]:
+                title_elem = g.find('h3')
+                snippet_elem = g.find('div', class_=['VwiC3b', 'yXK7lf'])
+                
+                if title_elem and snippet_elem:
+                    results.append({
+                        'title': clean_text(title_elem.get_text()),
+                        'snippet': clean_text(snippet_elem.get_text())
+                    })
+        
+        logger.info(f"🔍 Google search found {len(results)} results for: {query}")
+    except Exception as e:
+        logger.error(f"❌ Google search error: {e}")
+    
+    return results
 
+def scrape_specialized_site(topic, query):
+    """専門サイトのスクレイピング"""
+    config = SPECIALIZED_SITES.get(topic)
+    if not config:
+        return []
+    
+    results = []
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(config['base_url'], headers=headers, timeout=10)
+        response.encoding = 'utf-8'
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # サイトごとの構造に応じてスクレイピング（簡易版）
+            articles = soup.find_all(['article', 'div'], class_=re.compile(r'post|article|entry'))[:3]
+            
+            for article in articles:
+                title_elem = article.find(['h1', 'h2', 'h3', 'a'])
+                text_elem = article.find(['p', 'div'], class_=re.compile(r'content|excerpt|summary'))
+                
+                if title_elem:
+                    results.append({
+                        'title': clean_text(title_elem.get_text()),
+                        'snippet': clean_text(text_elem.get_text()) if text_elem else ''
+                    })
+        
+        logger.info(f"🎯 Specialized site ({topic}) found {len(results)} results")
+    except Exception as e:
+        logger.error(f"❌ Specialized site scraping error: {e}")
+    
+    return results
+
+def perform_web_search(query, specialized_topic=None):
+    """統合検索実行"""
+    all_results = []
+    
+    # 専門サイト優先
+    if specialized_topic:
+        all_results.extend(scrape_specialized_site(specialized_topic, query))
+    
+    # Google検索（専門サイトで結果が少ない場合は追加）
+    if len(all_results) < 3:
+        all_results.extend(scrape_google_search(query, max_results=5))
+    
+    return all_results[:5]  # 最大5件
+
+# --- コアロジック ---
 def generate_ai_response(user_data, message, history, reference_info=""):
     use_llama = len(reference_info) > 100 or any(keyword in message for keyword in ['分析', '詳しく', '説明'])
     
@@ -237,63 +318,107 @@ def generate_ai_response(user_data, message, history, reference_info=""):
 
     response = None
     if use_llama:
-        logger.info("🧠 Using Llama 3.1 70B for detailed response.")
+        logger.info("🧠 Using Llama 3.3 70B for detailed response.")
         response = call_llama_advanced(message, history, system_prompt)
     
     if not response:
-        logger.info("🚀 Using Gemini 1.5 Flash for fast response.")
+        logger.info("🚀 Using Gemini 2.0 Flash for fast response.")
         history_text = "\n".join([f"{h.role}: {h.content}" for h in history])
         response = call_gemini(message, history_text, system_prompt)
 
     return response or "ごめん、ちょっと考えがまとまらないや…！"
 
 def background_deep_search(task_id, query, history):
+    """バックグラウンド検索の実行（修正版）"""
     session = Session()
     try:
+        # ① 会話履歴を使って文脈理解
         contextual_query = query
-        if history and any(kw in query for kw in ['それ', 'あれ', 'その中で', 'もっと詳しく']):
-            logger.info("🧠 Generating contextual search query...")
-            history_text = "\n".join([f"{'User' if h.role=='user' else 'AI'}: {h.content}" for h in history[-3:]])
-            prompt = f'以下の会話履歴を参考に、最後の質問を自己完結したGoogle検索クエリに変換して。クエリだけを返して。\n\n[履歴]\n{history_text}\n\n[最後の質問]\n"{query}"\n\n[変換後の検索クエリ]:'
-            generated_query = call_gemini(prompt) # 高速なモデルでクエリ生成
+        if history and any(kw in query for kw in ['それ', 'あれ', 'その中で', 'もっと詳しく', '詳しく']):
+            logger.info("🧠 Generating contextual search query from history...")
+            history_text = "\n".join([
+                f"{'ユーザー' if h.role=='user' else 'もちこ'}: {h.content}"
+                for h in history[-5:]
+            ])
+            prompt = f'''以下の会話履歴を参考に、最後の質問を自己完結したGoogle検索クエリに変換してください。
+検索クエリだけを返してください。余計な文章は不要です。
+
+[会話履歴]
+{history_text}
+
+[最後の質問]
+"{query}"
+
+[変換後の検索クエリ]:'''
+            
+            generated_query = call_gemini(prompt)
             if generated_query:
-                contextual_query = generated_query.strip().replace("\"", "")
-                logger.info(f"✅ Contextual query: '{contextual_query}'")
+                contextual_query = clean_text(generated_query).replace('"', '').replace('「', '').replace('」', '')
+                logger.info(f"✅ Contextual query generated: '{contextual_query}'")
 
-        # (scrape_major_search_enginesはWeb検索を行う関数と仮定)
-        results = [{"snippet": f"「{contextual_query}」の検索結果が見つかりました。"}]
-        if not results:
-            search_result = f"「{contextual_query}」について調べたけど、情報が見つからなかったよ…！"
+        # ② 専門トピック検出
+        specialized_topic = detect_specialized_topic(contextual_query)
+        if specialized_topic:
+            logger.info(f"🎯 Detected specialized topic: {specialized_topic}")
+
+        # ③ Web検索実行
+        search_results = perform_web_search(contextual_query, specialized_topic)
+
+        # ④ 検索結果の処理
+        if not search_results:
+            search_result = f"「{contextual_query}」について調べたけど、情報が見つからなかったよ…！もう少し具体的に聞いてくれる？"
         else:
-            summary_text = "\n".join([res['snippet'] for res in results])
-            search_result = generate_ai_response(
-                {'name': 'ユーザー', 'uuid': ''}, # DUMMY
-                f"「{contextual_query}」について調べてきたよ。",
+            summary_text = "\n\n".join([
+                f"【{res['title']}】\n{res['snippet']}"
+                for res in search_results
+            ])
+            
+            # ⑤ AI要約生成（Llama使用）
+            logger.info("🧠 Generating AI summary with Llama...")
+            search_result = call_llama_advanced(
+                f"「{contextual_query}」について調べてきたよ！以下の情報をもちこ風にまとめて教えて。",
                 history,
-                reference_info=summary_text
+                f"あなたは「もちこ」です。以下の検索結果を基に、わかりやすく説明してください。\n\n{summary_text}"
             )
+            
+            if not search_result:
+                search_result = f"調べてきたよ！\n\n{summary_text[:500]}...\n\nって感じじゃん！"
 
+        # ⑥ タスク完了を保存
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task:
             task.result = search_result
             task.status = 'completed'
             task.completed_at = datetime.utcnow()
             session.commit()
-            logger.info(f"💾 Task {task_id} completed and saved.")
+            logger.info(f"✅ Task {task_id} completed successfully")
 
     except Exception as e:
         logger.error(f"❌ Background search failed for task {task_id}: {e}", exc_info=True)
+        try:
+            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+            if task:
+                task.result = "ごめん、検索中にエラーが起きちゃった…もう一回試してみて！"
+                task.status = 'failed'
+                task.completed_at = datetime.utcnow()
+                session.commit()
+        except:
+            pass
     finally:
         session.close()
 
 def start_background_search(user_uuid, query, history):
+    """バックグラウンド検索の開始"""
     session = Session()
     try:
         task_id = str(uuid.uuid4())
         task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, query=query)
         session.add(task)
         session.commit()
+        
+        # 履歴を渡してバックグラウンド実行
         background_executor.submit(background_deep_search, task_id, query, history)
+        logger.info(f"🚀 Background search started: {task_id}")
         return task_id
     except Exception as e:
         logger.error(f"❌ Failed to start background search: {e}")
@@ -302,21 +427,31 @@ def start_background_search(user_uuid, query, history):
     finally:
         session.close()
 
-
 # --- Flask エンドポイント ---
-
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     session = Session()
     try:
         data = request.json
-        user_uuid, user_name, message = data.get('uuid'), data.get('name'), data.get('message')
+        user_uuid = data.get('uuid')
+        user_name = data.get('name')
+        message = data.get('message')
 
-        user_data = {'uuid': user_uuid, 'name': user_name}
-        history = session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(5).all()
+        if not user_uuid or not message:
+            return jsonify({"type": "text", "message": "必要な情報が不足してるよ！"}), 400
+
+        user_data = {'uuid': user_uuid, 'name': user_name or 'ユーザー'}
+        history = session.query(ConversationHistory)\
+            .filter_by(user_uuid=user_uuid)\
+            .order_by(ConversationHistory.timestamp.desc())\
+            .limit(10).all()
+        history.reverse()  # 古い順に並べ替え
 
         response_data = {}
+        
+        # 検索が必要か判定
         if should_search(message):
+            logger.info(f"🔍 Search triggered for: {message}")
             task_id = start_background_search(user_uuid, message, history)
             if task_id:
                 response_data = {
@@ -325,46 +460,67 @@ def chat_lsl():
                     "message": "おっけー、調べてみるね！ちょっと待ってて！"
                 }
             else:
-                response_data = {"type": "text", "message": "ごめん、今検索機能がうまく動いてないみたい…"}
+                response_data = {
+                    "type": "text",
+                    "message": "ごめん、今検索機能がうまく動いてないみたい…普通に答えるね！"
+                }
+                ai_text = generate_ai_response(user_data, message, history)
+                response_data["message"] = ai_text
         else:
+            # 通常の会話
             ai_text = generate_ai_response(user_data, message, history)
             response_data = {"type": "text", "message": ai_text}
 
+        # 会話履歴を保存
         session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
         if response_data.get("message"):
-            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_data["message"]))
+            session.add(ConversationHistory(
+                user_uuid=user_uuid,
+                role='assistant',
+                content=response_data["message"]
+            ))
         session.commit()
 
         return jsonify(response_data)
 
     except Exception as e:
         logger.error(f"❌ Error in /chat_lsl: {e}", exc_info=True)
-        return jsonify({"type": "text", "message": "ごめん、サーバーでエラーが起きちゃった…"}), 500
+        return jsonify({
+            "type": "text",
+            "message": "ごめん、サーバーでエラーが起きちゃった…"
+        }), 500
     finally:
         session.close()
 
-# ★★★ 修正点: /check_task エンドポイントの追加 ★★★
 @app.route('/check_task', methods=['POST'])
 def check_task():
+    """タスクステータス確認エンドポイント"""
     session = Session()
     try:
         data = request.json
         task_id = data.get('task_id')
+        
         if not task_id:
             return jsonify({'status': 'error', 'message': 'task_idが必要です'}), 400
 
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
 
-        if task and task.status == 'completed':
-            # 完了したタスクをDBから削除して、再度ポーリングされないようにする
+        if not task:
+            return jsonify({'status': 'not_found'}), 404
+
+        if task.status == 'completed':
+            result = task.result
+            # 完了したタスクを削除
+            session.delete(task)
+            session.commit()
+            return jsonify({'status': 'completed', 'message': result})
+        elif task.status == 'failed':
             result = task.result
             session.delete(task)
             session.commit()
             return jsonify({'status': 'completed', 'message': result})
-        elif task:
-            return jsonify({'status': 'pending'})
         else:
-            return jsonify({'status': 'not_found'}), 404
+            return jsonify({'status': 'pending'})
 
     except Exception as e:
         logger.error(f"❌ Error in /check_task: {e}", exc_info=True)
@@ -372,26 +528,42 @@ def check_task():
     finally:
         session.close()
 
+@app.route('/health', methods=['GET'])
+def health():
+    """ヘルスチェック"""
+    return jsonify({
+        'status': 'healthy',
+        'gemini': gemini_model is not None,
+        'llama': groq_client is not None
+    })
+
 # --- アプリケーション初期化 ---
 def initialize_app():
     global engine, Session
-    logger.info("="*30 + " INITIALIZING MOCHIKO AI " + "="*30)
+    logger.info("=" * 30 + " INITIALIZING MOCHIKO AI " + "=" * 30)
+    
     initialize_gemini_client()
     initialize_groq_client()
+    
     try:
-        engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if 'sqlite' in DATABASE_URL else {})
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={'check_same_thread': False} if 'sqlite' in DATABASE_URL else {},
+            echo=False
+        )
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
         logger.info("✅ Database initialized successfully.")
     except Exception as e:
         logger.critical(f"🔥 Database initialization failed: {e}")
         sys.exit(1)
-    logger.info("="*30 + " INITIALIZATION COMPLETE " + "="*30)
+    
+    logger.info("=" * 30 + " INITIALIZATION COMPLETE " + "=" * 30)
 
 # --- メイン実行 ---
 if __name__ == '__main__':
     initialize_app()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
 else:
-    # for production server (gunicorn)
+    # Production server (gunicorn)
     initialize_app()
