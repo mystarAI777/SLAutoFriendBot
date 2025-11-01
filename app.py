@@ -1042,9 +1042,6 @@ def is_time_request(message):
 def is_weather_request(message):
     return any(keyword in message for keyword in ['天気', 'てんき', '気温', '雨', '晴れ', '曇り', '雪'])
 
-def is_hololive_request(message):
-    return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
-
 def is_recommendation_request(message):
     return any(keyword in message for keyword in ['おすすめ', 'オススメ', '推薦', '紹介して'])
 
@@ -1792,6 +1789,20 @@ def check_completed_tasks(user_uuid):
     finally:
         session.close()
     return None
+
+def get_or_create_user(session, uuid, name):
+    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
+    if user:
+        user.interaction_count += 1
+        user.last_interaction = datetime.utcnow()
+        if user.user_name != name: user.user_name = name
+    else:
+        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
+    session.add(user)
+    session.commit()
+    # ★ 修正: uuidを含める
+    return {'name': user.user_name, 'uuid': uuid}
+
 
 # ===== 【修正】background_deep_search 関数 =====
 # アニメ検索を追加
@@ -3151,6 +3162,7 @@ def get_stats():
 
 # --- アプリケーション初期化 ---
 
+# 【修正版】initialize_app 関数
 def initialize_app():
     global engine, Session, groq_client
     logger.info("=" * 60)
@@ -3160,8 +3172,8 @@ def initialize_app():
     try:
         logger.info("🚀 Step 1/6: Initializing Gemini...")
         initialize_gemini_client()
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"⚠️ Gemini initialization failed: {e}")
 
     try:
         logger.info("📡 Step 2/6: Initializing Groq client...")
@@ -3184,57 +3196,19 @@ def initialize_app():
         logger.critical(f"🔥 Database initialization failed: {e}")
         raise
 
-    # Groq初期化を呼び出し
-    try:
-        logger.info("📡 Step 1/5: Initializing Groq client...")
-        groq_client = initialize_groq_client()
-        if groq_client:
-            logger.info("✅ Groq client ready")
-        else:
-            logger.warning("⚠️ Groq client disabled - using fallback responses")
-    except Exception as e:
-        logger.warning(f"⚠️ Groq initialization failed but continuing: {e}")
-        groq_client = None
-
-    # データベースエンジン作成
-    try:
-        logger.info("🗄️ Step 2/5: Initializing database...")
-        engine = create_optimized_db_engine()
-        Base.metadata.create_all(engine)
-        Session = sessionmaker(bind=engine)
-        logger.info("✅ Database initialized successfully")
-    except Exception as e:
-        logger.critical(f"🔥 Database initialization failed: {e}")
-        raise  # データベースは必須なので例外を再スロー
-
-    # アプリ起動時にWikiを初期化
-    try:
-        logger.info("📚 Step 3/5: Initializing Wiki data...")
-        initialize_holomem_wiki()
-        populate_extended_holomem_wiki()
-        logger.info("✅ Wiki initialization complete")
-    except Exception as e:
-        logger.warning(f"⚠️ Wiki initialization failed but continuing: {e}")
-    
-    # ニュースデータのチェック
- session = Session()
+    # ニュースデータとメンバーデータのチェック
+    session = Session()
     try:
         logger.info("📰 Step 4/6: Checking news + member data...")
         holo_count = session.query(HololiveNews).count()
         member_count = session.query(HolomemWiki).count()
         
-        # ★ 初回起動時、またはメンバー情報が古い場合は更新
         if holo_count == 0 or member_count == 0:
             logger.info("🚀 First run: Scheduling Hololive news + members fetch...")
             background_executor.submit(update_hololive_news_database)
         else:
             logger.info(f"✅ Found {holo_count} Hololive news, {member_count} members")
-            
-            # メンバー情報が24時間以上古い場合は更新
-            latest_member = session.query(HolomemWiki).order_by(
-                HolomemWiki.last_updated.desc()
-            ).first()
-            
+            latest_member = session.query(HolomemWiki).order_by(HolomemWiki.last_updated.desc()).first()
             if latest_member and latest_member.last_updated < datetime.utcnow() - timedelta(hours=24):
                 logger.info("⏰ Member data is stale, scheduling update...")
                 background_executor.submit(update_hololive_news_database)
@@ -3253,12 +3227,9 @@ def initialize_app():
 
     try:
         logger.info("⏰ Step 5/6: Starting scheduler...")
-        
-        # ★ 変更: ホロライブニュース更新時にメンバー情報も更新
-        schedule.every().hour.do(update_hololive_news_database)  # ニュース + メンバー情報
+        schedule.every().hour.do(update_hololive_news_database)
         schedule.every(3).hours.do(update_all_specialized_news)
         schedule.every().day.at("02:00").do(cleanup_old_data_advanced)
-        # schedule.every().week.do(populate_extended_holomem_wiki)  # <-- 削除
         
         def run_scheduler():
             while True:
