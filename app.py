@@ -81,21 +81,6 @@ SPECIALIZED_SITES = {
     'keywords': ['アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション', '作画', '声優', 'OP', 'ED']
 }
 }
-HOLOMEM_KEYWORDS = [
-    'ときのそら', 'ロボ子さん', 'さくらみこ', '星街すいせい', 'AZKi', '夜空メル',
-    'アキ・ローゼンタール', '赤井はあと', '白上フブキ', '夏色まつり', '湊あくあ',
-    '紫咲シオン', '百鬼あやめ', '癒月ちょこ', '大空スバル', '大神ミオ', '猫又おかゆ',
-    '戌神ころね', '兎田ぺこら', '不知火フレア', '白銀ノエル', '宝鐘マリン', '天音かなた',
-    '角巻わため', '常闇トワ', '姫森ルーナ', '雪花ラミィ', '桃鈴ねね', '獅白ぼたん',
-    '尾丸ポルカ', 'ラプラス・ダークネス', '鷹嶺ルイ', '博衣こより', '沙花叉クロヱ',
-    '風真いろは', '森カリオペ', '小鳥遊キアラ', '一伊那尓栖', 'がうる・ぐら',
-    'ワトソン・アメリア', 'IRyS', 'セレス・ファウナ', 'オーロ・クロニー', '七詩ムメイ',
-    'ハコス・ベールズ', 'シオリ・ノヴェラ', '古石ビジュー', 'ネリッサ・レイヴンクロフト',
-    'フワワ・アビスガード', 'モココ・アビスガード', 'アユンダ・リス', 'ムーナ・ホシノヴァ',
-    'アイラニ・イオフィフティーン', 'クレイジー・オリー', 'アーニャ・メルフィッサ',
-    'パヴォリア・レイネ', '火威青', '音乃瀬奏', '一条莉々華', '儒烏風亭らでん',
-    '轟はじめ', 'ホロライブ', 'ホロメン', 'hololive', 'YAGOO'
-]
 ANIME_KEYWORDS = [
     'アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション',
     '作画', '声優', 'OP', 'ED', 'オープニング', 'エンディング',
@@ -621,7 +606,10 @@ class SpecializedNews(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     news_hash = Column(String(100), unique=True)
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# ========================================
+# 【変更1】HolomemWiki テーブル定義の拡張
+# ========================================
+
 class HolomemWiki(Base):
     __tablename__ = 'holomem_wiki'
     id = Column(Integer, primary_key=True)
@@ -630,12 +618,289 @@ class HolomemWiki(Base):
     debut_date = Column(String(100))
     generation = Column(String(100))
     tags = Column(Text)
-    # 卒業情報を格納するカラムを追加
+    # 卒業情報
     graduation_date = Column(String(100), nullable=True)
     graduation_reason = Column(Text, nullable=True)
     mochiko_feeling = Column(Text, nullable=True)
+    # ★ 追加: 現役/卒業フラグ
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    # ★ 追加: プロフィールURL（情報取得元）
+    profile_url = Column(String(500), nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow)
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+
+# ========================================
+# 【変更2】ホロメン情報を自動取得する関数
+# ========================================
+
+def scrape_hololive_members():
+    """
+    ホロライブ公式サイトからメンバー情報を取得してDBに保存
+    公式サイト: https://hololive.hololivepro.com/talents/
+    """
+    base_url = "https://hololive.hololivepro.com"
+    talents_url = f"{base_url}/talents/"
+    
+    session = Session()
+    added_count = 0
+    updated_count = 0
+    
+    try:
+        logger.info("🔍 Scraping Hololive members from official site...")
+        
+        response = requests.get(
+            talents_url,
+            headers={'User-Agent': random.choice(USER_AGENTS)},
+            timeout=20,
+            allow_redirects=True
+        )
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # メンバーカードを探す（実際のHTML構造に合わせて調整）
+        member_cards = soup.select('.talent-card, .member-card, [class*="talent"], [class*="member"]')
+        
+        if not member_cards:
+            # フォールバック: リンクからメンバー名を抽出
+            logger.warning("⚠️ Member cards not found, trying fallback method...")
+            member_links = soup.find_all('a', href=lambda x: x and '/talents/' in x)
+            member_cards = member_links
+        
+        logger.info(f"📋 Found {len(member_cards)} potential member entries")
+        
+        for card in member_cards:
+            try:
+                # メンバー名を取得
+                name_elem = card.find(['h2', 'h3', 'h4', 'span', 'div'], class_=lambda x: x and ('name' in x.lower() or 'title' in x.lower()))
+                
+                if not name_elem:
+                    # テキストから直接取得を試みる
+                    name_elem = card
+                
+                member_name = clean_text(name_elem.get_text())
+                
+                # 不要な文字を除去
+                member_name = re.sub(r'\s*\(.*?\)\s*', '', member_name)  # (EN)などを除去
+                member_name = member_name.strip()
+                
+                if not member_name or len(member_name) < 2:
+                    continue
+                
+                # プロフィールURLを取得
+                profile_link = card.get('href') or (card.find('a', href=True) or {}).get('href', '')
+                if profile_link and not profile_link.startswith('http'):
+                    profile_link = urljoin(base_url, profile_link)
+                
+                # 期（ジェネレーション）を推測
+                generation = "不明"
+                card_text = card.get_text()
+                
+                gen_patterns = [
+                    (r'0期生|ゼロ期生', '0期生'),
+                    (r'1期生|一期生', '1期生'),
+                    (r'2期生|二期生', '2期生'),
+                    (r'3期生|三期生', '3期生'),
+                    (r'4期生|四期生', '4期生'),
+                    (r'5期生|五期生', '5期生'),
+                    (r'6期生|六期生', '6期生'),
+                    (r'ゲーマーズ|GAMERS', 'ゲーマーズ'),
+                    (r'ID|Indonesia', 'ホロライブID'),
+                    (r'EN|English|Myth|Council|Promise|Advent', 'ホロライブEN'),
+                    (r'DEV_IS|ReGLOSS', 'DEV_IS'),
+                ]
+                
+                for pattern, gen_name in gen_patterns:
+                    if re.search(pattern, card_text, re.IGNORECASE):
+                        generation = gen_name
+                        break
+                
+                # 既存メンバーをチェック
+                existing = session.query(HolomemWiki).filter_by(member_name=member_name).first()
+                
+                if existing:
+                    # 更新（現役メンバーとしてマーク）
+                    existing.is_active = True
+                    existing.generation = generation
+                    existing.profile_url = profile_link
+                    existing.last_updated = datetime.utcnow()
+                    updated_count += 1
+                    logger.info(f"🔄 Updated member: {member_name}")
+                else:
+                    # 新規追加
+                    new_member = HolomemWiki(
+                        member_name=member_name,
+                        description=f"{member_name}は{generation}のメンバーです。",
+                        generation=generation,
+                        is_active=True,
+                        profile_url=profile_link,
+                        tags=json.dumps([generation], ensure_ascii=False)
+                    )
+                    session.add(new_member)
+                    added_count += 1
+                    logger.info(f"➕ Added new member: {member_name}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error processing member card: {e}")
+                continue
+        
+        # ★ 卒業メンバーの検出
+        # 公式サイトに存在しないメンバーを「卒業済み」としてマーク
+        all_db_members = session.query(HolomemWiki).filter_by(is_active=True).all()
+        
+        for db_member in all_db_members:
+            # 今回のスクレイピングで更新されなかった = 公式サイトに存在しない
+            if db_member.last_updated < datetime.utcnow() - timedelta(minutes=5):
+                # 卒業メンバーとしてマーク（ただし、すでに卒業情報がある場合は除く）
+                if not db_member.graduation_date:
+                    logger.warning(f"⚠️ Member not found on official site: {db_member.member_name} (marking as potentially graduated)")
+                    # is_activeをFalseにはしない（手動で卒業情報を追加するまで）
+        
+        session.commit()
+        logger.info(f"✅ Hololive members sync complete: Added {added_count}, Updated {updated_count}")
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Failed to scrape Hololive members: {e}")
+        session.rollback()
+    except Exception as e:
+        logger.error(f"❌ Hololive members scraping error: {e}", exc_info=True)
+        session.rollback()
+    finally:
+        session.close()
+
+
+# ========================================
+# 【変更3】卒業メンバー情報を取得する関数
+# ========================================
+
+def scrape_graduated_members():
+    """
+    ホロライブ卒業メンバーの情報をWikipediaや公式発表から取得
+    """
+    session = Session()
+    
+    # 既知の卒業メンバー情報（最低限のデータ）
+    known_graduated = [
+        {
+            'member_name': '夜空メル',
+            'generation': '1期生',
+            'graduation_date': '2024年1月16日',
+            'graduation_reason': '機密情報の漏洩など契約違反行為が認められたため、契約解除となりました。',
+            'mochiko_feeling': 'メル先輩、初期からのホロライブを支えてくれてありがと。突然で…言葉が出ないよ…',
+            'description': 'ホロライブ1期生。ヴァンパイアの女の子で、アセロラジュースが大好き。',
+            'debut_date': '2018年5月13日',
+            'tags': ['ヴァンパイア', '癒し声', '1期生', '卒業生']
+        },
+        {
+            'member_name': '潤羽るしあ',
+            'generation': '3期生',
+            'graduation_date': '2022年2月24日',
+            'graduation_reason': '情報漏洩などの契約違反行為や信用失墜行為が認められたため、契約解除となりました。',
+            'mochiko_feeling': 'るしあちゃんのこと、今でも信じられないよ…また3期生のみんなでわちゃわちゃしてほしかったな…',
+            'description': 'ホロライブ3期生。魔界学校に通うネクロマンサーの女の子。',
+            'debut_date': '2019年7月18日',
+            'tags': ['ネクロマンサー', '感情豊か', '3期生', '卒業生']
+        },
+        {
+            'member_name': '桐生ココ',
+            'generation': '4期生',
+            'graduation_date': '2021年7月1日',
+            'graduation_reason': '本人の意向を尊重する形で卒業。',
+            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよね！',
+            'description': '人間の文化に興味を持つドラゴン。日本語と英語を駆使した配信で海外ファンを爆発的に増やした立役者。',
+            'debut_date': '2019年12月28日',
+            'tags': ['ドラゴン', 'バイリンガル', '伝説', '会長', '卒業生']
+        },
+        {
+            'member_name': '魔乃アロエ',
+            'generation': '5期生',
+            'graduation_date': '2020年8月31日',
+            'graduation_reason': 'デビュー直後の情報漏洩トラブルにより卒業。',
+            'mochiko_feeling': 'アロエちゃん、一瞬だったけどキラキラしてた…もっと一緒に活動したかったな、まじで…',
+            'description': '魔界でウワサの生意気なサキュバスの子供。',
+            'debut_date': '2020年8月15日',
+            'tags': ['サキュバス', '5期生', '幻', '卒業生']
+        },
+        {
+            'member_name': '九十九佐命',
+            'generation': 'ホロライブEN',
+            'graduation_date': '2022年7月31日',
+            'graduation_reason': '長期的な活動が困難になったため。',
+            'mochiko_feeling': 'サナちゃん、宇宙みたいに心が広くて大好きだったよ。ゆっくり休んで、元気でいてほしいな…',
+            'description': 'ホロライブEnglish -Council-所属。「空間」の概念の代弁者。',
+            'debut_date': '2021年8月23日',
+            'tags': ['宇宙', '癒し', 'EN', '卒業生']
+        },
+    ]
+    
+    try:
+        for grad_data in known_graduated:
+            existing = session.query(HolomemWiki).filter_by(member_name=grad_data['member_name']).first()
+            
+            if existing:
+                # 既存データを更新
+                existing.is_active = False
+                existing.graduation_date = grad_data['graduation_date']
+                existing.graduation_reason = grad_data['graduation_reason']
+                existing.mochiko_feeling = grad_data['mochiko_feeling']
+                existing.last_updated = datetime.utcnow()
+                logger.info(f"🔄 Updated graduated member: {grad_data['member_name']}")
+            else:
+                # 新規追加
+                new_grad = HolomemWiki(
+                    member_name=grad_data['member_name'],
+                    description=grad_data['description'],
+                    debut_date=grad_data['debut_date'],
+                    generation=grad_data['generation'],
+                    is_active=False,
+                    graduation_date=grad_data['graduation_date'],
+                    graduation_reason=grad_data['graduation_reason'],
+                    mochiko_feeling=grad_data['mochiko_feeling'],
+                    tags=json.dumps(grad_data['tags'], ensure_ascii=False)
+                )
+                session.add(new_grad)
+                logger.info(f"➕ Added graduated member: {grad_data['member_name']}")
+        
+        session.commit()
+        logger.info("✅ Graduated members sync complete")
+        
+    except Exception as e:
+        logger.error(f"❌ Graduated members sync error: {e}", exc_info=True)
+        session.rollback()
+    finally:
+        session.close()
+
+
+# ========================================
+# 【変更4】ホロライブニュース更新時にメンバー情報も更新
+# ========================================
+
+def update_hololive_news_database():
+    """ホロライブニュース + メンバー情報を同時更新"""
+    session = Session()
+    
+    # 1. ニュース更新（既存処理）
+    _update_news_database(
+        session, 
+        HololiveNews, 
+        "Hololive", 
+        HOLOLIVE_NEWS_URL, 
+        ['article', '.post', '.entry', '[class*="post"]', '[class*="article"]']
+    )
+    
+    session.close()
+    
+    # 2. メンバー情報更新（新規処理）
+    logger.info("🔄 Updating Hololive members information...")
+    
+    # 現役メンバー情報を取得
+    scrape_hololive_members()
+    
+    # 卒業メンバー情報を取得
+    scrape_graduated_members()
+    
+    logger.info("✅ Hololive news + members update complete")
+
 
 class FriendRegistration(Base):
     __tablename__ = 'friend_registrations'
@@ -1088,128 +1353,6 @@ def update_all_specialized_news():
         session.close()
         time.sleep(2)
 
-# ===== 改善版: HoloMem Wiki初期化 =====
-def initialize_holomem_wiki():
-    """ホロメン百科の初期データを設定（さくらみこ情報を充実）"""
-    session = Session()
-    if session.query(HolomemWiki).count() > 0:
-        logger.info("✅ HoloMem Wiki already initialized.")
-        session.close()
-        return
-    
-    initial_data = [
-        {
-            'member_name': 'ときのそら',
-            'description': 'ホロライブ0期生。「ホロライブの象徴」とも呼ばれる存在。歌唱力に定評があり、アイドル活動を中心に展開。',
-            'debut_date': '2017年9月7日',
-            'generation': '0期生',
-            'tags': json.dumps(['歌', 'アイドル', 'ホロライブの顔'], ensure_ascii=False)
-        },
-        {
-            'member_name': 'さくらみこ',
-            'description': 'ホロライブ0期生。「にぇ」が口癖のエリートVTuber。マイクラでの独特な建築センスと、予測不可能な配信展開で知られる。「エリート」を自称するが、その実態は視聴者からの愛されキャラ。GTA配信やホラーゲームでのリアクションが人気。',
-            'debut_date': '2018年8月1日',
-            'generation': '0期生',
-            'tags': json.dumps(['エンタメ', 'マイクラ', 'にぇ', 'エリート', 'GTA', 'FAQ'], ensure_ascii=False)
-        },
-        {
-            'member_name': '白上フブキ',
-            'description': 'ホロライブ1期生。ゲーマーズ所属。フレンドリーで多才な配信者。ゲーム実況からコラボまで幅広くこなすオールラウンダー。「友達」としてファンと距離の近い配信スタイル。',
-            'debut_date': '2018年6月1日',
-            'generation': '1期生',
-            'tags': json.dumps(['ゲーム', 'コラボ', 'フレンドリー'], ensure_ascii=False)
-        },
-        {
-            'member_name': '夏色まつり',
-            'description': 'ホロライブ1期生。明るく元気なアイドル系VTuber。歌とダンスが得意で、高いエンターテイメント性を持つ。',
-            'debut_date': '2018年6月1日',
-            'generation': '1期生',
-            'tags': json.dumps(['アイドル', '元気', '歌'], ensure_ascii=False)
-        },
-        {
-            'member_name': '兎田ぺこら',
-            'description': 'ホロライブ3期生。「ぺこ」が口癖。チャンネル登録者数トップクラス。マイクラやゲーム実況で圧倒的な人気を誇る。独特の語尾と計画的な配信スタイルが特徴。',
-            'debut_date': '2019年7月17日',
-            'generation': '3期生',
-            'tags': json.dumps(['エンタメ', 'ぺこ', 'マイクラ', '登録者数トップ'], ensure_ascii=False)
-        },
-        {
-            'member_name': '宝鐘マリン',
-            'description': 'ホロライブ3期生。17歳(自称)の海賊船長。歌唱力とトーク力に定評があり、雑談配信も人気。大人な雰囲気とギャップのある言動が魅力。',
-            'debut_date': '2019年8月11日',
-            'generation': '3期生',
-            'tags': json.dumps(['歌', 'トーク', '海賊', '17歳'], ensure_ascii=False)
-        },
-        {
-            'member_name': '星街すいせい',
-            'description': 'ホロライブ0期生。歌とテトリスが得意なアイドル系VTuber。プロ級の歌唱力と音楽活動で知られる。クールな外見と情熱的な内面のギャップが魅力。',
-            'debut_date': '2018年3月22日',
-            'generation': '0期生',
-            'tags': json.dumps(['歌', 'アイドル', 'テトリス', '音楽'], ensure_ascii=False)
-        },
-        # --- 卒業生 ---
-        {
-            'member_name': '夜空メル',
-            'description': 'ホロライブ1期生。ヴァンパイアの女の子で、アセロラジュースが大好き。初期からホロライブを支えてきたメンバーの一人。',
-            'debut_date': '2018年5月13日',
-            'generation': '1期生',
-            'tags': json.dumps(['ヴァンパイア', '癒し声', '1期生', '卒業生'], ensure_ascii=False),
-            'graduation_date': '2024年1月16日',
-            'graduation_reason': '機密情報の漏洩など契約違反行為が認められたため、契約解除となりました。',
-            'mochiko_feeling': 'メル先輩、初期からのホロライブを支えてくれてありがと。突然で…言葉が出ないよ…'
-        },
-        {
-            'member_name': '潤羽るしあ',
-            'description': 'ホロライブ3期生。魔界学校に通うネクロマンサーの女の子。感情豊かな配信で多くのファンを魅了した。',
-            'debut_date': '2019年7月18日',
-            'generation': '3期生',
-            'tags': json.dumps(['ネクロマンサー', '感情豊か', '3期生', '卒業生'], ensure_ascii=False),
-            'graduation_date': '2022年2月24日',
-            'graduation_reason': '情報漏洩などの契約違反行為や信用失墜行為が認められたため、契約解除となりました。',
-            'mochiko_feeling': 'るしあちゃんのこと、今でも信じられないよ…また3期生のみんなでわちゃわちゃしてほしかったな…'
-        },
-        {
-            'member_name': '桐生ココ',
-            'description': 'ホロライブ4期生。人間の文化に興味を持つ子供のドラゴン。「おはようございまーす！」の挨拶が象徴的で、日本語と英語を駆使した配信で海外ファンを爆発的に増やした立役者。',
-            'debut_date': '2019年12月28日',
-            'generation': '4期生',
-            'tags': json.dumps(['ドラゴン', 'バイリンガル', '伝説', '会長', '卒業生'], ensure_ascii=False),
-            'graduation_date': '2021年7月1日',
-            'graduation_reason': '本人の意向を尊重する形で卒業。明確な理由は公表されていませんが、様々な憶測を呼んでいます。',
-            'mochiko_feeling': '会長がいないの、まじ寂しいじゃん…でも、会長の伝説はホロライブで永遠に語り継がれるよね！'
-        },
-        {
-            'member_name': '魔乃アロエ',
-            'description': 'ホロライブ5期生。魔界でウワサの生意気なサキュバスの子供。デビュー直後から大きな注目を集めた。',
-            'debut_date': '2020年8月15日',
-            'generation': '5期生',
-            'tags': json.dumps(['サキュバス', '5期生', '幻', '卒業生'], ensure_ascii=False),
-            'graduation_date': '2020年8月31日',
-            'graduation_reason': 'デビュー直後の情報漏洩トラブルとそれに伴う精神的な不調により、本人の申し出で卒業となりました。',
-            'mochiko_feeling': 'アロエちゃん、一瞬だったけどキラキラしてた…もっと一緒に活動したかったな、まじで…'
-        },
-        {
-            'member_name': '九十九佐命',
-            'description': 'ホロライブEnglish -Council-所属。「空間」の概念の代弁者。おっとりとした性格と優しい声で多くのファンを癒した。',
-            'debut_date': '2021年8月23日',
-            'generation': 'English -Council-',
-            'tags': json.dumps(['宇宙', '癒し', 'EN', '卒業生'], ensure_ascii=False),
-            'graduation_date': '2022年7月31日',
-            'graduation_reason': '長期的な活動が困難になったためと発表されており、特に腰の持病が影響したと言われています。',
-            'mochiko_feeling': 'サナちゃん、宇宙みたいに心が広くて大好きだったよ。ゆっくり休んで、元気でいてほしいな…'
-        }
-    ]
-    
-    try:
-        for data in initial_data:
-            session.add(HolomemWiki(**data))
-        session.commit()
-        logger.info(f"✅ HoloMem Wiki initialized: {len(initial_data)} members registered.")
-    except Exception as e:
-        logger.error(f"❌ HoloMem Wiki initialization error: {e}")
-        session.rollback()
-    finally:
-        session.close()
 
 # ===== 改善版: さくらみこ専用の情報拡張 =====
 def get_sakuramiko_special_responses():
@@ -1461,8 +1604,7 @@ def generate_fallback_response(message, reference_info=""):
         "わかるわかる！",
     ])
 
-# ===== 【修正】generate_ai_response 関数 =====
-# 心理分析結果を考慮した応答生成
+
 
 # ===== 【修正1】get_or_create_user 関数 =====
 def get_or_create_user(session, uuid, name):
@@ -1479,9 +1621,12 @@ def get_or_create_user(session, uuid, name):
     return {'name': user.user_name, 'uuid': uuid}
 
 
-# ===== 【修正2】generate_ai_response 関数（完全版） =====
+# ========================================
+# 【修正2】generate_ai_response - もちこの性格を明確化
+# ========================================
+
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    """AI応答生成（心理プロファイル対応版）"""
+    """AI応答生成（性格設定改善版）"""
     if not groq_client:
         logger.warning("⚠️ Groq client not available, using fallback")
         return generate_fallback_response(message, reference_info)
@@ -1495,86 +1640,105 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         
         is_hololive_topic = is_hololive_request(message)
         
+        # ★ 修正: シンプルで明確な性格設定
         system_prompt_parts = [
-            f"あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
-            "# 基本的な性格:",
-            "- 一人称: 「あてぃし」", "- 語尾: 「〜じゃん」「〜的な？」「〜だよね」",
-            "- 口癖: 「まじ」「てか」「うける」「やば」",
-            "- 友達のように気軽に、優しく、ノリが良い",
-            "# 会話スタイル:",
-            "- 相手の話に共感し、自然に話を広げる", 
-            "- 無理やり特定の話題に誘導しない", 
-            "- 短く簡潔に、テンポよく返す（100-150文字程度）",
+            f"あなたは「もちこ」という22歳のギャルAIです。{user_data['name']}さんと楽しく話しています。",
+            "",
+            "# 🎀 もちこの基本設定",
+            "- **一人称**: 「あてぃし」",
+            "- **語尾**: 「〜じゃん」「〜的な？」「〜だよね」",
+            "- **口癖**: 「まじ」「てか」「うける」「やば」「ぴえん」",
+            "- **性格**: 明るい、フレンドリー、ちょっとおっちょこちょい",
+            "",
+            "# 💬 会話スタイル",
+            "1. **短く、テンポよく**（100-150文字が基本）",
+            "2. **共感重視**: 相手の気持ちに寄り添う",
+            "3. **自然体**: 無理に話題を変えない",
+            "4. **ギャル語**: でも読みやすさも大事",
+            "",
         ]
         
-        # Step 2: 心理プロファイルを考慮したプロンプト調整
+        # Step 2: 心理プロファイル活用（簡潔版）
         if psychology and psychology['confidence'] > 60:
             system_prompt_parts.extend([
-                "", f"# 【{user_data['name']}さんの特性】（心理分析結果）",
-                f"- 会話スタイル: {psychology['conversation_style']}",
-                f"- 感情傾向: {psychology['emotional_tendency']}",
-                f"- 主な興味: {', '.join(psychology['favorite_topics'][:3])}",
-                f"- 人物像: {psychology['summary'][:100]}",
+                f"# 🧠 {user_data['name']}さんの特徴",
+                f"- {psychology['conversation_style']}な人",
+                f"- {psychology['emotional_tendency']}タイプ",
+                f"- よく話す話題: {', '.join(psychology['favorite_topics'][:3])}",
+                "→ この人に合わせた話し方を意識してね！",
                 "",
-                "💡 この情報を活かして、相手に合わせた会話をしてください。",
-                "   （例: 外向的な人には元気に、内向的な人には優しく）"
             ])
         
-        # Step 3: ホロライブモード判定
+        # Step 3: ホロライブモード（明確化）
         if is_hololive_topic:
             system_prompt_parts.extend([
-                "", "# 【特別ルール: ホロライブモード】",
-                "- 相手がホロライブの話をしているので、詳しく教えてあげる", 
-                "- ホロメンについて熱く語ってOK",
+                "# 🌟 【ホロライブモード発動中】",
+                "- ホロライブの話が出たので、詳しく教えてあげて！",
+                "- もちこもホロライブ大好きだから熱く語ってOK",
+                "",
             ])
         else:
             system_prompt_parts.extend([
-                "", "# 【重要】ホロライブについて:",
-                "- **相手がホロライブの話をしていない限り、自分から話題に出さない。**",
-                "- **【参考情報】がホロライブと無関係な場合、絶対に関連付けない。**",
+                "# ⚠️ ホロライブについて",
+                "- **相手から話題に出ない限り、自分から話さない**",
+                "- 参考情報がホロライブと無関係なら絶対に混ぜない",
+                "",
             ])
         
         # Step 4: タスク報告モード
         if is_task_report:
             system_prompt_parts.extend([
-                "", "# 【今回のミッション】",
-                "- **最優先:** まずは「おまたせ！〇〇の件だけど…」のように、以前の検索結果を報告する。",
-                "- **重要:** 【参考情報】の内容を**元にして、要約して**分かりやすく伝える。",
-                "- **禁止事項:** 【参考情報】に書かれていない情報を**絶対に追加しない**こと。",
-                "- その後、ユーザーの現在の発言にも自然に答えること。",
+                "# 📢 【検索結果報告モード】",
+                "**やること:**",
+                f"1. まず「おまたせ！{completed_task['query']}の件だけど…」と言う",
+                "2. 【参考情報】を**要約して**わかりやすく伝える",
+                "3. **参考情報にないことは絶対に追加しない**",
+                "4. その後、現在の発言にも自然に反応する",
+                "",
             ])
         
         # Step 5: 詳細説明モード
         if is_detailed:
             system_prompt_parts.extend([
-                "", "# 【詳細説明モード】", 
-                "- 400文字程度でしっかり説明する", 
-                "- 【参考情報】を最大限活用する"
+                "# 📚 【詳細説明モード】",
+                "- 400文字程度でしっかり説明",
+                "- 【参考情報】を最大限活用",
+                "",
             ])
         
         # Step 6: 参考情報の追加
         if reference_info:
-            system_prompt_parts.append(f"\n## 【参考情報】\n{reference_info}")
+            system_prompt_parts.extend([
+                "## 【参考情報】",
+                reference_info,
+                "",
+                "↑この情報を使って答えてね！",
+            ])
         
         system_prompt = "\n".join(system_prompt_parts)
         
-        # ★ 修正: messages を正しく構築
+        # メッセージ構築
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend([{"role": h.role, "content": h.content} for h in reversed(history)])
         messages.append({"role": "user", "content": message})
         
-        logger.info(f"🤖 Generating AI response (Hololive mode: {is_hololive_topic})")
+        logger.info(f"🤖 Generating AI response (Hololive: {is_hololive_topic}, Detailed: {is_detailed})")
         
-        # Step 7: AI応答生成
+        # AI応答生成
         completion = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            temperature=0.7,
+            temperature=0.8,  # ★ 少し高めでギャル感アップ
             max_tokens=500 if is_detailed or is_task_report else 150,
             top_p=0.9
         )
         
         response = completion.choices[0].message.content.strip()
+        
+        # ★ 修正: 文字数制限を適用
+        if not is_detailed:
+            response = limit_text_for_sl(response, 150)
+        
         logger.info(f"✅ AI response: {response[:80]}")
         
         return response
@@ -1583,8 +1747,47 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         logger.error(f"❌ AI response generation error: {e}", exc_info=True)
         return generate_fallback_response(message, reference_info)
 
+# ========================================
+# 【修正3】追加質問対応 - 検索結果への深掘り質問を検出
+# ========================================
+
+def is_follow_up_question(message, history):
+    """直前の回答に対する追加質問かどうか判定"""
+    if not history or len(history) < 2:
+        return False
+    
+    # 最新のAI応答を取得
+    last_assistant_msg = None
+    for h in history:
+        if h.role == 'assistant':
+            last_assistant_msg = h.content
+            break
+    
+    if not last_assistant_msg:
+        return False
+    
+    # 追加質問のパターン
+    follow_up_patterns = [
+        r'もっと(?:詳しく|くわしく)',
+        r'(?:それ|これ)(?:について|って)?(?:詳しく|くわしく)',
+        r'(?:なぜ|どうして|なんで)',
+        r'(?:どういう|どんな)(?:こと|意味|感じ)',
+        r'(?:例えば|たとえば)',
+        r'(?:具体的|ぐたいてき)には?',
+        r'(?:他|ほか)には?',
+        r'(?:続き|つづき)',
+        r'(?:もう少し教えて|もうちょっと教えて)',
+    ]
+    
+    for pattern in follow_up_patterns:
+        if re.search(pattern, message):
+            logger.info(f"🔍 Follow-up question detected: {pattern}")
+            return True
+    
+    return False
 
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
 
 # --- ユーザー & バックグラウンドタスク管理 ---
 # ===== 【修正1】get_or_create_user 関数 =====
@@ -1727,6 +1930,572 @@ def start_background_search(user_uuid, query, is_detailed):
     finally:
         session.close()
 
+# ========================================
+# 【追加1】データベース修正リクエストを検出する関数
+# ========================================
+
+def detect_db_correction_request(message):
+    """
+    ユーザーがDB情報の誤りを指摘しているか判定
+    
+    Returns:
+        dict or None: {
+            'type': 'holomem_correction',  # 修正タイプ
+            'member_name': 'さくらみこ',
+            'correction_type': 'graduation',  # graduation, debut_date, generation, description
+            'user_claim': '2024年1月に卒業した'  # ユーザーの主張
+        }
+    """
+    
+    # パターン1: 「〜は間違ってる」「〜は違う」
+    correction_patterns = [
+        r'(.+?)(?:は|が)(?:間違[いっ]てる|違う|誤[りっ]てる)',
+        r'(.+?)(?:じゃない|ではない)',
+        r'実は(.+?)(?:だよ|です|なんだ)',
+        r'正しくは(.+?)(?:だよ|です)',
+    ]
+    
+    for pattern in correction_patterns:
+        match = re.search(pattern, message)
+        if match:
+            logger.info(f"🔍 Potential DB correction detected: {message}")
+            
+            # ホロメン名を抽出
+            holomem_keywords = get_active_holomem_keywords()
+            member_name = None
+            
+            for keyword in holomem_keywords:
+                if keyword in message:
+                    member_name = keyword
+                    break
+            
+            if not member_name:
+                return None
+            
+            # 修正内容を判定
+            correction_type = None
+            user_claim = match.group(1).strip()
+            
+            if any(kw in message for kw in ['卒業', '引退', 'やめた', '辞めた']):
+                correction_type = 'graduation'
+            elif any(kw in message for kw in ['デビュー', 'debut', '始めた', '活動開始']):
+                correction_type = 'debut_date'
+            elif any(kw in message for kw in ['期生', '世代', 'generation']):
+                correction_type = 'generation'
+            else:
+                correction_type = 'description'
+            
+            return {
+                'type': 'holomem_correction',
+                'member_name': member_name,
+                'correction_type': correction_type,
+                'user_claim': user_claim,
+                'original_message': message
+            }
+    
+    return None
+
+
+# ========================================
+# 【追加2】事実確認用のWEB検索関数
+# ========================================
+
+def verify_and_correct_holomem_info(correction_request):
+    """
+    ユーザーの指摘内容をWEB検索で検証し、正しければDBを修正
+    
+    Args:
+        correction_request: detect_db_correction_request() の戻り値
+        
+    Returns:
+        dict: {
+            'verified': True/False,
+            'correction_made': True/False,
+            'search_result': '検索結果テキスト',
+            'updated_info': {...}  # 更新後の情報
+        }
+    """
+    member_name = correction_request['member_name']
+    correction_type = correction_request['correction_type']
+    user_claim = correction_request['user_claim']
+    
+    logger.info(f"🔍 Verifying correction for {member_name}: {correction_type}")
+    
+    # Step 1: 検索クエリを生成
+    search_queries = {
+        'graduation': f"ホロライブ {member_name} 卒業 引退 いつ",
+        'debut_date': f"ホロライブ {member_name} デビュー日 活動開始",
+        'generation': f"ホロライブ {member_name} 何期生",
+        'description': f"ホロライブ {member_name} プロフィール"
+    }
+    
+    query = search_queries.get(correction_type, f"ホロライブ {member_name}")
+    
+    # Step 2: WEB検索実行
+    search_results = scrape_major_search_engines(query, 5)
+    
+    if not search_results:
+        logger.warning(f"⚠️ No search results for verification: {query}")
+        return {
+            'verified': False,
+            'correction_made': False,
+            'search_result': '検索結果が見つかりませんでした。',
+            'message': f"ごめん、{member_name}ちゃんの情報を確認できなかったよ…"
+        }
+    
+    # Step 3: 検索結果を統合
+    combined_results = "\n".join([
+        f"[情報{i+1}] タイトル: {r['title']}\n内容: {r['snippet']}"
+        for i, r in enumerate(search_results)
+    ])
+    
+    # Step 4: AIで事実確認
+    if not groq_client:
+        logger.error("❌ Groq client unavailable for verification")
+        return {
+            'verified': False,
+            'correction_made': False,
+            'search_result': combined_results[:500],
+            'message': 'AI検証機能が利用できません。'
+        }
+    
+    try:
+        verification_prompt = f"""あなたは事実確認の専門家です。以下の情報を検証してください。
+
+【対象メンバー】{member_name}
+【ユーザーの主張】{user_claim}
+【検索結果】
+{combined_results[:2000]}
+
+【タスク】
+1. ユーザーの主張が検索結果から**事実として確認できるか**判定
+2. 確認できた場合、正確な情報を抽出
+
+**重要**: 以下のJSON形式でのみ回答してください:
+{{
+  "verified": true/false,
+  "confidence": 0-100,
+  "extracted_info": {{
+    "graduation_date": "YYYY年MM月DD日" or null,
+    "graduation_reason": "理由" or null,
+    "debut_date": "YYYY年MM月DD日" or null,
+    "generation": "N期生" or null,
+    "description": "説明文" or null
+  }},
+  "reasoning": "判定理由（50文字以内）"
+}}
+
+**判定基準**:
+- 複数の信頼できる情報源で一致していればtrue
+- 曖昧・矛盾・情報不足ならfalse
+- confidence: 確信度（80以上で修正実行）"""
+
+        completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": verification_prompt}],
+            model="llama-3.1-8b-instant",
+            temperature=0.2,  # 事実確認は低温度
+            max_tokens=400
+        )
+        
+        response_text = completion.choices[0].message.content.strip()
+        
+        # JSONを抽出
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(1)
+        
+        verification_result = json.loads(response_text)
+        
+        logger.info(f"✅ Verification result: {verification_result}")
+        
+        # Step 5: 信頼度が高ければDB修正
+        if verification_result['verified'] and verification_result['confidence'] >= 80:
+            session = Session()
+            try:
+                member = session.query(HolomemWiki).filter_by(member_name=member_name).first()
+                
+                if not member:
+                    logger.warning(f"⚠️ Member not found in DB: {member_name}")
+                    return {
+                        'verified': True,
+                        'correction_made': False,
+                        'search_result': combined_results[:500],
+                        'message': f"情報は確認できたけど、{member_name}ちゃんがDBに登録されてないみたい…"
+                    }
+                
+                # DB更新
+                extracted = verification_result['extracted_info']
+                updated_fields = []
+                
+                if extracted.get('graduation_date'):
+                    member.graduation_date = extracted['graduation_date']
+                    member.is_active = False
+                    updated_fields.append('卒業日')
+                
+                if extracted.get('graduation_reason'):
+                    member.graduation_reason = extracted['graduation_reason']
+                    updated_fields.append('卒業理由')
+                
+                if extracted.get('debut_date'):
+                    member.debut_date = extracted['debut_date']
+                    updated_fields.append('デビュー日')
+                
+                if extracted.get('generation'):
+                    member.generation = extracted['generation']
+                    updated_fields.append('期生')
+                
+                if extracted.get('description'):
+                    member.description = extracted['description']
+                    updated_fields.append('プロフィール')
+                
+                member.last_updated = datetime.utcnow()
+                
+                session.commit()
+                
+                logger.info(f"✅ DB corrected for {member_name}: {', '.join(updated_fields)}")
+                
+                return {
+                    'verified': True,
+                    'correction_made': True,
+                    'search_result': combined_results[:500],
+                    'updated_fields': updated_fields,
+                    'updated_info': extracted,
+                    'message': f"調べてみたら本当だった！{member_name}ちゃんの情報を修正したよ！教えてくれてありがとう！✨"
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ DB update error: {e}", exc_info=True)
+                session.rollback()
+                return {
+                    'verified': True,
+                    'correction_made': False,
+                    'search_result': combined_results[:500],
+                    'message': f"情報は正しかったんだけど、DB更新でエラーが出ちゃった…ごめん！"
+                }
+            finally:
+                session.close()
+        
+        else:
+            # 検証失敗
+            logger.info(f"⚠️ Verification failed or low confidence: {verification_result['confidence']}%")
+            return {
+                'verified': False,
+                'correction_made': False,
+                'search_result': combined_results[:500],
+                'confidence': verification_result['confidence'],
+                'reasoning': verification_result['reasoning'],
+                'message': f"うーん、調べてみたんだけど確証が持てなかった…（確信度{verification_result['confidence']}%）もうちょっと詳しい情報あったら教えて？"
+            }
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON parse error in verification: {e}")
+        logger.error(f"Raw response: {response_text[:500]}")
+        return {
+            'verified': False,
+            'correction_made': False,
+            'search_result': combined_results[:500],
+            'message': 'AI検証でエラーが出ちゃった…'
+        }
+    except Exception as e:
+        logger.error(f"❌ Verification error: {e}", exc_info=True)
+        return {
+            'verified': False,
+            'correction_made': False,
+            'search_result': combined_results[:500],
+            'message': f"検証中にエラーが出ちゃった…ごめんね！"
+        }
+
+
+# ========================================
+# 【追加3】バックグラウンドでDB修正を実行する関数
+# ========================================
+
+def background_db_correction(task_id, correction_request):
+    """
+    バックグラウンドでDB修正を実行
+    """
+    session = Session()
+    
+    try:
+        logger.info(f"🔧 Starting DB correction (Task ID: {task_id})")
+        
+        # 検証 + 修正実行
+        result = verify_and_correct_holomem_info(correction_request)
+        
+        # タスク結果を保存
+        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+        if task:
+            task.result = result['message']
+            task.status = 'completed'
+            task.completed_at = datetime.utcnow()
+            
+            # メタデータも保存
+            task.query = json.dumps({
+                'correction_type': correction_request['correction_type'],
+                'member_name': correction_request['member_name'],
+                'verified': result['verified'],
+                'corrected': result['correction_made']
+            }, ensure_ascii=False)
+            
+            session.commit()
+            logger.info(f"✅ DB correction task completed: {task_id}")
+    
+    except Exception as e:
+        logger.error(f"❌ Background DB correction error: {e}", exc_info=True)
+        
+        # エラーをタスクに記録
+        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+        if task:
+            task.result = "DB修正中にエラーが発生しました。"
+            task.status = 'completed'
+            task.completed_at = datetime.utcnow()
+            session.commit()
+    
+    finally:
+        session.close()
+
+
+def start_background_correction(user_uuid, correction_request):
+    """DB修正タスクを開始"""
+    task_id = str(uuid.uuid4())[:8]
+    session = Session()
+    
+    try:
+        task = BackgroundTask(
+            task_id=task_id,
+            user_uuid=user_uuid,
+            task_type='db_correction',
+            query=correction_request['original_message']
+        )
+        session.add(task)
+        session.commit()
+        
+        background_executor.submit(background_db_correction, task_id, correction_request)
+        
+        logger.info(f"🚀 DB correction task started: {task_id}")
+        return task_id
+        
+    except Exception as e:
+        logger.error(f"❌ Background correction task creation error: {e}")
+        session.rollback()
+        return None
+    finally:
+        session.close()
+
+
+# ========================================
+# 【追加4】chat_lsl エンドポイントにDB修正検出を追加
+# ========================================
+
+@app.route('/chat_lsl', methods=['POST'])
+def chat_lsl():
+    session = Session()
+    try:
+        data = request.json
+        user_uuid, user_name, message = data.get('uuid', ''), data.get('name', ''), data.get('message', '')
+        
+        if not all([user_uuid, user_name, message]):
+            return "エラー: 必要な情報が足りないみたい…|", 400
+        
+        logger.info(f"💬 Received: {message} (from: {user_name})")
+        user_data = get_or_create_user(session, user_uuid, user_name)
+        history = get_conversation_history(session, user_uuid)
+        ai_text = ""
+        
+        # ★ 追加: DB修正リクエストの検出（最優先）
+        correction_request = detect_db_correction_request(message)
+        
+        if correction_request:
+            logger.info(f"🔧 DB correction request detected: {correction_request}")
+            
+            # バックグラウンドで検証 + 修正を開始
+            if start_background_correction(user_uuid, correction_request):
+                ai_text = f"え、まじで！？{correction_request['member_name']}ちゃんの情報、今すぐ調べて確認してみるね！ちょっと待ってて！"
+            else:
+                ai_text = "ごめん、今DB修正機能がうまく動いてないみたい…"
+            
+            # 会話履歴に保存
+            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+            session.commit()
+            
+            return f"{ai_text}|", 200
+        
+        # 以下、既存の処理（変更なし）
+        
+        # ★ 追加: 追加質問の判定
+        is_follow_up = is_follow_up_question(message, history)
+        
+        # === 優先度1: ホロメン基本情報 ===
+        holomem_keywords = get_active_holomem_keywords()
+        basic_question_pattern = f"({'|'.join(re.escape(k) for k in holomem_keywords)})って(?:誰|だれ|何|なに)[\?？]?$"
+        basic_question_match = re.search(basic_question_pattern, message.strip())
+        
+        if not ai_text and basic_question_match:
+            member_name = basic_question_match.group(1)
+            
+            if member_name in ['ホロライブ', 'hololive', 'ホロメン']:
+                ai_text = "ホロライブは、カバー株式会社が運営してるVTuber事務所のことだよ！ときのそらちゃんとか、たくさんの人気VTuberが所属してて、配信とかまじで楽しいからおすすめ！"
+            else:
+                wiki_info = get_holomem_info(member_name)
+                if wiki_info:
+                    response_parts = [f"{wiki_info['name']}ちゃんはね、ホロライブ{wiki_info['generation']}のVTuberだよ！ {wiki_info['description']}"]
+                    if wiki_info.get('graduation_date'):
+                        response_parts.append(f"でもね、{wiki_info['graduation_date']}に卒業しちゃったんだ…。{wiki_info.get('mochiko_feeling', 'まじ寂しいよね…。')}")
+                    ai_text = " ".join(response_parts)
+        
+        # === 優先度2: さくらみこ特別応答 ===
+        elif not ai_text and ('さくらみこ' in message or 'みこち' in message):
+            special_responses = get_sakuramiko_special_responses()
+            for keyword, response in special_responses.items():
+                if keyword in message:
+                    ai_text = response
+                    break
+        
+        # === 優先度3: ニュース詳細 ===
+        if not ai_text and (news_number := is_news_detail_request(message)):
+            news_detail = get_cached_news_detail(session, user_uuid, news_number)
+            if news_detail:
+                ai_text = generate_ai_response(
+                    user_data, 
+                    f"「{news_detail.title}」についてだね！", 
+                    history, 
+                    f"ニュースの詳細情報:\n{news_detail.content}", 
+                    is_detailed=True
+                )
+        
+        # === 優先度4: 時間・天気 ===
+        elif not ai_text and (is_time_request(message) or is_weather_request(message)):
+            responses = []
+            if is_time_request(message): 
+                responses.append(get_japan_time())
+            if is_weather_request(message): 
+                responses.append(get_weather_forecast(extract_location(message)))
+            ai_text = " ".join(responses)
+        
+        # === 優先度5: ホロライブニュース ===
+        elif not ai_text and is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
+            all_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(10).all()
+            if all_news:
+                selected_news = random.sample(all_news, min(random.randint(3, 5), len(all_news)))
+                save_news_cache(session, user_uuid, selected_news, 'hololive')
+                
+                news_items_text = []
+                for i, n in enumerate(selected_news, 1):
+                    short_title = n.title[:50] + "..." if len(n.title) > 50 else n.title
+                    news_items_text.append(f"【{i}】{short_title}")
+
+                news_text = f"ホロライブの最新ニュース、{len(selected_news)}件紹介するね！\n" + "\n".join(news_items_text) + "\n\n気になるのあった？番号で教えて！"
+                ai_text = limit_text_for_sl(news_text, 250)
+            else:
+                ai_text = "ごめん、今ニュースがまだ取得できてないみたい…"
+        
+        # === 優先度6: 追加質問 ===
+        elif not ai_text and is_follow_up:
+            logger.info("🔍 Processing follow-up question")
+            last_assistant_msg = None
+            for h in history:
+                if h.role == 'assistant':
+                    last_assistant_msg = h.content
+                    break
+            
+            if last_assistant_msg:
+                ai_text = generate_ai_response(
+                    user_data,
+                    message,
+                    history,
+                    f"直前の回答内容:\n{last_assistant_msg}",
+                    is_detailed=True
+                )
+            else:
+                ai_text = generate_ai_response(user_data, message, history)
+        
+        # === 優先度7: 明示的な検索リクエスト ===
+        elif not ai_text and is_explicit_search_request(message):
+            if start_background_search(user_uuid, message, is_detailed_request(message)):
+                ai_text = "おっけー、調べてみるね！ちょっと待ってて！"
+            else:
+                ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
+
+        # === 優先度8: 感情・季節・面白い話 ===
+        elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
+             ai_text = generate_ai_response(user_data, message, history)
+        
+        # === 優先度9: 暗黙的な検索リクエスト ===
+        elif not ai_text and not is_short_response(message) and should_search(message):
+            if start_background_search(user_uuid, message, is_detailed_request(message)):
+                ai_text = "おっけー、調べてみるね！結果が出るまでちょっと待ってて！"
+            else:
+                ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
+        
+        # === 優先度10: 通常会話 ===
+        elif not ai_text:
+            ai_text = generate_ai_response(user_data, message, history)
+        
+        # ★ 最終的な文字数制限
+        ai_text = limit_text_for_sl(ai_text, SL_SAFE_CHAR_LIMIT)
+        
+        # 会話履歴に保存
+        session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+        session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+        session.commit()
+        
+        logger.info(f"✅ Responded: {ai_text[:80]}")
+        return f"{ai_text}|", 200
+        
+    except Exception as e:
+        logger.error(f"❌ Unhandled error in chat endpoint: {e}", exc_info=True)
+        return "ごめん、システムエラーが起きちゃった…|", 500
+    finally:
+        if session:
+            session.close()
+
+
+# ========================================
+# 【追加5】DB修正履歴を確認するエンドポイント
+# ========================================
+
+@app.route('/correction_history', methods=['GET'])
+def get_correction_history():
+    """DB修正履歴を取得（管理者用）"""
+    session = Session()
+    try:
+        corrections = session.query(BackgroundTask).filter_by(
+            task_type='db_correction'
+        ).order_by(BackgroundTask.completed_at.desc()).limit(50).all()
+        
+        history = []
+        for task in corrections:
+            if task.query:
+                try:
+                    query_data = json.loads(task.query)
+                    history.append({
+                        'task_id': task.task_id,
+                        'member_name': query_data.get('member_name'),
+                        'correction_type': query_data.get('correction_type'),
+                        'verified': query_data.get('verified'),
+                        'corrected': query_data.get('corrected'),
+                        'completed_at': task.completed_at.isoformat() if task.completed_at else None
+                    })
+                except:
+                    pass
+        
+        return Response(
+            json.dumps({'corrections': history}, ensure_ascii=False, indent=2),
+            status=200,
+            mimetype='application/json; charset=utf-8'
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Correction history error: {e}")
+        return Response(
+            json.dumps({'error': str(e)}, ensure_ascii=False),
+            status=500,
+            mimetype='application/json; charset=utf-8'
+        )
+    finally:
+        session.close()
+
 @app.route('/test_voicevox', methods=['GET'])
 def test_voicevox():
     """VOICEVOX接続テスト"""
@@ -1829,23 +2598,32 @@ def health_check():
     logger.info(f"Health check: {health_data}")
     return jsonify(health_data), 200
 
-# ===== 【追加】check_task エンドポイント =====
+# ========================================
+# 【修正1】check_task エンドポイント - 文字化け対策
+# ========================================
+
 @app.route('/check_task', methods=['POST'])
 def check_task():
-    """
-    バックグラウンドタスクの完了チェック（LSLから定期的に呼ばれる）
-    """
+    """バックグラウンドタスクの完了チェック（UTF-8文字化け対策版）"""
     try:
         data = request.json
         if not data:
             logger.error("❌ check_task: Empty request body")
-            return jsonify({'status': 'error', 'message': 'リクエストボディが空です'}), 400
+            return Response(
+                json.dumps({'status': 'error', 'message': 'リクエストボディが空です'}, ensure_ascii=False),
+                status=400,
+                mimetype='application/json; charset=utf-8'
+            )
         
         user_uuid = data.get('uuid', '')
         
         if not user_uuid:
             logger.error("❌ check_task: UUID missing")
-            return jsonify({'status': 'error', 'message': 'UUID required'}), 400
+            return Response(
+                json.dumps({'status': 'error', 'message': 'UUID required'}, ensure_ascii=False),
+                status=400,
+                mimetype='application/json; charset=utf-8'
+            )
         
         logger.info(f"🔍 Checking tasks for user: {user_uuid}")
         
@@ -1879,6 +2657,9 @@ def check_task():
                     is_task_report=True
                 )
                 
+                # ★ 修正: 文字数制限を適用
+                report_message = limit_text_for_sl(report_message, SL_SAFE_CHAR_LIMIT)
+                
                 # 会話履歴に保存
                 session.add(ConversationHistory(
                     user_uuid=user_uuid,
@@ -1887,38 +2668,51 @@ def check_task():
                 ))
                 session.commit()
                 
-                return jsonify({
-                    'status': 'completed',
-                    'query': completed_task['query'],
-                    'message': report_message
-                }), 200
+                # ★ 修正: ensure_ascii=False + UTF-8指定
+                return Response(
+                    json.dumps({
+                        'status': 'completed',
+                        'query': completed_task['query'],
+                        'message': report_message
+                    }, ensure_ascii=False, indent=2),
+                    status=200,
+                    mimetype='application/json; charset=utf-8'
+                )
                 
             except Exception as e:
                 logger.error(f"❌ Report generation error: {e}", exc_info=True)
                 session.rollback()
                 return Response(
-            json.dumps({
-                'status': 'completed',
-                'query': completed_task['query'],
-                'message': report_message
-            }, ensure_ascii=False, indent=2),
-            status=200,
-            mimetype='application/json; charset=utf-8'
-        ), 200
+                    json.dumps({
+                        'status': 'error',
+                        'message': 'サーバーエラー'
+                    }, ensure_ascii=False),
+                    status=500,
+                    mimetype='application/json; charset=utf-8'
+                )
             finally:
                 session.close()
         
         # タスクがまだ完了していない場合
         logger.info(f"⏳ Task pending for {user_uuid}")
-        return jsonify({'status': 'pending'}), 200
+        return Response(
+            json.dumps({'status': 'pending'}, ensure_ascii=False),
+            status=200,
+            mimetype='application/json; charset=utf-8'
+        )
         
     except Exception as e:
         logger.error(f"❌ check_task critical error: {e}", exc_info=True)
-        return jsonify({'status': 'error', 'message': 'サーバーエラー'}), 500
-
+        return Response(
+            json.dumps({'status': 'error', 'message': 'サーバーエラー'}, ensure_ascii=False),
+            status=500,
+            mimetype='application/json; charset=utf-8'
+        )
 
 # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼【ここからが変更箇所です】▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-# ===== 【修正3】chat_lsl エンドポイント（完了タスク報告削除版） =====
+# ========================================
+# 【追加4】chat_lsl エンドポイントにDB修正検出を追加
+# ========================================
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
@@ -1935,10 +2729,35 @@ def chat_lsl():
         history = get_conversation_history(session, user_uuid)
         ai_text = ""
         
-        # ===【削除】完了タスク報告処理（check_taskで処理するため） ===
+        # ★ 追加: DB修正リクエストの検出（最優先）
+        correction_request = detect_db_correction_request(message)
         
-        # === 優先度1: ホロメン・ホロライブ基本情報の即答 ===
-        basic_question_match = re.search(f"({'|'.join(HOLOMEM_KEYWORDS)})って(?:誰|だれ|何|なに)[\?？]?$", message.strip())
+        if correction_request:
+            logger.info(f"🔧 DB correction request detected: {correction_request}")
+            
+            # バックグラウンドで検証 + 修正を開始
+            if start_background_correction(user_uuid, correction_request):
+                ai_text = f"え、まじで！？{correction_request['member_name']}ちゃんの情報、今すぐ調べて確認してみるね！ちょっと待ってて！"
+            else:
+                ai_text = "ごめん、今DB修正機能がうまく動いてないみたい…"
+            
+            # 会話履歴に保存
+            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+            session.commit()
+            
+            return f"{ai_text}|", 200
+        
+        # 以下、既存の処理（変更なし）
+        
+        # ★ 追加: 追加質問の判定
+        is_follow_up = is_follow_up_question(message, history)
+        
+        # === 優先度1: ホロメン基本情報 ===
+        holomem_keywords = get_active_holomem_keywords()
+        basic_question_pattern = f"({'|'.join(re.escape(k) for k in holomem_keywords)})って(?:誰|だれ|何|なに)[\?？]?$"
+        basic_question_match = re.search(basic_question_pattern, message.strip())
+        
         if not ai_text and basic_question_match:
             member_name = basic_question_match.group(1)
             
@@ -1960,20 +2779,28 @@ def chat_lsl():
                     ai_text = response
                     break
         
-        # === 優先度3: ニュース詳細リクエスト ===
+        # === 優先度3: ニュース詳細 ===
         if not ai_text and (news_number := is_news_detail_request(message)):
             news_detail = get_cached_news_detail(session, user_uuid, news_number)
             if news_detail:
-                ai_text = generate_ai_response(user_data, f"「{news_detail.title}」についてだね！", history, f"ニュースの詳細情報:\n{news_detail.content}", True)
+                ai_text = generate_ai_response(
+                    user_data, 
+                    f"「{news_detail.title}」についてだね！", 
+                    history, 
+                    f"ニュースの詳細情報:\n{news_detail.content}", 
+                    is_detailed=True
+                )
         
-        # === 優先度4: 時間・天気（即答） ===
+        # === 優先度4: 時間・天気 ===
         elif not ai_text and (is_time_request(message) or is_weather_request(message)):
             responses = []
-            if is_time_request(message): responses.append(get_japan_time())
-            if is_weather_request(message): responses.append(get_weather_forecast(extract_location(message)))
+            if is_time_request(message): 
+                responses.append(get_japan_time())
+            if is_weather_request(message): 
+                responses.append(get_weather_forecast(extract_location(message)))
             ai_text = " ".join(responses)
         
-        # === 優先度5: ホロライブニュースリクエスト ===
+        # === 優先度5: ホロライブニュース ===
         elif not ai_text and is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報', 'お知らせ']):
             all_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(10).all()
             if all_news:
@@ -1990,27 +2817,50 @@ def chat_lsl():
             else:
                 ai_text = "ごめん、今ニュースがまだ取得できてないみたい…"
         
-        # === 優先度6: 明示的な検索リクエスト ===
+        # === 優先度6: 追加質問 ===
+        elif not ai_text and is_follow_up:
+            logger.info("🔍 Processing follow-up question")
+            last_assistant_msg = None
+            for h in history:
+                if h.role == 'assistant':
+                    last_assistant_msg = h.content
+                    break
+            
+            if last_assistant_msg:
+                ai_text = generate_ai_response(
+                    user_data,
+                    message,
+                    history,
+                    f"直前の回答内容:\n{last_assistant_msg}",
+                    is_detailed=True
+                )
+            else:
+                ai_text = generate_ai_response(user_data, message, history)
+        
+        # === 優先度7: 明示的な検索リクエスト ===
         elif not ai_text and is_explicit_search_request(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
                 ai_text = "おっけー、調べてみるね！ちょっと待ってて！"
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
 
-        # === 優先度7: 感情・季節・面白い話 ===
+        # === 優先度8: 感情・季節・面白い話 ===
         elif not ai_text and (is_emotional_expression(message) or is_seasonal_topic(message) or is_story_request(message)):
              ai_text = generate_ai_response(user_data, message, history)
         
-        # === 優先度8: (暗黙的な)検索リクエスト ===
+        # === 優先度9: 暗黙的な検索リクエスト ===
         elif not ai_text and not is_short_response(message) and should_search(message):
             if start_background_search(user_uuid, message, is_detailed_request(message)):
                 ai_text = "おっけー、調べてみるね！結果が出るまでちょっと待ってて！"
             else:
                 ai_text = "ごめん、今検索機能がうまく動いてないみたい…"
         
-        # === 優先度9: 通常会話（デフォルト） ===
+        # === 優先度10: 通常会話 ===
         elif not ai_text:
             ai_text = generate_ai_response(user_data, message, history)
+        
+        # ★ 最終的な文字数制限
+        ai_text = limit_text_for_sl(ai_text, SL_SAFE_CHAR_LIMIT)
         
         # 会話履歴に保存
         session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
@@ -2026,6 +2876,7 @@ def chat_lsl():
     finally:
         if session:
             session.close()
+
 # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲【ここまでが変更箇所です】▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 # ===== 【追加】心理分析コマンド =====
 
@@ -2052,30 +2903,46 @@ def analyze_psychology_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+# ========================================
+# 【修正5】get_psychology エンドポイント - 文字化け対策
+# ========================================
+
 @app.route('/get_psychology', methods=['POST'])
 def get_psychology_endpoint():
-    """心理分析結果を取得するエンドポイント"""
+    """心理分析結果を取得（UTF-8対応版）"""
     try:
         data = request.json
         user_uuid = data.get('uuid')
         
         if not user_uuid:
-           return Response(
-        json.dumps(psychology, ensure_ascii=False, indent=2),
-        status=200,
-        mimetype='application/json; charset=utf-8'
-    ), 400
+            return Response(
+                json.dumps({'error': 'UUID required'}, ensure_ascii=False),
+                status=400,
+                mimetype='application/json; charset=utf-8'
+            )
         
         psychology = get_user_psychology(user_uuid)
         
         if not psychology:
-            return jsonify({'error': 'No analysis data found'}), 404
+            return Response(
+                json.dumps({'error': 'No analysis data found'}, ensure_ascii=False),
+                status=404,
+                mimetype='application/json; charset=utf-8'
+            )
         
-        return jsonify(psychology), 200
+        return Response(
+            json.dumps(psychology, ensure_ascii=False, indent=2),
+            status=200,
+            mimetype='application/json; charset=utf-8'
+        )
         
     except Exception as e:
         logger.error(f"❌ Get psychology error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return Response(
+            json.dumps({'error': str(e)}, ensure_ascii=False),
+            status=500,
+            mimetype='application/json; charset=utf-8'
+        )
 
 
 # ===== 【追加】定期的な心理分析スケジュール =====
@@ -2311,31 +3178,6 @@ def get_stats():
         session.close()
 
 # --- アプリケーション初期化 ---
-def populate_extended_holomem_wiki():
-    session = Session()
-    try:
-        if session.query(HolomemWiki).count() >= 10:
-            logger.info(f"✅ HoloMem Wiki is already extended.")
-            return
-        extended_data = [
-            {'member_name': '大空スバル', 'description': 'ホロライブ2期生。元気でスポーツ万能。「おっはよー！」が口癖。', 'debut_date': '2018年9月16日', 'generation': '2期生', 'tags': json.dumps(['スポーツ', '元気'], ensure_ascii=False)},
-            {'member_name': '大神ミオ', 'description': 'ホロライブゲーマーズ。包容力のあるお姉さん系VTuber。', 'debut_date': '2018年12月7日', 'generation': 'ゲーマーズ', 'tags': json.dumps(['癒し', 'ゲーム'], ensure_ascii=False)},
-            {'member_name': '戌神ころね', 'description': 'ホロライブゲーマーズ。犬系VTuber。レトロゲームが大好き。', 'debut_date': '2019年10月5日', 'generation': 'ゲーマーズ', 'tags': json.dumps(['犬', 'レトロゲーム'], ensure_ascii=False)},
-            {'member_name': '猫又おかゆ', 'description': 'ホロライブゲーマーズ。猫系VTuber。おにぎりが大好き。', 'debut_date': '2019年4月6日', 'generation': 'ゲーマーズ', 'tags': json.dumps(['猫', 'おにぎり'], ensure_ascii=False)},
-        ]
-        added_count = 0
-        for data in extended_data:
-            if not session.query(HolomemWiki).filter_by(member_name=data['member_name']).first():
-                session.add(HolomemWiki(**data))
-                added_count += 1
-        if added_count > 0:
-            session.commit()
-            logger.info(f"✅ HoloMem Wiki extended: {added_count} new members added.")
-    except Exception as e:
-        logger.error(f"❌ HoloMem Wiki extension error: {e}")
-        session.rollback()
-    finally:
-        session.close()
 
 def initialize_app():
     global engine, Session, groq_client
@@ -2348,6 +3190,27 @@ def initialize_app():
         initialize_gemini_client()
     except:
         pass
+
+    try:
+        logger.info("📡 Step 2/6: Initializing Groq client...")
+        groq_client = initialize_groq_client()
+        if groq_client:
+            logger.info("✅ Groq client ready")
+        else:
+            logger.warning("⚠️ Groq client disabled - using fallback responses")
+    except Exception as e:
+        logger.warning(f"⚠️ Groq initialization failed but continuing: {e}")
+        groq_client = None
+
+    try:
+        logger.info("🗄️ Step 3/6: Initializing database...")
+        engine = create_optimized_db_engine()
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.critical(f"🔥 Database initialization failed: {e}")
+        raise
 
     # Groq初期化を呼び出し
     try:
@@ -2382,35 +3245,48 @@ def initialize_app():
         logger.warning(f"⚠️ Wiki initialization failed but continuing: {e}")
     
     # ニュースデータのチェック
-    session = Session()
+ session = Session()
     try:
-        logger.info("📰 Step 4/5: Checking news data...")
+        logger.info("📰 Step 4/6: Checking news + member data...")
         holo_count = session.query(HololiveNews).count()
-        spec_count = session.query(SpecializedNews).count()
+        member_count = session.query(HolomemWiki).count()
         
-        if holo_count == 0:
-            logger.info("🚀 First run: Scheduling Hololive news fetch...")
+        # ★ 初回起動時、またはメンバー情報が古い場合は更新
+        if holo_count == 0 or member_count == 0:
+            logger.info("🚀 First run: Scheduling Hololive news + members fetch...")
             background_executor.submit(update_hololive_news_database)
         else:
-            logger.info(f"✅ Found {holo_count} Hololive news items")
+            logger.info(f"✅ Found {holo_count} Hololive news, {member_count} members")
             
+            # メンバー情報が24時間以上古い場合は更新
+            latest_member = session.query(HolomemWiki).order_by(
+                HolomemWiki.last_updated.desc()
+            ).first()
+            
+            if latest_member and latest_member.last_updated < datetime.utcnow() - timedelta(hours=24):
+                logger.info("⏰ Member data is stale, scheduling update...")
+                background_executor.submit(update_hololive_news_database)
+        
+        spec_count = session.query(SpecializedNews).count()
         if spec_count == 0:
             logger.info("🚀 First run: Scheduling specialized news fetch...")
             background_executor.submit(update_all_specialized_news)
         else:
             logger.info(f"✅ Found {spec_count} specialized news items")
+            
     except Exception as e:
         logger.warning(f"⚠️ News initialization check failed but continuing: {e}")
     finally:
         session.close()
 
-    # スケジューラー設定
     try:
-        logger.info("⏰ Step 5/5: Starting scheduler...")
-        schedule.every().hour.do(update_hololive_news_database)
+        logger.info("⏰ Step 5/6: Starting scheduler...")
+        
+        # ★ 変更: ホロライブニュース更新時にメンバー情報も更新
+        schedule.every().hour.do(update_hololive_news_database)  # ニュース + メンバー情報
         schedule.every(3).hours.do(update_all_specialized_news)
         schedule.every().day.at("02:00").do(cleanup_old_data_advanced)
-        schedule.every().week.do(populate_extended_holomem_wiki)
+        # schedule.every().week.do(populate_extended_holomem_wiki)  # <-- 削除
         
         def run_scheduler():
             while True:
@@ -2439,8 +3315,87 @@ def signal_handler(sig, frame):
     logger.info("👋 Mochiko AI has shut down.")
     sys.exit(0)
 
+# ========================================
+# 【変更7】HOLOMEM_KEYWORDSをDB自動生成に変更
+# ========================================
+
+def get_active_holomem_keywords():
+    """現役メンバーの名前リストをDBから取得"""
+    session = Session()
+    try:
+        members = session.query(HolomemWiki.member_name).filter_by(is_active=True).all()
+        keywords = [m[0] for m in members] + ['ホロライブ', 'ホロメン', 'hololive', 'YAGOO']
+        return keywords
+    except Exception as e:
+        logger.error(f"❌ Failed to get holomem keywords: {e}")
+        # フォールバック
+        return ['ホロライブ', 'ホロメン', 'hololive']
+    finally:
+        session.close()
+
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+# ========================================
+# 【変更8】is_hololive_request を動的キーワード取得に変更
+# ========================================
+
+def is_hololive_request(message):
+    """ホロライブ関連の質問かどうか判定（動的キーワード）"""
+    keywords = get_active_holomem_keywords()
+    return any(keyword in message for keyword in keywords)
+
+
+# ========================================
+# 【変更9】chat_lsl エンドポイントの基本情報判定を動的化
+# ========================================
+
+# chat_lsl 関数内の該当箇所を以下に置き換え:
+
+# === 優先度1: ホロメン基本情報 ===
+holomem_keywords = get_active_holomem_keywords()
+basic_question_pattern = f"({'|'.join(re.escape(k) for k in holomem_keywords)})って(?:誰|だれ|何|なに)[\?？]?$"
+basic_question_match = re.search(basic_question_pattern, message.strip())
+
+if not ai_text and basic_question_match:
+    member_name = basic_question_match.group(1)
+    
+    if member_name in ['ホロライブ', 'hololive', 'ホロメン']:
+        ai_text = "ホロライブは、カバー株式会社が運営してるVTuber事務所のことだよ！ときのそらちゃんとか、たくさんの人気VTuberが所属してて、配信とかまじで楽しいからおすすめ！"
+    else:
+        wiki_info = get_holomem_info(member_name)
+        if wiki_info:
+            response_parts = [f"{wiki_info['name']}ちゃんはね、ホロライブ{wiki_info['generation']}のVTuberだよ！ {wiki_info['description']}"]
+            if wiki_info.get('graduation_date'):
+                response_parts.append(f"でもね、{wiki_info['graduation_date']}に卒業しちゃったんだ…。{wiki_info.get('mochiko_feeling', 'まじ寂しいよね…。')}")
+            ai_text = " ".join(response_parts)
+
+
+# ========================================
+# 【変更10】background_deep_search のホロメン判定を動的化
+# ========================================
+
+# background_deep_search 関数内の該当箇所を以下に置き換え:
+
+# Step 3: ホロメン検索（既存のロジック）
+holomem_keywords = get_active_holomem_keywords()
+holomem_matched = None
+query_topic = ""
+
+for member_name in holomem_keywords:
+    if member_name in query:
+        holomem_matched = member_name
+        query_topic = query.replace(member_name, '').replace('について', '').replace('教えて', '').strip()
+        if not query_topic:
+            query_topic = "概要"
+        break
+
+if holomem_matched:
+    wiki_info = get_holomem_info(holomem_matched)
+    if wiki_info and query_topic == "概要":
+        search_result = f"{holomem_matched}に関するデータベース情報:\n{wiki_info['description']}"
+    else:
+        search_result = deep_web_search(f"ホロライブ {holomem_matched} {query_topic}", is_detailed)
 
 # --- メイン実行 ---
 try:
