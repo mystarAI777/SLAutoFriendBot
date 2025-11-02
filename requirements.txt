@@ -8,6 +8,7 @@ psycopg2-binary==2.9.9
 
 # AI/API clients
 groq>=0.10.0
+google-generativeai==0.3.2
 
 # HTTP requests and web scraping
 requests==2.31.0
@@ -17,7 +18,7 @@ lxml==4.9.3
 # Additional utilities
 urllib3==2.1.0
 certifi==2023.11.17
-schedule==1.2.1  # <-- ★★★ これを追加してください ★★★
+schedule==1.2.1
 
 # Security
 Werkzeug==2.3.7
@@ -27,15 +28,3 @@ html5lib==1.1
 
 # JSON and data processing
 python-dateutil==2.8.2
-
-# Threading and async support
-# threading-timer==0.1.0  # Removed - using built-in threading
-
-# For voice synthesis (VOICEVOX client)
-# Note: VOICEVOX runs as separate service
-
-# Development dependencies (comment out for production)
-# python-dotenv==1.0.0
-
-# Note: Google API dependencies removed for cost savings
-# google-api-python-client==2.108.0  # REMOVED - using free alternatives
