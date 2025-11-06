@@ -1,32 +1,33 @@
-# Core Flask dependencies
+# -----------------------------------------------------------------
+# Mochiko AI Bot - requirements.txt
+# -----------------------------------------------------------------
+
+# Core Web Framework
+# Flaskと、Renderでの本番運用に推奨されるWSGIサーバーgunicorn
 Flask==2.3.3
-Flask-CORS==4.0.0
+Flask-Cors==4.0.0
+gunicorn==21.2.0
 
 # Database
+# SQLAlchemy（ORM）と、PostgreSQL on Renderに接続するためのアダプタ
 SQLAlchemy==2.0.23
 psycopg2-binary==2.9.9
 
-# AI/API clients
-groq>=0.10.0
-google-generativeai==0.3.2
+# AI and API Clients
+# groqとgoogle-generativeaiのバージョンを固定
+# google-generativeaiは重複を解消し、より新しい0.4.0に統一
+groq==0.4.2
+google-generativeai==0.4.0
 
-# HTTP requests and web scraping
+# Web Scraping & HTTP
+# WebスクレイピングとHTTPリクエストに使用するライブラリ
 requests==2.31.0
 beautifulsoup4==4.12.2
-lxml==4.9.3
 
-# Additional utilities
-urllib3==2.1.0
-certifi==2023.11.17
+# Background Tasks & Scheduling
+# 定期実行タスクに使用
 schedule==1.2.1
 
-# Security
-Werkzeug==2.3.7
-
-# For web scraping
-html5lib==1.1
-
-# JSON and data processing
-python-dateutil==2.8.2
-
-google-generativeai==0.4.0
+# Security & Encryption
+# 暗号化機能に必須
+cryptography==41.0.7
