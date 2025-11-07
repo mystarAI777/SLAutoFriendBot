@@ -461,26 +461,46 @@ def update_hololive_news_database():
         session.close()
 
 def scrape_hololive_members():
+    """ホロライブメンバースクレイピング（改善版・堅牢性向上）"""
     base_url = "https://hololive.hololivepro.com"
     session = Session()
     try:
         logger.info("🔍 Scraping Hololive members...")
         response = scraper.fetch_with_retry(f"{base_url}/talents/")
-        if not response: return
+        if not response: 
+            logger.error("❌ Failed to fetch Hololive talents page")
+            return
+
         soup = BeautifulSoup(response.content, 'html.parser')
-        member_cards = soup.select('.talent-card, .member-card, [class*="talent"], [class*="member"]')
-        if not member_cards: member_cards = soup.find_all('a', href=lambda x: x and '/talents/' in x)
+
+        # 【修正点1】より厳密なセレクタでメンバーカードのみを取得
+        # 'a'タグで、かつ'href'が'/talents/'で始まる要素に絞り込む
+        member_cards = soup.select("a[href^='/talents/']")
+        
         logger.info(f"📋 Found {len(member_cards)} potential member cards")
+        
         scraped_names = set()
         updated_count, added_count = 0, 0
+        
         for idx, card in enumerate(member_cards, 1):
             try:
+                # メンバー個別のページへのリンクか確認 (トップページへのリンク等は除外)
+                href = card.get('href', '')
+                if href == '/talents/' or not href.startswith('/talents/'):
+                    continue
+
                 name_elem = card.find(['h2', 'h3', 'h4', 'span'], class_=lambda x: x and ('name' in x.lower() or 'title' in x.lower())) or card
                 member_name = re.sub(r'\s*\(.*?\)\s*', '', clean_text(name_elem.get_text())).strip()
-                if not member_name or len(member_name) < 2: continue
+
+                # 【修正点2】取得した名前の長さをチェック
+                if not member_name or len(member_name) > 100:
+                    logger.warning(f"⚠️ Skipping card {idx}: Invalid name found or name too long ('{member_name[:50]}...').")
+                    continue
+                
+                # ... (以降の処理は変更なし) ...
+                
                 scraped_names.add(member_name)
-                profile_link_raw = card.get('href') or (card.find('a', href=True) or {}).get('href', '')
-                profile_link = urljoin(base_url, profile_link_raw) if profile_link_raw else ""
+                profile_link = urljoin(base_url, href)
                 generation = "不明"
                 gen_patterns = [(r'0期生|ゼロ期生','0期生'),(r'1期生|一期生','1期生'),(r'2期生|二期生','2期生'),(r'3期生|三期生','3期生'),(r'4期生|四期生','4期生'),(r'5期生|五期生','5期生'),(r'ゲーマーズ|GAMERS','ゲーマーズ'),(r'ID|Indonesia','ホロライブID'),(r'EN|English','ホロライブEN'),(r'DEV_IS|ReGLOSS','DEV_IS')]
                 card_text = card.get_text()
@@ -499,8 +519,10 @@ def scrape_hololive_members():
                     session.add(new_member)
                     added_count += 1
                     logger.info(f"➕ Added: {member_name}")
+
             except Exception as e:
                 logger.error(f"❌ Error processing member card {idx}: {e}")
+        
         all_db_members = session.query(HolomemWiki).filter(HolomemWiki.member_name.notin_(scraped_names)).all()
         inactive_count = 0
         for db_member in all_db_members:
@@ -508,9 +530,12 @@ def scrape_hololive_members():
                 logger.warning(f"⚠️ Not found on site, marking inactive: {db_member.member_name}")
                 db_member.is_active, db_member.last_updated = False, datetime.utcnow()
                 inactive_count += 1
+        
         if updated_count > 0 or added_count > 0 or inactive_count > 0:
             session.commit()
+            
         logger.info(f"✅ Member scraping complete: {added_count} added, {updated_count} updated, {inactive_count} marked inactive")
+
     except Exception as e:
         logger.error(f"❌ Member scraping error: {e}")
         session.rollback()
