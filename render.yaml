@@ -2,21 +2,35 @@ services:
   - type: web
     name: mochiko-ai-assistant
     env: python
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python app.py
+    
+    # 修正点1: Pythonのバージョンを3.11に変更
+    pythonVersion: 3.11
+
+    # 修正点2: ビルドコマンドをシンプルに
+    buildCommand: "pip install -r requirements.txt"
+    
+    # 修正点3: 本番用のgunicornで起動
+    startCommand: "gunicorn app:application"
+
     plan: free
     healthCheckPath: /health
+    
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.18
-      - key: PORT
-        value: 5000
-      - key: PYTHONUNBUFFERED
-        value: 1
+      # 修正点4: envVarsセクションからPYTHON_VERSIONを削除
+      # - key: PYTHON_VERSION
+      #   value: 3.9.18  <-- このブロック全体を削除
+      
       - key: DATABASE_URL
         fromDatabase:
-          name: mochiko-db
+          name: mochiko-db # あなたのデータベース名に合わせてください
           property: connectionString
+      
+      # sync: false のキーはRenderでは自動で無視されるため、そのままでもOK
       - key: GROQ_API_KEY
-        sync: false  # これは手動で設定する必要があります
-    autoDeploy: true
+        sync: false
+      
+      # 他の必要なSecret Keyもここに記述するか、sync: falseとして管理
+      - key: BACKUP_ENCRYPTION_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
