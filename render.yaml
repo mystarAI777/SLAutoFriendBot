@@ -1,51 +1,24 @@
 services:
   - type: web
     name: mochiko-ai-assistant
-    env: python
-    runtime: python
-    
-    # Pythonバージョンを強制指定
-    region: oregon
-    
-    buildCommand: |
-      echo "=== Checking Python version ==="
-      python --version
-      python3 --version
-      which python
-      echo "=== Installing dependencies ==="
-      pip install --upgrade pip setuptools wheel
-      pip install -r requirements.txt
-      echo "=== Build complete ==="
-    
-    # Gunicornで起動
-    startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --access-logfile - --error-logfile - app:application"
-
+    # 環境を'docker'に変更
+    env: docker
+    # Dockerfileのパスを指定
+    dockerfilePath: ./Dockerfile
     plan: free
-    
-    # ヘルスチェック設定
     healthCheckPath: /health
+    # HTTP/2を有効にする（推奨）
+    http2: true
     
+    # 環境変数はここで一元管理
     envVars:
-      - key: PORT
-        value: "10000"
-      
       - key: DATABASE_URL
         fromDatabase:
-          name: mochiko-db
+          name: mochiko-db # あなたのデータベース名に合わせてください
           property: connectionString
       
-      # Secret Files経由で設定
-      - key: GROQ_API_KEY
-        sync: false
-      
-      - key: BACKUP_ENCRYPTION_KEY
-        sync: false
-      
-      - key: ADMIN_TOKEN
-        sync: false
-      
-      - key: VOICEVOX_URL
-        sync: false
-      
-      - key: GEMINI_API_KEY
-        sync: false
+      # sync: false を使う代わりに、RenderのUI（Environment > Secret Files）で
+      # 以下のキーが設定されていることを確認してください。
+      # - GROQ_API_KEY
+      # - BACKUP_ENCRYPTION_KEY
+      # - ADMIN_TOKEN
