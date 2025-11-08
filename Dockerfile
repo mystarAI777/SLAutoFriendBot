@@ -25,4 +25,4 @@ COPY . .
 EXPOSE 10000
 
 # The command to run the application using a production server
-CMD ["gunicorn", "--bind", "0.0.0.0:10000", "app:application"]
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--threads", "8", "--timeout", "120", "--log-level", "debug", "app:application"]
