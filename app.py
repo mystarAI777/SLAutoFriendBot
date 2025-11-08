@@ -372,8 +372,10 @@ def signal_handler(sig, frame):
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler); signal.signal(signal.SIGTERM, signal_handler)
 
+# --- Application Initialization and Startup ---
+
 application = None
-initialization_error = None # エラーを保持するためのグローバル変数を追加
+initialization_error = None 
 
 try:
     initialize_app()
@@ -382,21 +384,19 @@ try:
 
 except Exception as e:
     logger.critical(f"🔥 Fatal initialization error: {e}", exc_info=True)
-    initialization_error = e # 捕捉したエラーをグローバル変数に保存
+    initialization_error = e
     
-    # 失敗した場合でも、gunicornが起動できるように最小限のアプリを作成
     application = Flask(__name__)
     
-    # このアプリに、エラー報告専用の/healthエンドポイントを定義
     @application.route('/health')
     def failed_health():
-        # グローバル変数に保存されたエラー情報を返す
         error_message = str(initialization_error) if initialization_error else "Unknown initialization error"
-        return json_response({
+        # json_response関数はまだ定義されていない可能性があるので、jsonifyを使う
+        return jsonify({
             'status': 'error', 
             'message': 'Application failed to initialize.', 
             'error_details': error_message
-        }, 500)
+        }), 500
     
     logger.warning("⚠️ Application created with limited functionality due to initialization error.")
 
@@ -406,4 +406,5 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 10000))
         application.run(host='0.0.0.0', port=port, debug=False)
     else:
-        logger.critical("🔥 Could not start application.")```
+        # SyntaxErrorの原因となっていたバッククォートを削除
+        logger.critical("🔥 Could not start application.")
