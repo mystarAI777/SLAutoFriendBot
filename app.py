@@ -137,6 +137,25 @@ def ensure_voice_directory():
     except Exception as e:
         logger.error(f"❌ Could not create voice directory: {e}")
 
+def create_optimized_db_engine():
+    try:
+        is_sqlite = 'sqlite' in DATABASE_URL
+        connect_args = {'check_same_thread': False} if is_sqlite else {'connect_timeout': 10}
+        engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+        with engine.connect() as conn: conn.execute(text("SELECT 1"))
+        logger.info(f"✅ Database engine created ({'SQLite' if is_sqlite else 'PostgreSQL'})")
+        return engine
+    except Exception as e: logger.error(f"❌ Failed to create database engine: {e}"); raise
+
+def initialize_groq_client():
+    global groq_client
+    try:
+        if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            logger.info("✅ Groq client initialized")
+        else: logger.warning("⚠️ GROQ_API_KEY is not set or too short.")
+    except Exception as e: logger.error(f"❌ Groq initialization failed: {e}")
+    
 def get_cached_or_fetch(key, func, ttl=3600):
     with _cache_lock:
         now = time.time()
@@ -415,8 +434,13 @@ except Exception as e:
     application = Flask(__name__)
     @application.route('/health')
     def failed_health():
-        # json_response might not be defined if error is early
         return jsonify({'status': 'error', 'message': 'Initialization failed', 'error': str(initialization_error)}), 500
+
+def signal_handler(sig, frame):
+    logger.info("🛑 Shutting down..."); background_executor.shutdown(wait=True)
+    if engine: engine.dispose()
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler); signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == '__main__':
     if application: application.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
