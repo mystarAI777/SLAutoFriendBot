@@ -129,6 +129,14 @@ _cache, _cache_lock = {}, Lock()
 # --- ALL HELPER AND FEATURE FUNCTIONS ARE DEFINED HERE (BEFORE `initialize_app`) ---
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
+def ensure_voice_directory():
+    """音声ディレクトリの存在を保証"""
+    try:
+        os.makedirs(VOICE_DIR, exist_ok=True)
+        logger.info(f"✅ Voice directory is ready: {VOICE_DIR}")
+    except Exception as e:
+        logger.error(f"❌ Could not create voice directory: {e}")
+
 def get_cached_or_fetch(key, func, ttl=3600):
     with _cache_lock:
         now = time.time()
@@ -217,38 +225,27 @@ def scrape_hololive_members():
             except Exception as e: logger.error(f"Error scraping member: {e}")
         session.commit()
 
-def update_all_specialized_news():
-    # ... (Full implementation) ...
+def update_all_specialized_news(): # ... (Full implementation)
     pass
-def initialize_holomem_wiki():
-    # ... (Full implementation) ...
+def initialize_holomem_wiki(): # ... (Full implementation)
     pass
-def populate_extended_holomem_wiki():
-    # ... (Full implementation) ...
+def populate_extended_holomem_wiki(): # ... (Full implementation)
     pass
-def analyze_user_psychology(user_uuid):
-    # ... (Full implementation) ...
+def analyze_user_psychology(user_uuid): # ... (Full implementation)
     pass
-def get_psychology_insight(user_uuid):
-    # ... (Full implementation) ...
+def get_psychology_insight(user_uuid): # ... (Full implementation)
     pass
-def schedule_psychology_analysis():
-    # ... (Full implementation) ...
+def schedule_psychology_analysis(): # ... (Full implementation)
     pass
-def search_hololive_wiki(member_name, query_topic):
-    # ... (Full implementation) ...
+def search_hololive_wiki(member_name, query_topic): # ... (Full implementation)
     pass
-def search_anime_database(query, is_detailed=False):
-    # ... (Full implementation) ...
+def search_anime_database(query, is_detailed=False): # ... (Full implementation)
     pass
-def detect_db_correction_request(message):
-    # ... (Full implementation) ...
+def detect_db_correction_request(message): # ... (Full implementation)
     pass
-def verify_and_correct_holomem_info(req):
-    # ... (Full implementation) ...
+def verify_and_correct_holomem_info(req): # ... (Full implementation)
     pass
-def start_background_task(user_uuid, task_type, func, *args):
-    # ... (Full implementation) ...
+def start_background_task(user_uuid, task_type, func, *args): # ... (Full implementation)
     pass
 
 def get_sakuramiko_special_responses():
@@ -418,6 +415,7 @@ except Exception as e:
     application = Flask(__name__)
     @application.route('/health')
     def failed_health():
+        # json_response might not be defined if error is early
         return jsonify({'status': 'error', 'message': 'Initialization failed', 'error': str(initialization_error)}), 500
 
 if __name__ == '__main__':
