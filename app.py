@@ -373,14 +373,37 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler); signal.signal(signal.SIGTERM, signal_handler)
 
 application = None
+initialization_error = None # エラーを保持するためのグローバル変数を追加
+
 try:
     initialize_app()
     application = app
+    logger.info("✅ Application successfully initialized and assigned for gunicorn.")
+
 except Exception as e:
     logger.critical(f"🔥 Fatal initialization error: {e}", exc_info=True)
+    initialization_error = e # 捕捉したエラーをグローバル変数に保存
+    
+    # 失敗した場合でも、gunicornが起動できるように最小限のアプリを作成
     application = Flask(__name__)
+    
+    # このアプリに、エラー報告専用の/healthエンドポイントを定義
     @application.route('/health')
-    def failed_health(): return json_response({'status': 'error', 'message': str(e)}, 500)
+    def failed_health():
+        # グローバル変数に保存されたエラー情報を返す
+        error_message = str(initialization_error) if initialization_error else "Unknown initialization error"
+        return json_response({
+            'status': 'error', 
+            'message': 'Application failed to initialize.', 
+            'error_details': error_message
+        }, 500)
+    
+    logger.warning("⚠️ Application created with limited functionality due to initialization error.")
 
+# ローカルでのデバッグ実行用のコード
 if __name__ == '__main__':
-    if application: application.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    if application:
+        port = int(os.environ.get('PORT', 10000))
+        application.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        logger.critical("🔥 Could not start application.")```
