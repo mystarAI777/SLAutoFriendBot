@@ -9,8 +9,8 @@ services:
     # 修正点2: ビルドコマンドをシンプルに
     buildCommand: "pip install -r requirements.txt"
     
-    # 修正点3: 本番用のgunicornで起動
-    startCommand: "gunicorn app:application"
+    # startCommandを更新
+startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --access-logfile - --error-logfile - app:application"
 
     plan: free
     healthCheckPath: /health
