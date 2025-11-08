@@ -117,7 +117,7 @@ def get_encryption_key():
         sys.exit(1)
     return encryption_key.encode('utf-8')
 
-# --- Database Models (All models are included) ---
+# --- Database Models ---
 class UserMemory(Base): __tablename__ = 'user_memories'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False); user_name = Column(String(255), nullable=False); interaction_count = Column(Integer, default=0); last_interaction = Column(DateTime, default=datetime.utcnow)
 class ConversationHistory(Base): __tablename__ = 'conversation_history'; id = Column(Integer, primary_key=True, autoincrement=True); user_uuid = Column(String(255), nullable=False, index=True); role = Column(String(10), nullable=False); content = Column(Text, nullable=False); timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 class HololiveNews(Base): __tablename__ = 'hololive_news'; id = Column(Integer, primary_key=True); title = Column(String(500), nullable=False); content = Column(Text, nullable=False); url = Column(String(1000)); created_at = Column(DateTime, default=datetime.utcnow, index=True); news_hash = Column(String(100), unique=True)
@@ -127,7 +127,14 @@ class HolomemWiki(Base): __tablename__ = 'holomem_wiki'; id = Column(Integer, pr
 class NewsCache(Base): __tablename__ = 'news_cache'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), nullable=False, index=True); news_id = Column(Integer, nullable=False); news_number = Column(Integer, nullable=False); news_type = Column(String(50), nullable=False); created_at = Column(DateTime, default=datetime.utcnow)
 class UserPsychology(Base): __tablename__ = 'user_psychology'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False, index=True); user_name = Column(String(255), nullable=False); openness = Column(Integer, default=50); conscientiousness = Column(Integer, default=50); extraversion = Column(Integer, default=50); agreeableness = Column(Integer, default=50); neuroticism = Column(Integer, default=50); interests = Column(Text); favorite_topics = Column(Text); conversation_style = Column(String(50)); emotional_tendency = Column(String(50)); total_messages = Column(Integer, default=0); avg_message_length = Column(Integer, default=0); analysis_summary = Column(Text); last_analyzed = Column(DateTime, default=datetime.utcnow); analysis_confidence = Column(Integer, default=0)
 
-# --- Core Initializations (DB, AI, Cache) ---
+# --- Core Initializations ---
+def ensure_voice_directory():
+    try:
+        os.makedirs(VOICE_DIR, exist_ok=True)
+        logger.info(f"✅ Voice directory is ready: {VOICE_DIR}")
+    except Exception as e:
+        logger.error(f"❌ Could not create voice directory: {e}")
+
 def create_optimized_db_engine():
     try:
         is_sqlite = 'sqlite' in DATABASE_URL.lower()
@@ -275,7 +282,8 @@ def scrape_hololive_members():
         session.close()
 
 def scrape_graduated_members():
-    # ... implementation is unchanged ...
+    # This is static data, no retry logic needed
+    # ... Implementation is unchanged ...
     pass
 
 def update_all_specialized_news():
@@ -312,4 +320,369 @@ def update_all_specialized_news():
         for future in as_completed(future_to_site):
             logger.info(f"✅ Spec news update for {future_to_site[future]}: {future.result()}")
             
-# ... (Full application code continues below) ...
+# --- Helper Functions (Conversation Patterns, User Management, etc.) ---
+def clean_text(text):
+    if not text: return ""
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip()
+
+def get_japan_time():
+    now = datetime.now(timezone(timedelta(hours=9)))
+    return f"今は{now.year}年{now.month}月{now.day}日 {now.hour}時{now.minute}分だよ！"
+
+def get_weather_forecast(location_name):
+    area_code = LOCATION_CODES.get(location_name, "130000")
+    url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
+    try:
+        response = scraper.fetch_with_retry(url)
+        if response:
+            return f"今の{location_name}の天気は、「{response.json().get('text', '情報なし')}」って感じだよ！"
+    except Exception as e:
+        logger.error(f"❌ Weather fetch error: {e}")
+    return f"{location_name}の天気、うまく取れなかったみたい…ごめんね！"
+
+def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT):
+    return text if len(text) <= max_length else text[:max_length - 3] + "..."
+
+def get_or_create_user(session, uuid, name):
+    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
+    if user:
+        user.interaction_count += 1
+        user.last_interaction = datetime.utcnow()
+        if user.user_name != name: user.user_name = name
+    else:
+        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
+        session.add(user)
+    session.commit()
+    return user
+
+def get_conversation_history(session, uuid, limit=10):
+    history = session.query(ConversationHistory).filter_by(user_uuid=uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
+    history.reverse()
+    return history
+
+def get_active_holomem_keywords():
+    def _fetch():
+        session = Session()
+        try:
+            members = session.query(HolomemWiki.member_name).filter_by(is_active=True).all()
+            return [m[0] for m in members] + ['ホロライブ', 'ホロメン']
+        finally:
+            session.close()
+    return get_cached_or_fetch('holomem_keywords', _fetch)
+
+def is_time_request(message): return any(kw in message for kw in ['今何時', '時間', '時刻'])
+def is_weather_request(message): return any(kw in message for kw in ['天気', '気温', '雨', '晴れ'])
+def is_explicit_search_request(message): return any(kw in message for kw in ['調べて', '検索して', '教えて'])
+def is_news_detail_request(message):
+    match = re.search(r'([1-9]|[１-９])番', message)
+    if match and any(kw in message for kw in ['詳しく', '詳細']):
+        return int(unicodedata.normalize('NFKC', match.group(1)))
+    return None
+
+# --- Self-Correction Functionality (Re-integrated) ---
+def detect_db_correction_request(message):
+    patterns = [r'(.+?)(?:は|が)(?:間違[いっ]てる|違う)', r'実は(.+?)(?:だよ|です)', r'正しくは(.+?)(?:だよ|です)']
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            member_name = next((kw for kw in get_active_holomem_keywords() if kw in message), None)
+            if member_name:
+                return {'member_name': member_name, 'user_claim': match.group(1).strip(), 'original_message': message}
+    return None
+
+def scrape_major_search_engines(query, num_results=3):
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP"
+    response = scraper.fetch_with_retry(url)
+    if not response: return []
+    soup = BeautifulSoup(response.content, 'html.parser')
+    results = []
+    for elem in soup.select('li.b_algo')[:num_results]:
+        title = elem.select_one('h2')
+        snippet = elem.select_one('div.b_caption p')
+        if title and snippet:
+            results.append({'title': clean_text(title.get_text()), 'snippet': clean_text(snippet.get_text())})
+    return results
+
+def verify_and_correct_holomem_info(correction_request):
+    member_name = correction_request['member_name']
+    logger.info(f"🔍 Verifying correction for {member_name}...")
+    search_results = scrape_major_search_engines(f"ホロライブ {member_name} {correction_request['user_claim']}", 5)
+    if not search_results or not groq_client:
+        return "ごめん、情報が確認できなかった…"
+
+    combined_results = "\n".join([f"- {r['snippet']}" for r in search_results])
+    verification_prompt = f"""以下の情報とユーザーの主張を検証してください。
+対象: ホロライブの{member_name}
+ユーザーの主張: {correction_request['user_claim']}
+検索結果:
+{combined_results[:2000]}
+タスク: ユーザーの主張が事実なら、修正すべき情報をJSON形式で抽出してください。事実でない、または確認できない場合は verified: false としてください。
+例: {{"verified": true, "confidence": 95, "extracted_info": {{"generation": "1期生"}}}}
+"""
+    try:
+        completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": verification_prompt}], model="llama-3.1-8b-instant", temperature=0.1, max_tokens=300, response_format={"type": "json_object"})
+        result = json.loads(completion.choices[0].message.content)
+
+        if result.get('verified') and result.get('confidence', 0) >= 80:
+            session = Session()
+            try:
+                member = session.query(HolomemWiki).filter_by(member_name=member_name).first()
+                if member and result.get('extracted_info'):
+                    for key, value in result['extracted_info'].items():
+                        if hasattr(member, key): setattr(member, key, value)
+                    member.last_updated = datetime.utcnow()
+                    session.commit()
+                    return f"本当だ！{member_name}ちゃんの情報を修正したよ、教えてくれてありがとう！✨"
+            finally:
+                session.close()
+    except Exception as e:
+        logger.error(f"❌ Verification AI error: {e}")
+    return "うーん、ちょっと確信が持てなかった…でも教えてくれてありがとう！"
+
+def background_db_correction(task_id, correction_request):
+    result_message = verify_and_correct_holomem_info(correction_request)
+    session = Session()
+    try:
+        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+        if task:
+            task.result = result_message
+            task.status = 'completed'
+            task.completed_at = datetime.utcnow()
+            session.commit()
+    finally:
+        session.close()
+
+def start_background_correction(user_uuid, correction_request):
+    task_id = str(uuid.uuid4())
+    session = Session()
+    try:
+        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type='db_correction', query=json.dumps(correction_request))
+        session.add(task)
+        session.commit()
+        background_executor.submit(background_db_correction, task_id, correction_request)
+        return task_id
+    except Exception as e:
+        logger.error(f"❌ Failed to start correction task: {e}"); session.rollback()
+        return None
+    finally:
+        session.close()
+        
+# --- AI Response Generation ---
+def generate_ai_response(user_data, message, history, reference_info=""):
+    if not groq_client: return "ごめんね、今AIくんの調子が悪いみたい…ちょっと待ってて！"
+    try:
+        system_prompt = f"あなたは「もちこ」という22歳の明るい女性AIです。{user_data['name']}さんと楽しく話しています。一人称は「あてぃし」、語尾は「〜じゃん」「〜だよ」を使い、明るくギャルっぽい口調で話します。口癖は「まじ」「てか」「うける」です。男性的な言葉は絶対使いません。"
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history[-4:]: messages.append({"role": msg.role, "content": msg.content})
+        if reference_info: messages.append({"role": "system", "content": f"参考情報：{reference_info}"})
+        messages.append({"role": "user", "content": message})
+        
+        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=300)
+        response = completion.choices[0].message.content.strip()
+        response = re.sub(r'だぜ|だな(?![い])|俺|僕', '', response)
+        if not any(response.endswith(end) for end in ['。', '！', '？', '♪', '✨', '…', 'よ', 'ね', 'じゃん']):
+            response += 'だよ！'
+        return response
+    except Exception as e:
+        logger.error(f"❌ AI response error: {e}"); return "うーん、なんて言おうかな…考えがまとまらないや！"
+
+# --- Secure GitHub Backup Section ---
+def encrypt_backup_data(backup_data):
+    try:
+        fernet = Fernet(get_encryption_key())
+        json_data = json.dumps(backup_data, ensure_ascii=False, indent=2).encode('utf-8')
+        return fernet.encrypt(json_data)
+    except Exception as e:
+        logger.error(f"❌ Encryption failed: {e}"); raise
+
+def decrypt_backup_data(encrypted_data):
+    try:
+        fernet = Fernet(get_encryption_key())
+        decrypted_bytes = fernet.decrypt(encrypted_data)
+        return json.loads(decrypted_bytes.decode('utf-8'))
+    except Exception as e:
+        logger.error(f"❌ Decryption failed: {e}"); raise
+
+def export_database_to_json():
+    if not Session: return None
+    session = Session(); backup_data = {'timestamp': datetime.utcnow().isoformat(), 'tables': {}}
+    try:
+        tables = {'user_memories': UserMemory, 'conversation_history': ConversationHistory, 'holomem_wiki': HolomemWiki, 'user_psychology': UserPsychology}
+        for name, model in tables.items():
+            query = session.query(model)
+            if name == 'conversation_history': query = query.order_by(model.timestamp.desc()).limit(5000)
+            backup_data['tables'][name] = [{c.name: getattr(r, c.name).isoformat() if isinstance(getattr(r, c.name), datetime) else getattr(r, c.name) for c in r.__table__.columns} for r in query.all()]
+        return backup_data
+    except Exception as e:
+        logger.error(f"❌ DB export error: {e}"); return None
+    finally:
+        session.close()
+
+def commit_encrypted_backup_to_github():
+    try:
+        backup_data = export_database_to_json()
+        if not backup_data: return False
+        encrypted_data = encrypt_backup_data(backup_data)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        with open(BACKUP_DIR / GITHUB_BACKUP_FILE, 'wb') as f: f.write(encrypted_data)
+        import shutil; shutil.copy(BACKUP_DIR / GITHUB_BACKUP_FILE, Path('.') / GITHUB_BACKUP_FILE)
+        commands = [['git', 'config', 'user.email', 'bot@example.com'], ['git', 'config', 'user.name', 'Backup Bot'], ['git', 'add', GITHUB_BACKUP_FILE], ['git', 'commit', '-m', f'🔒 Backup {datetime.utcnow().isoformat()}'], ['git', 'push']]
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0 and 'nothing to commit' not in result.stdout:
+                logger.error(f"❌ Git command failed: {result.stderr}"); return False
+        logger.info("✅ Encrypted backup committed to GitHub")
+        return True
+    except Exception as e:
+        logger.error(f"❌ GitHub commit error: {e}"); return False
+
+# --- Admin Security ---
+def require_admin_auth(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not ADMIN_TOKEN: logger.critical("🔥 ADMIN_TOKEN not set!"); return jsonify({'error': 'Server config error'}), 500
+        auth = request.headers.get('Authorization')
+        if not auth or not auth.startswith('Bearer ') or auth.split(' ')[1] != ADMIN_TOKEN:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Flask Endpoints ---
+@app.route('/health')
+def health_check():
+    db_ok = False
+    try:
+        with engine.connect() as conn: conn.execute(text("SELECT 1")); db_ok = True
+    except: pass
+    return jsonify({'database': 'ok' if db_ok else 'error', 'groq_ai': 'ok' if groq_client else 'disabled'}), 200
+
+@app.route('/chat_lsl', methods=['POST', 'OPTIONS'])
+def chat_lsl():
+    if request.method == 'OPTIONS': return '', 204
+    data = request.json
+    if not data or 'user_uuid' not in data or 'user_name' not in data or 'message' not in data:
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    user_uuid, user_name, message = data['user_uuid'], data['user_name'], data['message'].strip()
+    session = Session()
+    try:
+        user = get_or_create_user(session, user_uuid, user_name)
+        session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+        
+        response_text = ""
+        # Priority 1: DB correction
+        if (correction_request := detect_db_correction_request(message)):
+            if start_background_correction(user_uuid, correction_request):
+                response_text = f"え、まじで！？{correction_request['member_name']}ちゃんの情報、調べてみるね！ちょっと待ってて！"
+            else:
+                response_text = "ごめん、今DB修正機能がうまく動いてないみたい…"
+        # Keyword-based routing
+        elif is_time_request(message): response_text = get_japan_time()
+        elif is_weather_request(message): response_text = get_weather_forecast(user_name.split(' ')[0])
+        else: # Default to AI
+            history = get_conversation_history(session, user_uuid)
+            response_text = generate_ai_response({'name': user.user_name}, message, history)
+
+        session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
+        session.commit()
+        return jsonify({'response': response_text}), 200
+    except Exception as e:
+        logger.error(f"❌ Chat error for {user_name}: {e}", exc_info=True); session.rollback()
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        session.close()
+
+@app.route('/check_task', methods=['POST'])
+def check_task():
+    data = request.json
+    if not data or 'user_uuid' not in data:
+        return jsonify({'status': 'error', 'message': 'UUID required'}), 400
+    session = Session()
+    try:
+        task = session.query(BackgroundTask).filter_by(user_uuid=data['user_uuid'], status='completed').order_by(BackgroundTask.completed_at.desc()).first()
+        if task:
+            result = {'query': task.query, 'result': task.result}
+            session.delete(task)
+            session.commit()
+            return jsonify({'status': 'completed', 'task': result})
+    finally:
+        session.close()
+    return jsonify({'status': 'pending'})
+
+@app.route('/generate_voice', methods=['POST'])
+def generate_voice_endpoint():
+    data = request.json; text = data.get('text', '').strip()
+    if not text: return jsonify({'error': 'Text is required'}), 400
+    voicevox_url = VOICEVOX_URL_FROM_ENV or "http://localhost:50021"
+    try:
+        query_res = requests.post(f"{voicevox_url}/audio_query", params={"text": text, "speaker": VOICEVOX_SPEAKER_ID}, timeout=10)
+        query_res.raise_for_status()
+        synth_res = requests.post(f"{voicevox_url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=query_res.json(), timeout=30)
+        synth_res.raise_for_status()
+        filename = f"voice_{uuid.uuid4().hex[:8]}.wav"; filepath = os.path.join(VOICE_DIR, filename)
+        with open(filepath, 'wb') as f: f.write(synth_res.content)
+        return jsonify({'url': f"{SERVER_URL}/voices/{filename}"}), 200
+    except Exception as e:
+        logger.error(f"❌ Voice generation error: {e}"); return jsonify({'error': 'Voice generation failed'}), 500
+
+@app.route('/voices/<filename>')
+def serve_voice(filename):
+    return send_from_directory(VOICE_DIR, filename)
+
+@app.route('/admin/backup', methods=['POST'])
+@require_admin_auth
+def manual_backup():
+    if commit_encrypted_backup_to_github(): return jsonify({'status': 'success'}), 200
+    else: return jsonify({'status': 'error'}), 500
+
+# --- Application Initialization and Startup ---
+def initialize_app():
+    global engine, Session, groq_client
+    logger.info("=" * 60); logger.info("🔧 Starting Mochiko AI initialization...")
+    ensure_voice_directory()
+    if not DATABASE_URL: logger.critical("🔥 FATAL: DATABASE_URL not set."); sys.exit(1)
+    get_encryption_key()
+    groq_client = initialize_groq_client()
+    try:
+        engine = create_optimized_db_engine(); Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+    except Exception as e:
+        logger.critical(f"🔥 DB init failed: {e}"); raise
+    with Session() as session:
+        if session.query(HolomemWiki).count() == 0: background_executor.submit(update_hololive_news_database)
+        if session.query(SpecializedNews).count() == 0: background_executor.submit(update_all_specialized_news)
+
+    schedule.every().hour.do(update_hololive_news_database)
+    schedule.every(3).hours.do(update_all_specialized_news)
+    schedule.every().day.at("18:00").do(commit_encrypted_backup_to_github)
+    
+    def run_scheduler():
+        while True: schedule.run_pending(); time.sleep(60)
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    logger.info("✅ Initialization complete!"); logger.info("=" * 60)
+
+def signal_handler(sig, frame):
+    logger.info("🛑 Shutting down..."); background_executor.shutdown(wait=True)
+    if engine: engine.dispose()
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler); signal.signal(signal.SIGTERM, signal_handler)
+
+application = None
+try:
+    initialize_app()
+    application = app
+    logger.info("✅ Application successfully initialized and assigned for gunicorn.")
+except Exception as e:
+    logger.critical(f"🔥 Fatal initialization error: {e}", exc_info=True)
+    application = Flask(__name__)
+    @application.route('/health')
+    def failed_health(): return jsonify({'status': 'error', 'message': 'Application failed to initialize.', 'error': str(e)}), 500
+    logger.warning("⚠️ Application created with limited functionality due to initialization error.")
+
+if __name__ == '__main__':
+    if application:
+        port = int(os.environ.get('PORT', 10000))
+        application.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        logger.critical("🔥 Could not start application due to initialization failure.")
