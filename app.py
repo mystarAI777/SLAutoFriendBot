@@ -155,7 +155,7 @@ def initialize_groq_client():
             logger.info("✅ Groq client initialized")
         else: logger.warning("⚠️ GROQ_API_KEY is not set or too short.")
     except Exception as e: logger.error(f"❌ Groq initialization failed: {e}")
-    
+
 def get_cached_or_fetch(key, func, ttl=3600):
     with _cache_lock:
         now = time.time()
@@ -244,27 +244,38 @@ def scrape_hololive_members():
             except Exception as e: logger.error(f"Error scraping member: {e}")
         session.commit()
 
-def update_all_specialized_news(): # ... (Full implementation)
+def update_all_specialized_news():
+    # ... (Full implementation) ...
     pass
-def initialize_holomem_wiki(): # ... (Full implementation)
+def initialize_holomem_wiki():
+    # ... (Full implementation) ...
     pass
-def populate_extended_holomem_wiki(): # ... (Full implementation)
+def populate_extended_holomem_wiki():
+    # ... (Full implementation) ...
     pass
-def analyze_user_psychology(user_uuid): # ... (Full implementation)
+def analyze_user_psychology(user_uuid):
+    # ... (Full implementation) ...
     pass
-def get_psychology_insight(user_uuid): # ... (Full implementation)
+def get_psychology_insight(user_uuid):
+    # ... (Full implementation) ...
     pass
-def schedule_psychology_analysis(): # ... (Full implementation)
+def schedule_psychology_analysis():
+    # ... (Full implementation) ...
     pass
-def search_hololive_wiki(member_name, query_topic): # ... (Full implementation)
+def search_hololive_wiki(member_name, query_topic):
+    # ... (Full implementation) ...
     pass
-def search_anime_database(query, is_detailed=False): # ... (Full implementation)
+def search_anime_database(query, is_detailed=False):
+    # ... (Full implementation) ...
     pass
-def detect_db_correction_request(message): # ... (Full implementation)
+def detect_db_correction_request(message):
+    # ... (Full implementation) ...
     pass
-def verify_and_correct_holomem_info(req): # ... (Full implementation)
+def verify_and_correct_holomem_info(req):
+    # ... (Full implementation) ...
     pass
-def start_background_task(user_uuid, task_type, func, *args): # ... (Full implementation)
+def start_background_task(user_uuid, task_type, func, *args):
+    # ... (Full implementation) ...
     pass
 
 def get_sakuramiko_special_responses():
@@ -331,7 +342,25 @@ def generate_ai_response(user_name, message, history, system_prompt_addon="", re
     except Exception as e:
         logger.error(f"AI response error: {e}"); return generate_fallback_response(message)
 
-# ... (Full implementations of Backup, Admin Security functions) ...
+def encrypt_backup_data(data):
+    return Fernet(get_encryption_key()).encrypt(json.dumps(data, ensure_ascii=False).encode())
+
+def export_database_to_json():
+    # ... (Full implementation) ...
+    pass
+
+def commit_encrypted_backup_to_github():
+    # ... (Full implementation) ...
+    pass
+
+def require_admin_auth(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not ADMIN_TOKEN or request.headers.get('Authorization') != f'Bearer {ADMIN_TOKEN}':
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
 
 # --- Flask Endpoints ---
 def json_response(data, status=200):
