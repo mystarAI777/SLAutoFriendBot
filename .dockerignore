@@ -1,0 +1,14 @@
+# Ignore Git history and virtual environments
+.git
+.gitignore
+.venv
+venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore local development files
+.env
