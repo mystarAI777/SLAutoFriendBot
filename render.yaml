@@ -2,35 +2,50 @@ services:
   - type: web
     name: mochiko-ai-assistant
     env: python
+    runtime: python
     
-    # 修正点1: Pythonのバージョンを3.11に変更
-    pythonVersion: 3.11
-
-    # 修正点2: ビルドコマンドをシンプルに
-    buildCommand: "pip install -r requirements.txt"
+    # Pythonバージョンを強制指定
+    region: oregon
     
-    # startCommandを更新
-startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --access-logfile - --error-logfile - app:application"
+    buildCommand: |
+      echo "=== Checking Python version ==="
+      python --version
+      python3 --version
+      which python
+      echo "=== Installing dependencies ==="
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+      echo "=== Build complete ==="
+    
+    # Gunicornで起動
+    startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --access-logfile - --error-logfile - app:application"
 
     plan: free
+    
+    # ヘルスチェック設定
     healthCheckPath: /health
     
     envVars:
-      # 修正点4: envVarsセクションからPYTHON_VERSIONを削除
-      # - key: PYTHON_VERSION
-      #   value: 3.9.18  <-- このブロック全体を削除
+      - key: PORT
+        value: "10000"
       
       - key: DATABASE_URL
         fromDatabase:
-          name: mochiko-db # あなたのデータベース名に合わせてください
+          name: mochiko-db
           property: connectionString
       
-      # sync: false のキーはRenderでは自動で無視されるため、そのままでもOK
+      # Secret Files経由で設定
       - key: GROQ_API_KEY
         sync: false
       
-      # 他の必要なSecret Keyもここに記述するか、sync: falseとして管理
       - key: BACKUP_ENCRYPTION_KEY
         sync: false
+      
       - key: ADMIN_TOKEN
+        sync: false
+      
+      - key: VOICEVOX_URL
+        sync: false
+      
+      - key: GEMINI_API_KEY
         sync: false
