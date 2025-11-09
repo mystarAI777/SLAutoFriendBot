@@ -63,7 +63,6 @@ app.config['JSON_AS_ASCII'] = False
 CORS(app)
 Base = declarative_base()
 
-# ▼▼▼ カラム不足対策：メモリキャッシュ ▼▼▼
 search_context_cache = {}
 cache_lock = Lock()
 
@@ -79,6 +78,11 @@ def get_secret(name):
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+
+if DATABASE_URL and DATABASE_URL.startswith('postgresql'):
+    if 'client_encoding' not in DATABASE_URL:
+        DATABASE_URL += '?client_encoding=utf8'
+        logger.info("✅ Forcing PostgreSQL client encoding to UTF-8.")
 
 # --- データベースモデル ---
 class UserMemory(Base): 
@@ -104,8 +108,7 @@ class UserPsychology(Base):
     user_name = Column(String(255), nullable=False)
     analysis_summary = Column(Text)
     analysis_confidence = Column(Integer, default=0)
-    last_analyzed = Column(DateTime)
-    # 以下のカラムは古いDBには存在しない可能性がある
+    last_analyzed = Column(DateTime, nullable=True)
     last_search_results = Column(Text, nullable=True)
     search_context = Column(String(500), nullable=True)
     
@@ -132,6 +135,24 @@ class HolomemWiki(Base):
     mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow)
 
+class HololiveNews(Base):
+    __tablename__ = 'hololive_news'
+    id = Column(Integer, primary_key=True)
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=False)
+    url = Column(String(1000), unique=True)
+    news_hash = Column(String(100), unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class NewsCache(Base):
+    __tablename__ = 'news_cache'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    news_id = Column(Integer, nullable=False)
+    news_number = Column(Integer, nullable=False)
+    news_type = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # --- ヘルパー関数群 ---
 def clean_text(text): return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip() if text else ""
 def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT): return text[:max_length-3] + "..." if len(text) > max_length else text
@@ -141,17 +162,24 @@ def is_detailed_request(message): return any(kw in message for kw in ['詳しく
 def is_number_selection(message):
     match = re.match(r'^\s*([1-9])', message.strip())
     return int(match.group(1)) if match else None
-
 def format_search_results_as_list(results):
     if not results: return None
     return [{'number': i, 'title': r.get('title', ''), 'snippet': r.get('snippet', ''), 'full_content': r.get('snippet', '')} for i, r in enumerate(results[:5], 1)]
 
+def save_news_cache(session, user_uuid, news_items, news_type='hololive'):
+    session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
+    for i, news in enumerate(news_items, 1):
+        cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type=news_type)
+        session.add(cache)
+    session.commit()
+def get_cached_news_detail(session, user_uuid, news_number):
+    cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number).first()
+    if not cache: return None
+    return session.query(HololiveNews).filter_by(id=cache.news_id).first()
+
 def save_search_context(user_uuid, search_results, query):
-    # メモリキャッシュに保存
     with cache_lock:
         search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
-    
-    # DBへの保存を試行
     try:
         with Session() as session:
             psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
@@ -159,40 +187,28 @@ def save_search_context(user_uuid, search_results, query):
                 user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
                 psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name if user else 'Unknown')
                 session.add(psych)
-            
             if 'last_search_results' in UserPsychology.__table__.columns:
                 psych.last_search_results = json.dumps(search_results, ensure_ascii=False)
                 psych.search_context = query
                 session.commit()
-                logger.info("✅ Search context saved to DB.")
-            else:
-                logger.warning("DB schema is old. Search context saved to memory cache only.")
     except Exception as e:
         logger.warning(f"⚠️ Search context DB save failed, relying on cache: {e}")
 
 def get_saved_search_result(user_uuid, number):
-    # メモリキャッシュから取得
     with cache_lock:
         cached_data = search_context_cache.get(user_uuid)
-    if cached_data and (time.time() - cached_data['timestamp']) < 600: # 10分以内
+    if cached_data and (time.time() - cached_data['timestamp']) < 600:
         for r in cached_data['results']:
             if r.get('number') == number:
-                logger.info(f"💾 Search result fetched from memory")
                 return r
-
-    # DBからの取得を試行
     try:
         with Session() as session:
             psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
             if psych and 'last_search_results' in UserPsychology.__table__.columns and psych.last_search_results:
                 search_results = json.loads(psych.last_search_results)
-                result = next((r for r in search_results if r.get('number') == number), None)
-                if result:
-                    logger.info(f"✅ Search result fetched from DB")
-                    return result
+                return next((r for r in search_results if r.get('number') == number), None)
     except Exception as e:
         logger.warning(f"⚠️ Search result DB fetch failed: {e}")
-    
     return None
 
 def is_recommendation_request(message): return any(kw in message for kw in ['おすすめ', 'オススメ', '人気'])
@@ -200,6 +216,7 @@ def extract_recommendation_topic(message):
     topics = {'映画': ['映画'], '音楽': ['音楽', '曲'], 'アニメ': ['アニメ'], 'ゲーム': ['ゲーム']}
     return next((topic for topic, keywords in topics.items() if any(kw in message for kw in keywords)), None)
 def detect_specialized_topic(message):
+    if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']): return None
     for topic, config in SPECIALIZED_SITES.items():
         if any(keyword in message for keyword in config['keywords']): return topic
     return None
@@ -214,9 +231,8 @@ def is_follow_up_question(message, history):
 def should_search(message):
     if len(message) < 5 or is_number_selection(message): return False
     if detect_specialized_topic(message) or is_recommendation_request(message): return True
-    if any(re.search(p, message) for p in [r'とは', r'について', r'教えて', r'最新', r'調べて', r'検索']): return True
+    if any(re.search(p, message) for p in [r'とは', r'について', r'教えて', r'最新', r'調べて', r'検索', r'ニュース']): return True
     return any(word in message for word in ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして'])
-
 def get_or_create_user(session, user_uuid, user_name):
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if not user:
@@ -244,7 +260,6 @@ def get_sakuramiko_special_responses():
 def ensure_voice_directory():
     try: os.makedirs(VOICE_DIR, exist_ok=True)
     except Exception as e: logger.error(f"❌ Voice directory creation failed: {e}")
-
 def generate_voice(text):
     if not VOICEVOX_ENABLED: return None
     try:
@@ -261,7 +276,6 @@ def generate_voice(text):
     except Exception as e:
         logger.error(f"❌ VOICEVOX generation error: {e}")
         return None
-
 def get_weather_forecast(location):
     area_code = LOCATION_CODES.get(location, "130000")
     url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
@@ -273,7 +287,6 @@ def get_weather_forecast(location):
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "うぅ、天気情報がうまく取れなかったみたい…"
-
 def detect_db_correction_request(message):
     match = re.search(r'(.+?)って(.+?)じゃなかった？|(.+?)はもう卒業したよ', message)
     if not match: return None
@@ -282,7 +295,6 @@ def detect_db_correction_request(message):
     member_name = next((keyword for keyword in holomem_keywords if keyword in message), None)
     if not member_name: return None
     return {'member_name': member_name, 'original_message': message}
-
 def verify_and_correct_holomem_info(correction_request):
     member_name = correction_request['member_name']
     query = f"ホロライブ {member_name} 卒業"
@@ -458,7 +470,18 @@ def chat_lsl():
 
             response_text = ""
             
-            if correction_req := detect_db_correction_request(message):
+            # ▼▼▼ 修正: ホロライブニュース専用処理を追加 ▼▼▼
+            if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']):
+                news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
+                if news_items:
+                    save_news_cache(session, user_uuid, news_items, 'hololive')
+                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
+                    response_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                else:
+                    start_background_task(user_uuid, "ホロライブ 最新ニュース", 'search')
+                    response_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
+
+            elif (correction_req := detect_db_correction_request(message)):
                 start_background_task(user_uuid, correction_req, 'correction')
                 response_text = f"え、まじ！？{correction_req['member_name']}の情報、調べてみるね！"
             elif '性格分析' in message:
@@ -468,13 +491,21 @@ def chat_lsl():
                 for keyword, resp in get_sakuramiko_special_responses().items():
                     if keyword in message:
                         response_text = resp; break
+                if not response_text: # 「みこち」だけの場合
+                    response_text = generate_ai_response(user_data, message, history)
             elif (selected_number := is_number_selection(message)):
-                saved_result = get_saved_search_result(user_uuid, selected_number)
-                if saved_result:
-                    prompt = f"「{saved_result['title']}」について詳しく教えて！"
-                    response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
+                # ニュースの詳細要求もここで処理
+                news_detail = get_cached_news_detail(session, user_uuid, selected_number)
+                if news_detail:
+                    response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
                 else:
-                    response_text = "あれ、何の番号だっけ？もう一回検索してみて！"
+                    saved_result = get_saved_search_result(user_uuid, selected_number)
+                    if saved_result:
+                        prompt = f"「{saved_result['title']}」について詳しく教えて！"
+                        response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
+                    else:
+                        response_text = "あれ、何の番号だっけ？もう一回検索してみて！"
+
             elif is_follow_up_question(message, history):
                 last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
                 response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
@@ -592,4 +623,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    application.run(host='0.0.0.0', port=port, debug=False)
+    application.run(host='0.0.0.0', port=port, debug=False)```
