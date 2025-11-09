@@ -9,6 +9,7 @@ import re
 import random
 import hashlib
 import unicodedata
+import traceback 
 from datetime import datetime, timedelta, timezone
 from groq import Groq
 from flask import Response, send_from_directory
@@ -17,6 +18,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 import schedule
 import signal
+from threading import Lock
 
 # --- 型ヒント ---
 try:
@@ -61,10 +63,14 @@ app.config['JSON_AS_ASCII'] = False
 CORS(app)
 Base = declarative_base()
 
+# ▼▼▼ カラム不足対策：メモリキャッシュ ▼▼▼
+search_context_cache = {}
+cache_lock = Lock()
+
 # --- 秘密情報/環境変数 読み込み ---
 def get_secret(name):
     path = f"/etc/secrets/{name}"
-    if os.path.exists(path):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
         try:
             with open(path, 'r') as f: return f.read().strip()
         except IOError: return None
@@ -99,8 +105,9 @@ class UserPsychology(Base):
     analysis_summary = Column(Text)
     analysis_confidence = Column(Integer, default=0)
     last_analyzed = Column(DateTime)
-    last_search_results = Column(Text)
-    search_context = Column(String(500))
+    # 以下のカラムは古いDBには存在しない可能性がある
+    last_search_results = Column(Text, nullable=True)
+    search_context = Column(String(500), nullable=True)
     
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
@@ -109,17 +116,17 @@ class BackgroundTask(Base):
     user_uuid = Column(String(255), nullable=False, index=True)
     task_type = Column(String(50), nullable=False)
     query = Column(Text, nullable=False)
-    result = Column(Text)
+    result = Column(Text, nullable=True)
     status = Column(String(20), default='pending', index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime)
+    completed_at = Column(DateTime, nullable=True)
 
 class HolomemWiki(Base):
     __tablename__ = 'holomem_wiki'
     id = Column(Integer, primary_key=True)
     member_name = Column(String(100), nullable=False, unique=True, index=True)
-    description = Column(Text)
-    generation = Column(String(100))
+    description = Column(Text, nullable=True)
+    generation = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True, index=True)
     graduation_date = Column(String(100), nullable=True)
     mochiko_feeling = Column(Text, nullable=True)
@@ -134,25 +141,60 @@ def is_detailed_request(message): return any(kw in message for kw in ['詳しく
 def is_number_selection(message):
     match = re.match(r'^\s*([1-9])', message.strip())
     return int(match.group(1)) if match else None
+
 def format_search_results_as_list(results):
     if not results: return None
     return [{'number': i, 'title': r.get('title', ''), 'snippet': r.get('snippet', ''), 'full_content': r.get('snippet', '')} for i, r in enumerate(results[:5], 1)]
+
 def save_search_context(user_uuid, search_results, query):
-    with Session() as session:
-        psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-        if not psych:
-            user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-            psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name if user else 'Unknown')
-            session.add(psych)
-        psych.last_search_results = json.dumps(search_results, ensure_ascii=False)
-        psych.search_context = query
-        session.commit()
+    # メモリキャッシュに保存
+    with cache_lock:
+        search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
+    
+    # DBへの保存を試行
+    try:
+        with Session() as session:
+            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            if not psych:
+                user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+                psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name if user else 'Unknown')
+                session.add(psych)
+            
+            if 'last_search_results' in UserPsychology.__table__.columns:
+                psych.last_search_results = json.dumps(search_results, ensure_ascii=False)
+                psych.search_context = query
+                session.commit()
+                logger.info("✅ Search context saved to DB.")
+            else:
+                logger.warning("DB schema is old. Search context saved to memory cache only.")
+    except Exception as e:
+        logger.warning(f"⚠️ Search context DB save failed, relying on cache: {e}")
+
 def get_saved_search_result(user_uuid, number):
-    with Session() as session:
-        psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-        if not psych or not psych.last_search_results: return None
-        search_results = json.loads(psych.last_search_results)
-        return next((r for r in search_results if r.get('number') == number), None)
+    # メモリキャッシュから取得
+    with cache_lock:
+        cached_data = search_context_cache.get(user_uuid)
+    if cached_data and (time.time() - cached_data['timestamp']) < 600: # 10分以内
+        for r in cached_data['results']:
+            if r.get('number') == number:
+                logger.info(f"💾 Search result fetched from memory")
+                return r
+
+    # DBからの取得を試行
+    try:
+        with Session() as session:
+            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            if psych and 'last_search_results' in UserPsychology.__table__.columns and psych.last_search_results:
+                search_results = json.loads(psych.last_search_results)
+                result = next((r for r in search_results if r.get('number') == number), None)
+                if result:
+                    logger.info(f"✅ Search result fetched from DB")
+                    return result
+    except Exception as e:
+        logger.warning(f"⚠️ Search result DB fetch failed: {e}")
+    
+    return None
+
 def is_recommendation_request(message): return any(kw in message for kw in ['おすすめ', 'オススメ', '人気'])
 def extract_recommendation_topic(message):
     topics = {'映画': ['映画'], '音楽': ['音楽', '曲'], 'アニメ': ['アニメ'], 'ゲーム': ['ゲーム']}
@@ -174,6 +216,7 @@ def should_search(message):
     if detect_specialized_topic(message) or is_recommendation_request(message): return True
     if any(re.search(p, message) for p in [r'とは', r'について', r'教えて', r'最新', r'調べて', r'検索']): return True
     return any(word in message for word in ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして'])
+
 def get_or_create_user(session, user_uuid, user_name):
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if not user:
@@ -184,8 +227,10 @@ def get_or_create_user(session, user_uuid, user_name):
     if user.user_name != user_name: user.user_name = user_name
     session.commit()
     return {'uuid': user.user_uuid, 'name': user.user_name}
+
 def get_conversation_history(session, user_uuid, limit=6):
     return session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
+
 def get_sakuramiko_special_responses():
     return {
         'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
@@ -199,6 +244,7 @@ def get_sakuramiko_special_responses():
 def ensure_voice_directory():
     try: os.makedirs(VOICE_DIR, exist_ok=True)
     except Exception as e: logger.error(f"❌ Voice directory creation failed: {e}")
+
 def generate_voice(text):
     if not VOICEVOX_ENABLED: return None
     try:
@@ -215,6 +261,7 @@ def generate_voice(text):
     except Exception as e:
         logger.error(f"❌ VOICEVOX generation error: {e}")
         return None
+
 def get_weather_forecast(location):
     area_code = LOCATION_CODES.get(location, "130000")
     url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
@@ -226,6 +273,7 @@ def get_weather_forecast(location):
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "うぅ、天気情報がうまく取れなかったみたい…"
+
 def detect_db_correction_request(message):
     match = re.search(r'(.+?)って(.+?)じゃなかった？|(.+?)はもう卒業したよ', message)
     if not match: return None
@@ -234,6 +282,7 @@ def detect_db_correction_request(message):
     member_name = next((keyword for keyword in holomem_keywords if keyword in message), None)
     if not member_name: return None
     return {'member_name': member_name, 'original_message': message}
+
 def verify_and_correct_holomem_info(correction_request):
     member_name = correction_request['member_name']
     query = f"ホロライブ {member_name} 卒業"
@@ -309,47 +358,62 @@ def analyze_user_psychology(user_uuid):
 
 # --- AI & バックグラウンドタスク ---
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False):
-    if not groq_client: return "ごめん、ちょっと考えまとまらないや…"
+    if not groq_client: 
+        return "はーい！何か話そっか！(※ただいまAI機能はオフラインだよ)"
+    
     try:
-        with Session() as session:
-            psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
-        psych_prompt = f"\n# 【{user_data['name']}さんの特性】\n- {psych.analysis_summary}" if psych and psych.analysis_confidence > 40 else ""
+        psych = None
+        psych_prompt = ""
+        try:
+            with Session() as session:
+                psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
+            if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary and psych.analysis_confidence > 40:
+                psych_prompt = f"\n# 【{user_data['name']}さんの特性】\n- {psych.analysis_summary}"
+        except Exception as db_error:
+            logger.warning(f"⚠️ Psychology fetch failed (continuing without): {db_error}")
+        
         system_prompt = f"""あなたは「もちこ」という明るいギャルAIです。{user_data['name']}さんと話しています。
 - 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。
 - 短くテンポよく、共感しながら返す。{psych_prompt}"""
-        if is_detailed: system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
-        if reference_info: system_prompt += f"\n【参考情報】: {reference_info}"
+        
+        if is_detailed: 
+            system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
+        if reference_info: 
+            system_prompt += f"\n【参考情報】: {reference_info}"
         
         messages = [{"role": "system", "content": system_prompt}]
-        # ▼▼▼ 修正点: reversed()で履歴を正しい順序に ▼▼▼
         for h in reversed(history): 
             messages.append({"role": "assistant" if h.role == "assistant" else "user", "content": h.content})
         messages.append({"role": "user", "content": message})
         
-        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=400 if is_detailed else 200)
-        # ▼▼▼ 修正点: 正しい応答の取得方法 ▼▼▼
+        completion = groq_client.chat.completions.create(
+            messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=400 if is_detailed else 200)
         return completion.choices[0].message.content.strip()
+        
     except Exception as e:
-        logger.error(f"AI response error: {e}")
+        logger.error(f"❌ AI response error: {e}")
+        logger.error(traceback.format_exc())
         return "ごめん、ちょっと考えまとまらないや…"
 
 def background_task_runner(task_id, query, task_type, user_uuid):
     result_data, result_status = None, 'failed'
-    if task_type == 'search':
-        search_query = query
-        if (topic := extract_recommendation_topic(query)): search_query = f"おすすめ {topic} ランキング 2025"
-        elif (topic := detect_specialized_topic(query)): search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
-        raw_results = scrape_major_search_engines(search_query, 5)
-        result_data = json.dumps(format_search_results_as_list(raw_results), ensure_ascii=False) if raw_results else None
+    try:
+        if task_type == 'search':
+            search_query = query
+            if (topic := extract_recommendation_topic(query)): search_query = f"おすすめ {topic} ランキング 2025"
+            elif (topic := detect_specialized_topic(query)): search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
+            raw_results = scrape_major_search_engines(search_query, 5)
+            result_data = json.dumps(format_search_results_as_list(raw_results), ensure_ascii=False) if raw_results else None
+        elif task_type == 'correction':
+            result_data = verify_and_correct_holomem_info(query)
+        elif task_type == 'psych_analysis':
+            analyze_user_psychology(user_uuid)
+            result_data = "Analysis Complete"
         result_status = 'completed'
-    elif task_type == 'correction':
-        result_data = verify_and_correct_holomem_info(query)
-        result_status = 'completed'
-    elif task_type == 'psych_analysis':
-        analyze_user_psychology(user_uuid)
-        result_data = "Analysis Complete"
-        result_status = 'completed'
-    
+    except Exception as e:
+        logger.error(f"❌ Background task '{task_type}' failed: {e}")
+        logger.error(traceback.format_exc())
+
     with Session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task:
@@ -381,7 +445,11 @@ def health_check():
 def chat_lsl():
     try:
         data = request.json
+        if not all(k in data for k in ['user_uuid', 'user_name', 'message']):
+            return Response("Error: Missing required fields|", status=400, mimetype='text/plain; charset=utf-8')
+
         user_uuid, user_name, message = data['user_uuid'], data['user_name'], data['message'].strip()
+        
         with Session() as session:
             user_data = get_or_create_user(session, user_uuid, user_name)
             history = get_conversation_history(session, user_uuid, limit=4)
@@ -389,8 +457,7 @@ def chat_lsl():
             session.commit()
 
             response_text = ""
-            is_detailed = is_detailed_request(message)
-
+            
             if correction_req := detect_db_correction_request(message):
                 start_background_task(user_uuid, correction_req, 'correction')
                 response_text = f"え、まじ！？{correction_req['member_name']}の情報、調べてみるね！"
@@ -400,16 +467,19 @@ def chat_lsl():
             elif ('さくらみこ' in message or 'みこち' in message):
                 for keyword, resp in get_sakuramiko_special_responses().items():
                     if keyword in message:
-                        response_text = resp
-                        break
+                        response_text = resp; break
             elif (selected_number := is_number_selection(message)):
                 saved_result = get_saved_search_result(user_uuid, selected_number)
                 if saved_result:
                     prompt = f"「{saved_result['title']}」について詳しく教えて！"
                     response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
+                else:
+                    response_text = "あれ、何の番号だっけ？もう一回検索してみて！"
             elif is_follow_up_question(message, history):
                 last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
                 response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
+            elif is_time_request(message):
+                response_text = get_japan_time()
             elif (location := is_weather_request(message)):
                 response_text = get_weather_forecast(location)
             elif should_search(message):
@@ -423,11 +493,11 @@ def chat_lsl():
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
             session.commit()
             
-            # ▼▼▼ 修正点: LSL向けのプレーンテキスト形式で返す ▼▼▼
             return Response(f"{response_text}|", mimetype='text/plain; charset=utf-8')
 
     except Exception as e:
-        logger.error(f"Chat error: {e}", exc_info=True)
+        logger.error(f"Chat error: {e}")
+        logger.error(traceback.format_exc())
         return Response("ごめん、システムエラーが起きちゃった…|", status=500, mimetype='text/plain; charset=utf-8')
 
 @app.route('/check_task', methods=['POST'])
@@ -476,19 +546,32 @@ def serve_voice(filename):
 # --- アプリケーション起動 ---
 def initialize_app():
     global engine, Session, groq_client
-    logger.info("="*30 + "\n🔧 Mochiko AI (Ultimate Ver.) Starting Up...\n" + "="*30)
-    ensure_voice_directory()
-    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY and len(GROQ_API_KEY) > 20 else None
+    logger.info("="*50)
+    logger.info("🔧 Mochiko AI (Final Ver.) Starting Up...")
+    logger.info("="*50)
     
+    ensure_voice_directory()
+
+    if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
+        try:
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            logger.info("🔍 Verifying Groq API key...")
+            groq_client.chat.completions.create(messages=[{"role": "user", "content": "test"}], model="llama-3.1-8b-instant", max_tokens=2)
+            logger.info("✅ Groq API key is valid and working.")
+        except Exception as e:
+            logger.critical("🔥🔥🔥 FATAL: Groq API key verification failed! The key is likely invalid, expired, or has billing issues. AI features will be disabled. 🔥🔥🔥")
+            logger.critical(f"Error details: {e}")
+            groq_client = None
+    else:
+        logger.warning("⚠️ GROQ_API_KEY is not set or too short. AI features will be disabled.")
+        groq_client = None
+
     is_sqlite = 'sqlite' in DATABASE_URL
     connect_args = {'check_same_thread': False} if is_sqlite else {}
     engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
 
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    
-    # schedule.every(4).hours.do(update_all_hololive_data)
-    # schedule.every(6).hours.do(update_specialized_news)
     
     def run_scheduler():
         while True: 
