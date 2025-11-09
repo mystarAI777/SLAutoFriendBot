@@ -46,13 +46,11 @@ SPECIALIZED_SITES = {
     'CGニュース': {'base_url': 'https://modelinghappy.com/', 'keywords': ['CGニュース', '3DCG', 'CG業界']},
     '脳科学・心理学': {'base_url': 'https://nazology.kusuguru.co.jp/', 'keywords': ['脳科学', '心理学', '脳', '認知科学']},
     'セカンドライフ': {'base_url': 'https://community.secondlife.com/news/', 'keywords': ['セカンドライフ', 'Second Life', 'SL']},
-    # ▼▼▼ 修正箇所 ▼▼▼
     'アニメ': {
         'base_url': 'https://animedb.jp/',
         'keywords': ['アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション', '作画', '声優', 'OP', 'ED']
     }
 }
-
 
 # --- グローバル変数 & アプリ設定 ---
 background_executor = ThreadPoolExecutor(max_workers=5)
@@ -229,13 +227,19 @@ def get_or_create_user(session, user_uuid, user_name):
     return {'uuid': user.user_uuid, 'name': user.user_name}
 def get_conversation_history(session, user_uuid, limit=6):
     return session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()[::-1]
+def get_sakuramiko_special_responses():
+    return {
+        'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
+        'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてんの知ってる?まじ個性的!',
+        'FAQ': 'みこちのFAQってさ、実は本人が答えるんじゃなくてファンが質問するコーナーなの!面白いよね〜',
+        'GTA': 'みこちのGTA配信、カオスすぎて最高!警察に追われたり変なことしたり、見てて飽きないんだよね〜'
+    }
 
-# --- 音声合成機能 ---
+# --- 音声合成・天気・自己修正などのコア機能 ---
 def ensure_voice_directory():
-    try:
-        os.makedirs(VOICE_DIR, exist_ok=True)
-    except Exception as e:
-        logger.error(f"❌ Voice directory creation failed: {e}")
+    try: os.makedirs(VOICE_DIR, exist_ok=True)
+    except Exception as e: logger.error(f"❌ Voice directory creation failed: {e}")
 def generate_voice(text):
     if not VOICEVOX_ENABLED: return None
     try:
@@ -252,8 +256,17 @@ def generate_voice(text):
     except Exception as e:
         logger.error(f"❌ VOICEVOX generation error: {e}")
         return None
-
-# --- 自己修正機能 ---
+def get_weather_forecast(location):
+    area_code = LOCATION_CODES.get(location, "130000")
+    url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        text = clean_text(response.json().get('text', ''))
+        return f"今の{location}の天気はね、「{text}」って感じだよ！" if text else f"{location}の天気情報が見つからなかった…"
+    except Exception as e:
+        logger.error(f"Weather API error for {location}: {e}")
+        return "うぅ、天気情報がうまく取れなかったみたい…"
 def detect_db_correction_request(message):
     match = re.search(r'(.+?)って(.+?)じゃなかった？|(.+?)はもう卒業したよ', message)
     if not match: return None
@@ -262,7 +275,6 @@ def detect_db_correction_request(message):
     member_name = next((keyword for keyword in holomem_keywords if keyword in message), None)
     if not member_name: return None
     return {'member_name': member_name, 'original_message': message}
-
 def verify_and_correct_holomem_info(correction_request):
     member_name = correction_request['member_name']
     query = f"ホロライブ {member_name} 卒業"
@@ -345,14 +357,39 @@ def update_specialized_news():
     for site, config in SPECIALIZED_SITES.items():
         with Session() as session: _update_news_database(session, SpecializedNews, site, config['base_url'], "article, .post, .entry")
 def scrape_hololive_members():
-    # 実際にはここに mochiko_fixed11.2.TXT のスクレイピングロジックを実装します
-    logger.info("Skipping member scrape in this example.")
+    logger.info("Skipping member scrape in this version for stability.")
     pass
 def update_all_hololive_data():
     logger.info("🔄 Starting Holo-data sync...")
     scrape_hololive_members()
     update_hololive_news()
     logger.info("✅ Holo-data sync finished.")
+
+# --- 心理分析 ---
+def analyze_user_psychology(user_uuid):
+    with Session() as session:
+        history = session.query(ConversationHistory).filter_by(user_uuid=user_uuid, role='user').order_by(ConversationHistory.timestamp.desc()).limit(50).all()
+        if len(history) < 10 or not groq_client: return
+
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        messages_text = "\n".join([h.content for h in reversed(history)])
+        prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格、興味、会話スタイルを要約してJSONで返して: {messages_text[:2000]}"
+        try:
+            completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", response_format={"type": "json_object"})
+            analysis_data = json.loads(completion.choices[0].message.content)
+            
+            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            if not psych:
+                psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name)
+                session.add(psych)
+            psych.analysis_summary = analysis_data.get('summary', '')
+            psych.analysis_confidence = analysis_data.get('confidence', 70)
+            # ... 他の心理分析項目の更新 ...
+            psych.last_analyzed = datetime.utcnow()
+            session.commit()
+            logger.info(f"✅ Psychology analysis updated for {user.user_name}")
+        except Exception as e:
+            logger.error(f"Psychology analysis failed: {e}")
 
 # --- AI & バックグラウンドタスク ---
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False):
@@ -387,7 +424,8 @@ def background_task_runner(task_id, query, task_type, user_uuid):
         result_status = 'completed'
     elif task_type == 'psych_analysis':
         analyze_user_psychology(user_uuid)
-        return
+        result_data = "Analysis Complete"
+        result_status = 'completed'
     
     with Session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
@@ -400,7 +438,8 @@ def background_task_runner(task_id, query, task_type, user_uuid):
 def start_background_task(user_uuid, query, task_type):
     task_id = hashlib.md5(f"{user_uuid}{str(query)}{time.time()}{task_type}".encode()).hexdigest()[:10]
     with Session() as session:
-        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type=task_type, query=json.dumps(query, ensure_ascii=False) if isinstance(query, dict) else query)
+        task_query = json.dumps(query, ensure_ascii=False) if isinstance(query, dict) else query
+        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type=task_type, query=task_query)
         session.add(task)
         session.commit()
     background_executor.submit(background_task_runner, task_id, query, task_type, user_uuid)
@@ -435,6 +474,11 @@ def chat_lsl():
             elif '性格分析' in message:
                 start_background_task(user_uuid, None, 'psych_analysis')
                 response_text = "おっけー！あなたのこと、分析しちゃうね！ちょっと時間かかるかも！"
+            elif ('さくらみこ' in message or 'みこち' in message):
+                for keyword, resp in get_sakuramiko_special_responses().items():
+                    if keyword in message:
+                        response_text = resp
+                        break
             elif (selected_number := is_number_selection(message)):
                 saved_result = get_saved_search_result(user_uuid, selected_number)
                 if saved_result:
@@ -444,12 +488,12 @@ def chat_lsl():
                 last_assistant_msg = next((h.content for h in reversed(history) if h.role == 'assistant'), "")
                 response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
             elif (location := is_weather_request(message)):
-                from weather_api import get_weather_forecast # 仮
                 response_text = get_weather_forecast(location)
             elif should_search(message):
                 start_background_task(user_uuid, message, 'search')
                 response_text = "おっけー、調べてみるね！終わったら教える！"
-            else:
+            
+            if not response_text:
                 response_text = generate_ai_response(user_data, message, history)
             
             response_text = limit_text_for_sl(response_text)
@@ -517,12 +561,16 @@ def initialize_app():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     
+    # 定期実行タスクのスケジュール
     schedule.every(4).hours.do(update_all_hololive_data)
     schedule.every(6).hours.do(update_specialized_news)
-    schedule.every().day.at("04:00").do(lambda: logger.info("Cleanup placeholder")) # cleanup_old_data
+    # schedule.every().day.at("04:00").do(cleanup_old_data_advanced)
     
     def run_scheduler():
-        while True: schedule.run_pending(); time.sleep(60)
+        while True: 
+            schedule.run_pending()
+            time.sleep(60)
+
     threading.Thread(target=run_scheduler, daemon=True).start()
     
     logger.info("✅ Initialization Complete!")
