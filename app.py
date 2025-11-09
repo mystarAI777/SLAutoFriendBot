@@ -44,7 +44,7 @@ USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
 LOCATION_CODES = { "東京": "130000", "大阪": "270000", "名古屋": "230000", "福岡": "400000", "札幌": "016000" }
 
 SPECIALIZED_SITES = {
-    'Blender': {'base_url': 'https://docs.blender.org/manual/ja/latest/', 'keywords': ['Blender', 'ブレンダー', '3Dモデリング']},
+    'Blender': {'base_url': 'https://docs.blender.org/manual/ja/latest/', 'keywords': ['Blender', 'ブレンダー', 'blener']},
     'CGニュース': {'base_url': 'https://modelinghappy.com/', 'keywords': ['CGニュース', '3DCG', 'CG業界']},
     '脳科学・心理学': {'base_url': 'https://nazology.kusuguru.co.jp/', 'keywords': ['脳科学', '心理学', '脳', '認知科学']},
     'セカンドライフ': {'base_url': 'https://community.secondlife.com/news/', 'keywords': ['セカンドライフ', 'Second Life', 'SL']},
@@ -65,6 +65,7 @@ Base = declarative_base()
 
 search_context_cache = {}
 cache_lock = Lock()
+g_holomem_keywords = []
 
 # --- 秘密情報/環境変数 読み込み ---
 def get_secret(name):
@@ -82,7 +83,6 @@ VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 if DATABASE_URL and DATABASE_URL.startswith('postgresql'):
     if 'client_encoding' not in DATABASE_URL:
         DATABASE_URL += '?client_encoding=utf8'
-        logger.info("✅ Forcing PostgreSQL client encoding to UTF-8.")
 
 # --- データベースモデル ---
 class UserMemory(Base): 
@@ -106,7 +106,7 @@ class UserPsychology(Base):
     id = Column(Integer, primary_key=True)
     user_uuid = Column(String(255), unique=True, nullable=False, index=True)
     user_name = Column(String(255), nullable=False)
-    analysis_summary = Column(Text)
+    analysis_summary = Column(Text, nullable=True)
     analysis_confidence = Column(Integer, default=0)
     last_analyzed = Column(DateTime, nullable=True)
     last_search_results = Column(Text, nullable=True)
@@ -230,6 +230,8 @@ def is_follow_up_question(message, history):
     return any(re.search(p, message) for p in [r'もっと詳しく', r'それについて詳しく', r'なんで？', r'どういうこと'])
 def should_search(message):
     if len(message) < 5 or is_number_selection(message): return False
+    if is_holomem_name_only_request(message): return False
+    if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']): return False
     if detect_specialized_topic(message) or is_recommendation_request(message): return True
     if any(re.search(p, message) for p in [r'とは', r'について', r'教えて', r'最新', r'調べて', r'検索', r'ニュース']): return True
     return any(word in message for word in ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして'])
@@ -251,10 +253,43 @@ def get_sakuramiko_special_responses():
     return {
         'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
         'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
-        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてんの知ってる?まじ個性的!',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?まじ個性的!',
         'FAQ': 'みこちのFAQってさ、実は本人が答えるんじゃなくてファンが質問するコーナーなの!面白いよね〜',
         'GTA': 'みこちのGTA配信、カオスすぎて最高!警察に追われたり変なことしたり、見てて飽きないんだよね〜'
     }
+
+def initialize_holomem_wiki():
+    with Session() as session:
+        if session.query(HolomemWiki).count() > 10: return
+        initial_data = [
+            {'member_name': 'ときのそら', 'generation': '0期生', 'description': 'ホロライブの原点であり、みんなの憧れのアイドル！歌声がまじで神がかってる！'},
+            {'member_name': '宝鐘マリン', 'generation': '3期生', 'description': '自称17歳のセクシー（笑）な女海賊船長！トークも歌も面白くて、まじ天才！'},
+            {'member_name': '兎田ぺこら', 'generation': '3期生', 'description': '「ぺこ」が口癖のうさ耳VTuber！いたずら好きだけど、根は優しくて面白い配信の王！'},
+            {'member_name': '天音かなた', 'generation': '4期生', 'description': '天界から来た天使！パワフルな歌声と握力50kgのギャップがうける！PP天使！'},
+        ]
+        for data in initial_data:
+            if not session.query(HolomemWiki).filter_by(member_name=data['member_name']).first():
+                session.add(HolomemWiki(**data))
+        session.commit()
+        update_holomem_keywords()
+
+def update_holomem_keywords():
+    global g_holomem_keywords
+    with Session() as session:
+        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki.member_name).all()]
+    logger.info(f"✅ Holomem keywords updated: {len(g_holomem_keywords)} members")
+
+def is_holomem_name_only_request(message):
+    if len(message) > 15: return None
+    for name in g_holomem_keywords:
+        if name in message:
+            # 「〇〇のニュース」のような場合を除外
+            if len(message.replace(name, "").strip()) < 5:
+                return name
+    return None
+
+def get_holomem_info(session, member_name):
+    return session.query(HolomemWiki).filter_by(member_name=member_name).first()
 
 # --- コア機能 (音声, 天気, 自己修正) ---
 def ensure_voice_directory():
@@ -290,9 +325,7 @@ def get_weather_forecast(location):
 def detect_db_correction_request(message):
     match = re.search(r'(.+?)って(.+?)じゃなかった？|(.+?)はもう卒業したよ', message)
     if not match: return None
-    with Session() as session:
-        holomem_keywords = [row[0] for row in session.query(HolomemWiki.member_name).all()]
-    member_name = next((keyword for keyword in holomem_keywords if keyword in message), None)
+    member_name = next((keyword for keyword in g_holomem_keywords if keyword in message), None)
     if not member_name: return None
     return {'member_name': member_name, 'original_message': message}
 def verify_and_correct_holomem_info(correction_request):
@@ -346,13 +379,14 @@ def scrape_major_search_engines(query, num_results=3):
 # --- 心理分析 ---
 def analyze_user_psychology(user_uuid):
     with Session() as session:
-        history = session.query(ConversationHistory).filter_by(user_uuid=user_uuid, role='user').order_by(ConversationHistory.timestamp.desc()).limit(50).all()
-        if len(history) < 10 or not groq_client: return
-
-        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-        messages_text = "\n".join([h.content for h in reversed(history)])
-        prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格、興味、会話スタイルを要約してJSONで返してください（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
         try:
+            history = session.query(ConversationHistory).filter_by(user_uuid=user_uuid, role='user').order_by(ConversationHistory.timestamp.desc()).limit(50).all()
+            if len(history) < 10 or not groq_client: return
+
+            user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+            messages_text = "\n".join([h.content for h in reversed(history)])
+            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格、興味、会話スタイルを要約してJSONで返してください（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
+            
             completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", response_format={"type": "json_object"})
             analysis_data = json.loads(completion.choices[0].message.content)
             
@@ -360,9 +394,12 @@ def analyze_user_psychology(user_uuid):
             if not psych:
                 psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name)
                 session.add(psych)
-            psych.analysis_summary = analysis_data.get('summary', '')
-            psych.analysis_confidence = analysis_data.get('confidence', 70)
-            psych.last_analyzed = datetime.utcnow()
+            
+            if 'analysis_summary' in UserPsychology.__table__.columns:
+                psych.analysis_summary = analysis_data.get('summary', '')
+                psych.analysis_confidence = analysis_data.get('confidence', 70)
+                psych.last_analyzed = datetime.utcnow()
+            
             session.commit()
             logger.info(f"✅ Psychology analysis updated for {user.user_name}")
         except Exception as e:
@@ -385,8 +422,10 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
             logger.warning(f"⚠️ Psychology fetch failed (continuing without): {db_error}")
         
         system_prompt = f"""あなたは「もちこ」という明るいギャルAIです。{user_data['name']}さんと話しています。
+- あなたの名前は「もちこ」です。「さくらみこ」や「みこち」はホロライブのVTuberで、あなたとは別人です。絶対に混同しないでください。
 - 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。
-- 短くテンポよく、共感しながら返す。{psych_prompt}"""
+- 短くテンポよく、共感しながら返す。{psych_prompt}
+- 【重要】確実な情報（参考情報やDBの情報）がない場合は、安易に断定せず「〜だと思うな」「推測だけど〜かも！」のように不確かな表現を使うか、「その情報は持ってないや、ごめんね！」と正直に答えること。"""
         
         if is_detailed: 
             system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
@@ -470,7 +509,6 @@ def chat_lsl():
 
             response_text = ""
             
-            # ▼▼▼ 修正: ホロライブニュース専用処理を追加 ▼▼▼
             if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']):
                 news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if news_items:
@@ -480,7 +518,6 @@ def chat_lsl():
                 else:
                     start_background_task(user_uuid, "ホロライブ 最新ニュース", 'search')
                     response_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
-
             elif (correction_req := detect_db_correction_request(message)):
                 start_background_task(user_uuid, correction_req, 'correction')
                 response_text = f"え、まじ！？{correction_req['member_name']}の情報、調べてみるね！"
@@ -491,10 +528,15 @@ def chat_lsl():
                 for keyword, resp in get_sakuramiko_special_responses().items():
                     if keyword in message:
                         response_text = resp; break
-                if not response_text: # 「みこち」だけの場合
+                if not response_text:
+                    response_text = generate_ai_response(user_data, message, history, "さくらみこはホロライブ所属の人気VTuber。独特な口癖やゲーム実況が人気。")
+            elif (member_name := is_holomem_name_only_request(message)):
+                member_info = get_holomem_info(session, member_name)
+                if member_info:
+                    response_text = generate_ai_response(user_data, f"{member_name}について教えて", history, member_info.description)
+                else:
                     response_text = generate_ai_response(user_data, message, history)
             elif (selected_number := is_number_selection(message)):
-                # ニュースの詳細要求もここで処理
                 news_detail = get_cached_news_detail(session, user_uuid, selected_number)
                 if news_detail:
                     response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
@@ -505,7 +547,6 @@ def chat_lsl():
                         response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
                     else:
                         response_text = "あれ、何の番号だっけ？もう一回検索してみて！"
-
             elif is_follow_up_question(message, history):
                 last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
                 response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
@@ -558,7 +599,9 @@ def check_task_endpoint():
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
             session.delete(task)
             session.commit()
-            return jsonify({'status': 'completed', 'response': response_text})
+            
+            return Response(json.dumps({'status': 'completed', 'response': response_text}, ensure_ascii=False), mimetype='application/json; charset=utf-8')
+            
     except Exception as e:
         logger.error(f"Check task error: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
@@ -603,6 +646,8 @@ def initialize_app():
 
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
+    
+    initialize_holomem_wiki()
     
     def run_scheduler():
         while True: 
