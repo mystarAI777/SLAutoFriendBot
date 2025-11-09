@@ -185,7 +185,7 @@ def get_or_create_user(session, user_uuid, user_name):
     session.commit()
     return {'uuid': user.user_uuid, 'name': user.user_name}
 def get_conversation_history(session, user_uuid, limit=6):
-    return session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()[::-1]
+    return session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
 def get_sakuramiko_special_responses():
     return {
         'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
@@ -319,11 +319,15 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
 - 短くテンポよく、共感しながら返す。{psych_prompt}"""
         if is_detailed: system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
         if reference_info: system_prompt += f"\n【参考情報】: {reference_info}"
+        
         messages = [{"role": "system", "content": system_prompt}]
-        for h in history: messages.append({"role": "assistant" if h.role == "assistant" else "user", "content": h.content})
+        # ▼▼▼ 修正点: reversed()で履歴を正しい順序に ▼▼▼
+        for h in reversed(history): 
+            messages.append({"role": "assistant" if h.role == "assistant" else "user", "content": h.content})
         messages.append({"role": "user", "content": message})
         
         completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=400 if is_detailed else 200)
+        # ▼▼▼ 修正点: 正しい応答の取得方法 ▼▼▼
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"AI response error: {e}")
@@ -404,7 +408,7 @@ def chat_lsl():
                     prompt = f"「{saved_result['title']}」について詳しく教えて！"
                     response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
             elif is_follow_up_question(message, history):
-                last_assistant_msg = next((h.content for h in reversed(history) if h.role == 'assistant'), "")
+                last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
                 response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
             elif (location := is_weather_request(message)):
                 response_text = get_weather_forecast(location)
@@ -419,7 +423,7 @@ def chat_lsl():
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
             session.commit()
             
-            # ▼▼▼ 修正箇所: jsonifyではなくプレーンテキストで返す ▼▼▼
+            # ▼▼▼ 修正点: LSL向けのプレーンテキスト形式で返す ▼▼▼
             return Response(f"{response_text}|", mimetype='text/plain; charset=utf-8')
 
     except Exception as e:
@@ -453,7 +457,6 @@ def check_task_endpoint():
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
             session.delete(task)
             session.commit()
-            # ▼▼▼ 修正箇所: LSL向けにレスポンス形式を統一 ▼▼▼
             return jsonify({'status': 'completed', 'response': response_text})
     except Exception as e:
         logger.error(f"Check task error: {e}", exc_info=True)
