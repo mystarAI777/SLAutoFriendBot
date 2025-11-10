@@ -172,6 +172,11 @@ def save_news_cache(session, user_uuid, news_items, news_type='hololive'):
         cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type=news_type)
         session.add(cache)
     session.commit()
+    # メモリキャッシュをクリアして衝突を防ぐ
+    with cache_lock:
+        if user_uuid in search_context_cache:
+            del search_context_cache[user_uuid]
+
 def get_cached_news_detail(session, user_uuid, news_number):
     cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number).first()
     if not cache: return None
@@ -180,6 +185,7 @@ def get_cached_news_detail(session, user_uuid, news_number):
 def save_search_context(user_uuid, search_results, query):
     with cache_lock:
         search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
+    # DBへの保存は試行するが、失敗してもメモリキャッシュで機能する
     try:
         with Session() as session:
             psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
@@ -201,14 +207,6 @@ def get_saved_search_result(user_uuid, number):
         for r in cached_data['results']:
             if r.get('number') == number:
                 return r
-    try:
-        with Session() as session:
-            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-            if psych and 'last_search_results' in UserPsychology.__table__.columns and psych.last_search_results:
-                search_results = json.loads(psych.last_search_results)
-                return next((r for r in search_results if r.get('number') == number), None)
-    except Exception as e:
-        logger.warning(f"⚠️ Search result DB fetch failed: {e}")
     return None
 
 def is_recommendation_request(message): return any(kw in message for kw in ['おすすめ', 'オススメ', '人気'])
@@ -253,19 +251,19 @@ def get_sakuramiko_special_responses():
     return {
         'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
         'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
-        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?まじ個性的!',
-        'FAQ': 'みこちのFAQってさ、実は本人が答えるんじゃなくてファンが質問するコーナーなの!面白いよね〜',
-        'GTA': 'みこちのGTA配信、カオスすぎて最高!警察に追われたり変なことしたり、見てて飽きないんだよね〜'
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてんの知ってる?まじ個性的!',
     }
 
 def initialize_holomem_wiki():
     with Session() as session:
-        if session.query(HolomemWiki).count() > 10: return
+        if session.query(HolomemWiki).count() > 10: 
+            update_holomem_keywords(); return
         initial_data = [
             {'member_name': 'ときのそら', 'generation': '0期生', 'description': 'ホロライブの原点であり、みんなの憧れのアイドル！歌声がまじで神がかってる！'},
             {'member_name': '宝鐘マリン', 'generation': '3期生', 'description': '自称17歳のセクシー（笑）な女海賊船長！トークも歌も面白くて、まじ天才！'},
             {'member_name': '兎田ぺこら', 'generation': '3期生', 'description': '「ぺこ」が口癖のうさ耳VTuber！いたずら好きだけど、根は優しくて面白い配信の王！'},
             {'member_name': '天音かなた', 'generation': '4期生', 'description': '天界から来た天使！パワフルな歌声と握力50kgのギャップがうける！PP天使！'},
+            {'member_name': 'さくらみこ', 'generation': '0期生', 'description': '「にぇ」が口癖のエリート巫女VTuber！ポンコツかわいいところが最高なんだよね〜！'}
         ]
         for data in initial_data:
             if not session.query(HolomemWiki).filter_by(member_name=data['member_name']).first():
@@ -282,16 +280,14 @@ def update_holomem_keywords():
 def is_holomem_name_only_request(message):
     if len(message) > 15: return None
     for name in g_holomem_keywords:
-        if name in message:
-            # 「〇〇のニュース」のような場合を除外
-            if len(message.replace(name, "").strip()) < 5:
-                return name
+        if name in message and len(message.replace(name, "").strip()) < 5:
+            return name
     return None
 
 def get_holomem_info(session, member_name):
     return session.query(HolomemWiki).filter_by(member_name=member_name).first()
 
-# --- コア機能 (音声, 天気, 自己修正) ---
+# --- コア機能 (音声, 天気, 検索) ---
 def ensure_voice_directory():
     try: os.makedirs(VOICE_DIR, exist_ok=True)
     except Exception as e: logger.error(f"❌ Voice directory creation failed: {e}")
@@ -301,7 +297,6 @@ def generate_voice(text):
         voicevox_url = VOICEVOX_URL_FROM_ENV or "http://localhost:50021"
         final_text = limit_text_for_sl(text, 150)
         query_response = requests.post(f"{voicevox_url}/audio_query", params={"text": final_text, "speaker": VOICEVOX_SPEAKER_ID}, timeout=10)
-        query_response.raise_for_status()
         synthesis_response = requests.post(f"{voicevox_url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=query_response.json(), timeout=30)
         synthesis_response.raise_for_status()
         filename = f"voice_{int(time.time())}_{random.randint(1000, 9999)}.wav"
@@ -322,40 +317,6 @@ def get_weather_forecast(location):
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "うぅ、天気情報がうまく取れなかったみたい…"
-def detect_db_correction_request(message):
-    match = re.search(r'(.+?)って(.+?)じゃなかった？|(.+?)はもう卒業したよ', message)
-    if not match: return None
-    member_name = next((keyword for keyword in g_holomem_keywords if keyword in message), None)
-    if not member_name: return None
-    return {'member_name': member_name, 'original_message': message}
-def verify_and_correct_holomem_info(correction_request):
-    member_name = correction_request['member_name']
-    query = f"ホロライブ {member_name} 卒業"
-    search_results = scrape_major_search_engines(query, 3)
-    if not search_results or not groq_client: return "ごめん、うまく確認できなかった…"
-    
-    summary = "\n".join([r['snippet'] for r in search_results])
-    prompt = f"以下の情報に基づき、「{member_name}」が卒業しているか、しているなら日付はいつか簡潔に答えて。\n\n{summary}"
-    try:
-        completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", temperature=0.1, max_tokens=100)
-        verification_text = completion.choices[0].message.content
-        grad_date_match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', verification_text)
-        if "卒業しています" in verification_text and grad_date_match:
-            grad_date = grad_date_match.group(0)
-            with Session() as session:
-                member = session.query(HolomemWiki).filter_by(member_name=member_name).first()
-                if member and (member.is_active or member.graduation_date != grad_date):
-                    member.is_active = False
-                    member.graduation_date = grad_date
-                    member.last_updated = datetime.utcnow()
-                    session.commit()
-                    return f"本当だ！教えてくれてありがと！{member_name}ちゃんの情報を「{grad_date}に卒業」って直しといたよ！"
-        return "うーん、調べてみたけど、はっきりとは分からなかったな…。"
-    except Exception as e:
-        logger.error(f"Error during verification: {e}")
-        return "AIでの確認中にエラーが出ちゃった。"
-
-# --- ニュース・Web検索・DB更新 ---
 def scrape_major_search_engines(query, num_results=3):
     search_configs = [
         {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'selector': 'li.b_algo'},
@@ -385,7 +346,7 @@ def analyze_user_psychology(user_uuid):
 
             user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
             messages_text = "\n".join([h.content for h in reversed(history)])
-            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格、興味、会話スタイルを要約してJSONで返してください（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
+            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格を要約してJSONで返して（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
             
             completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", response_format={"type": "json_object"})
             analysis_data = json.loads(completion.choices[0].message.content)
@@ -395,7 +356,7 @@ def analyze_user_psychology(user_uuid):
                 psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name)
                 session.add(psych)
             
-            if 'analysis_summary' in UserPsychology.__table__.columns:
+            if hasattr(psych, 'analysis_summary'):
                 psych.analysis_summary = analysis_data.get('summary', '')
                 psych.analysis_confidence = analysis_data.get('confidence', 70)
                 psych.last_analyzed = datetime.utcnow()
@@ -411,12 +372,11 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         return "はーい！何か話そっか！(※ただいまAI機能はオフラインだよ)"
     
     try:
-        psych = None
         psych_prompt = ""
         try:
             with Session() as session:
                 psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
-            if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary and psych.analysis_confidence > 40:
+            if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary:
                 psych_prompt = f"\n# 【{user_data['name']}さんの特性】\n- {psych.analysis_summary}"
         except Exception as db_error:
             logger.warning(f"⚠️ Psychology fetch failed (continuing without): {db_error}")
@@ -424,8 +384,8 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         system_prompt = f"""あなたは「もちこ」という明るいギャルAIです。{user_data['name']}さんと話しています。
 - あなたの名前は「もちこ」です。「さくらみこ」や「みこち」はホロライブのVTuberで、あなたとは別人です。絶対に混同しないでください。
 - 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。
-- 短くテンポよく、共感しながら返す。{psych_prompt}
-- 【重要】確実な情報（参考情報やDBの情報）がない場合は、安易に断定せず「〜だと思うな」「推測だけど〜かも！」のように不確かな表現を使うか、「その情報は持ってないや、ごめんね！」と正直に答えること。"""
+- 【重要】確実な情報（参考情報やDBの情報）がない場合は、安易に断定せず「〜だと思うな」「推測だけど〜かも！」のように不確かな表現を使うか、「その情報は持ってないや、ごめんね！」と正直に答えること。
+{psych_prompt}"""
         
         if is_detailed: 
             system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
@@ -455,8 +415,6 @@ def background_task_runner(task_id, query, task_type, user_uuid):
             elif (topic := detect_specialized_topic(query)): search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
             raw_results = scrape_major_search_engines(search_query, 5)
             result_data = json.dumps(format_search_results_as_list(raw_results), ensure_ascii=False) if raw_results else None
-        elif task_type == 'correction':
-            result_data = verify_and_correct_holomem_info(query)
         elif task_type == 'psych_analysis':
             analyze_user_psychology(user_uuid)
             result_data = "Analysis Complete"
@@ -476,8 +434,7 @@ def background_task_runner(task_id, query, task_type, user_uuid):
 def start_background_task(user_uuid, query, task_type):
     task_id = hashlib.md5(f"{user_uuid}{str(query)}{time.time()}{task_type}".encode()).hexdigest()[:10]
     with Session() as session:
-        task_query = json.dumps(query, ensure_ascii=False) if isinstance(query, dict) else query
-        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type=task_type, query=task_query)
+        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type=task_type, query=query)
         session.add(task)
         session.commit()
     background_executor.submit(background_task_runner, task_id, query, task_type, user_uuid)
@@ -490,7 +447,7 @@ def health_check():
     try:
         with engine.connect() as conn: conn.execute(text("SELECT 1")); db_ok = 'ok'
     except: pass
-    return jsonify({'status': 'ok', 'db': db_ok, 'ai': 'ok' if groq_client else 'disabled', 'voice': 'ok' if VOICEVOX_ENABLED else 'disabled'})
+    return jsonify({'status': 'ok', 'db': db_ok, 'ai': 'ok' if groq_client else 'disabled'})
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
@@ -518,11 +475,8 @@ def chat_lsl():
                 else:
                     start_background_task(user_uuid, "ホロライブ 最新ニュース", 'search')
                     response_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
-            elif (correction_req := detect_db_correction_request(message)):
-                start_background_task(user_uuid, correction_req, 'correction')
-                response_text = f"え、まじ！？{correction_req['member_name']}の情報、調べてみるね！"
             elif '性格分析' in message:
-                start_background_task(user_uuid, None, 'psych_analysis')
+                start_background_task(user_uuid, message, 'psych_analysis')
                 response_text = "おっけー！あなたのこと、分析しちゃうね！ちょっと時間かかるかも！"
             elif ('さくらみこ' in message or 'みこち' in message):
                 for keyword, resp in get_sakuramiko_special_responses().items():
@@ -535,7 +489,8 @@ def chat_lsl():
                 if member_info:
                     response_text = generate_ai_response(user_data, f"{member_name}について教えて", history, member_info.description)
                 else:
-                    response_text = generate_ai_response(user_data, message, history)
+                    start_background_task(user_uuid, message, 'search')
+                    response_text = f"ごめん、「{message}」ちゃんの詳しい情報は持ってないや…。Webで調べてみるね！"
             elif (selected_number := is_number_selection(message)):
                 news_detail = get_cached_news_detail(session, user_uuid, selected_number)
                 if news_detail:
@@ -589,8 +544,6 @@ def check_task_endpoint():
                     save_search_context(user_uuid, results, task.query)
                     list_items = [f"【{r['number']}】{r['title']}" for r in results]
                     response_text = f"おまたせ！「{task.query}」について調べてきたよ！\n" + "\n".join(list_items) + "\n\n気になる番号教えて！"
-            elif task.task_type == 'correction':
-                response_text = task.result
             elif task.task_type == 'psych_analysis':
                 psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
                 response_text = f"分析終わったよ！あてぃしが見たあなたは…「{psych.analysis_summary}」って感じ！(信頼度: {psych.analysis_confidence}%)" if psych and psych.analysis_summary else "分析終わったけど、まだうまくまとめられないや…"
@@ -606,25 +559,12 @@ def check_task_endpoint():
         logger.error(f"Check task error: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/generate_voice', methods=['POST'])
-def generate_voice_endpoint():
-    data = request.json
-    if not data or not (text := data.get('text')): return jsonify({'error': 'text is required'}), 400
-    if voice_path := generate_voice(text):
-        return jsonify({'url': f"{SERVER_URL}/voices/{os.path.basename(voice_path)}"})
-    return jsonify({'error': 'Failed to generate voice'}), 500
-@app.route('/voices/<filename>')
-def serve_voice(filename):
-    return send_from_directory(VOICE_DIR, filename)
-
 # --- アプリケーション起動 ---
 def initialize_app():
     global engine, Session, groq_client
     logger.info("="*50)
     logger.info("🔧 Mochiko AI (Final Ver.) Starting Up...")
     logger.info("="*50)
-    
-    ensure_voice_directory()
 
     if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
         try:
@@ -633,8 +573,7 @@ def initialize_app():
             groq_client.chat.completions.create(messages=[{"role": "user", "content": "test"}], model="llama-3.1-8b-instant", max_tokens=2)
             logger.info("✅ Groq API key is valid and working.")
         except Exception as e:
-            logger.critical("🔥🔥🔥 FATAL: Groq API key verification failed! The key is likely invalid, expired, or has billing issues. AI features will be disabled. 🔥🔥🔥")
-            logger.critical(f"Error details: {e}")
+            logger.critical("🔥🔥🔥 FATAL: Groq API key verification failed! 🔥🔥🔥")
             groq_client = None
     else:
         logger.warning("⚠️ GROQ_API_KEY is not set or too short. AI features will be disabled.")
@@ -668,4 +607,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    application.run(host='0.0.0.0', port=port, debug=False)
+    application.run(host='0.0.0.0', port=port, debug=False)```
