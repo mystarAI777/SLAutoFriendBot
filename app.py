@@ -275,10 +275,11 @@ def initialize_holomem_wiki():
         session.commit()
         update_holomem_keywords()
 
+# ▼▼▼ 修正: データベースクエリを修正 ▼▼▼
 def update_holomem_keywords():
     global g_holomem_keywords
     with Session() as session:
-        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki).all()]
+        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki.member_name).all()]
     logger.info(f"✅ Holomem keywords updated: {len(g_holomem_keywords)} members")
 
 def is_holomem_name_only_request(message):
@@ -323,9 +324,8 @@ def get_weather_forecast(location):
         return "うぅ、天気情報がうまく取れなかったみたい…"
 def scrape_major_search_engines(query, num_results=3):
     search_configs = [
-        {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'selector': 'li.b_algo'},
-        {'name': 'Yahoo', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'selector': 'div.Algo'},
-        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja", 'selector': 'div.g'}
+        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja", 'selector': 'div.g'},
+        {'name': 'Yahoo', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'selector': 'div.Algo'}
     ]
     for config in search_configs:
         try:
@@ -528,7 +528,7 @@ def chat_lsl():
                         response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
                     else:
                         response_text = "あれ、その番号のニュースが見つからないや…"
-                else: # デフォルトをWeb検索にする
+                else:
                     saved_result = get_saved_search_result(user_uuid, selected_number)
                     if saved_result:
                         prompt = f"「{saved_result['title']}」について詳しく教えて！"
