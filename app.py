@@ -109,8 +109,6 @@ class UserPsychology(Base):
     analysis_summary = Column(Text, nullable=True)
     analysis_confidence = Column(Integer, default=0)
     last_analyzed = Column(DateTime, nullable=True)
-    last_search_results = Column(Text, nullable=True)
-    search_context = Column(String(500), nullable=True)
     
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
@@ -166,13 +164,12 @@ def format_search_results_as_list(results):
     if not results: return None
     return [{'number': i, 'title': r.get('title', ''), 'snippet': r.get('snippet', ''), 'full_content': r.get('snippet', '')} for i, r in enumerate(results[:5], 1)]
 
-def save_news_cache(session, user_uuid, news_items, news_type='hololive'):
+def save_news_cache(session, user_uuid, news_items):
     session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
     for i, news in enumerate(news_items, 1):
-        cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type=news_type)
+        cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type='hololive')
         session.add(cache)
     session.commit()
-    # メモリキャッシュをクリアして衝突を防ぐ
     with cache_lock:
         if user_uuid in search_context_cache:
             del search_context_cache[user_uuid]
@@ -185,20 +182,12 @@ def get_cached_news_detail(session, user_uuid, news_number):
 def save_search_context(user_uuid, search_results, query):
     with cache_lock:
         search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
-    # DBへの保存は試行するが、失敗してもメモリキャッシュで機能する
     try:
         with Session() as session:
-            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-            if not psych:
-                user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-                psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name if user else 'Unknown')
-                session.add(psych)
-            if 'last_search_results' in UserPsychology.__table__.columns:
-                psych.last_search_results = json.dumps(search_results, ensure_ascii=False)
-                psych.search_context = query
-                session.commit()
+            session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
+            session.commit()
     except Exception as e:
-        logger.warning(f"⚠️ Search context DB save failed, relying on cache: {e}")
+        logger.warning(f"Failed to clear news cache: {e}")
 
 def get_saved_search_result(user_uuid, number):
     with cache_lock:
@@ -249,9 +238,9 @@ def get_conversation_history(session, user_uuid, limit=6):
 
 def get_sakuramiko_special_responses():
     return {
-        'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
+        'にぇ': 'みこちの「にぇ」、まじかわいいよね!あの独特な口癖がエリートの証なんだって〜うける!',
         'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
-        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてんの知ってる?まじ個性的!',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?まじ個性的!',
     }
 
 def initialize_holomem_wiki():
@@ -274,7 +263,7 @@ def initialize_holomem_wiki():
 def update_holomem_keywords():
     global g_holomem_keywords
     with Session() as session:
-        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki.member_name).all()]
+        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki).all()]
     logger.info(f"✅ Holomem keywords updated: {len(g_holomem_keywords)} members")
 
 def is_holomem_name_only_request(message):
@@ -346,7 +335,7 @@ def analyze_user_psychology(user_uuid):
 
             user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
             messages_text = "\n".join([h.content for h in reversed(history)])
-            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格を要約してJSONで返して（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
+            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格を要約してJSONで返してください（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
             
             completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", response_format={"type": "json_object"})
             analysis_data = json.loads(completion.choices[0].message.content)
@@ -411,7 +400,7 @@ def background_task_runner(task_id, query, task_type, user_uuid):
     try:
         if task_type == 'search':
             search_query = query
-            if (topic := extract_recommendation_topic(query)): search_query = f"おすすめ {topic} ランキング 2025"
+            if (topic := extract_recommendation_topic(query)): search_query = f"おすすめ {topic} ランキング"
             elif (topic := detect_specialized_topic(query)): search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
             raw_results = scrape_major_search_engines(search_query, 5)
             result_data = json.dumps(format_search_results_as_list(raw_results), ensure_ascii=False) if raw_results else None
@@ -469,7 +458,7 @@ def chat_lsl():
             if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']):
                 news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if news_items:
-                    save_news_cache(session, user_uuid, news_items, 'hololive')
+                    save_news_cache(session, user_uuid, news_items)
                     news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
                     response_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
                 else:
@@ -565,7 +554,7 @@ def initialize_app():
     logger.info("="*50)
     logger.info("🔧 Mochiko AI (Final Ver.) Starting Up...")
     logger.info("="*50)
-
+    
     if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
         try:
             groq_client = Groq(api_key=GROQ_API_KEY)
