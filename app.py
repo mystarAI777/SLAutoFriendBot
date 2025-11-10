@@ -109,6 +109,8 @@ class UserPsychology(Base):
     analysis_summary = Column(Text, nullable=True)
     analysis_confidence = Column(Integer, default=0)
     last_analyzed = Column(DateTime, nullable=True)
+    last_search_results = Column(Text, nullable=True)
+    search_context = Column(String(500), nullable=True)
     
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
@@ -178,6 +180,9 @@ def save_news_cache(session, user_uuid, news_items):
         cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type='hololive')
         session.add(cache)
     session.commit()
+    with cache_lock:
+        if user_uuid in search_context_cache:
+            del search_context_cache[user_uuid]
 
 def get_cached_news_detail(session, user_uuid, news_number):
     cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number).first()
@@ -187,6 +192,12 @@ def get_cached_news_detail(session, user_uuid, news_number):
 def save_search_context(user_uuid, search_results, query):
     with cache_lock:
         search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
+    try:
+        with Session() as session:
+            session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
+            session.commit()
+    except Exception as e:
+        logger.warning(f"Failed to clear news cache: {e}")
 
 def get_saved_search_result(user_uuid, number):
     with cache_lock:
@@ -275,7 +286,6 @@ def initialize_holomem_wiki():
         session.commit()
         update_holomem_keywords()
 
-# ▼▼▼ 修正: データベースクエリを修正 ▼▼▼
 def update_holomem_keywords():
     global g_holomem_keywords
     with Session() as session:
@@ -528,7 +538,7 @@ def chat_lsl():
                         response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
                     else:
                         response_text = "あれ、その番号のニュースが見つからないや…"
-                else:
+                else: 
                     saved_result = get_saved_search_result(user_uuid, selected_number)
                     if saved_result:
                         prompt = f"「{saved_result['title']}」について詳しく教えて！"
