@@ -151,6 +151,14 @@ class NewsCache(Base):
     news_type = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class UserContext(Base):
+    __tablename__ = 'user_context'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
+    last_context_type = Column(String(50), nullable=False)
+    last_query = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # --- ヘルパー関数群 ---
 def clean_text(text): return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip() if text else ""
 def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT): return text[:max_length-3] + "..." if len(text) > max_length else text
@@ -170,9 +178,6 @@ def save_news_cache(session, user_uuid, news_items):
         cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type='hololive')
         session.add(cache)
     session.commit()
-    with cache_lock:
-        if user_uuid in search_context_cache:
-            del search_context_cache[user_uuid]
 
 def get_cached_news_detail(session, user_uuid, news_number):
     cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number).first()
@@ -182,12 +187,6 @@ def get_cached_news_detail(session, user_uuid, news_number):
 def save_search_context(user_uuid, search_results, query):
     with cache_lock:
         search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
-    try:
-        with Session() as session:
-            session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
-            session.commit()
-    except Exception as e:
-        logger.warning(f"Failed to clear news cache: {e}")
 
 def get_saved_search_result(user_uuid, number):
     with cache_lock:
@@ -196,6 +195,22 @@ def get_saved_search_result(user_uuid, number):
         for r in cached_data['results']:
             if r.get('number') == number:
                 return r
+    return None
+
+def save_user_context(session, user_uuid, context_type, query):
+    context = session.query(UserContext).filter_by(user_uuid=user_uuid).first()
+    if not context:
+        context = UserContext(user_uuid=user_uuid, last_context_type=context_type, last_query=query)
+        session.add(context)
+    else:
+        context.last_context_type = context_type
+        context.last_query = query
+    session.commit()
+
+def get_user_context(session, user_uuid):
+    context = session.query(UserContext).filter_by(user_uuid=user_uuid).first()
+    if context and (datetime.utcnow() - context.updated_at).total_seconds() < 600:
+        return {'type': context.last_context_type, 'query': context.last_query}
     return None
 
 def is_recommendation_request(message): return any(kw in message for kw in ['おすすめ', 'オススメ', '人気'])
@@ -238,7 +253,7 @@ def get_conversation_history(session, user_uuid, limit=6):
 
 def get_sakuramiko_special_responses():
     return {
-        'にぇ': 'みこちの「にぇ」、まじかわいいよね!あの独特な口癖がエリートの証なんだって〜うける!',
+        'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
         'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
         'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?まじ個性的!',
     }
@@ -310,6 +325,7 @@ def scrape_major_search_engines(query, num_results=3):
     search_configs = [
         {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'selector': 'li.b_algo'},
         {'name': 'Yahoo', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'selector': 'div.Algo'},
+        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja", 'selector': 'div.g'}
     ]
     for config in search_configs:
         try:
@@ -318,12 +334,16 @@ def scrape_major_search_engines(query, num_results=3):
             soup = BeautifulSoup(response.content, 'html.parser')
             results = []
             for elem in soup.select(config['selector'])[:num_results]:
-                title_elem = elem.select_one('h2, h3')
-                snippet_elem = elem.select_one('.b_caption p, .compText')
+                title_elem = elem.select_one('h2, h3, .LC20lb')
+                snippet_elem = elem.select_one('.b_caption p, .compText, .VwiC3b')
                 if title_elem and snippet_elem:
                     results.append({'title': clean_text(title_elem.get_text()), 'snippet': clean_text(snippet_elem.get_text())})
-            if results: return results
-        except Exception: continue
+            if results: 
+                logger.info(f"✅ Search successful on {config['name']}")
+                return results
+        except Exception as e:
+            logger.warning(f"⚠️ Search failed on {config['name']}: {e}")
+            continue
     return []
 
 # --- 心理分析 ---
@@ -345,10 +365,9 @@ def analyze_user_psychology(user_uuid):
                 psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name)
                 session.add(psych)
             
-            if hasattr(psych, 'analysis_summary'):
-                psych.analysis_summary = analysis_data.get('summary', '')
-                psych.analysis_confidence = analysis_data.get('confidence', 70)
-                psych.last_analyzed = datetime.utcnow()
+            psych.analysis_summary = analysis_data.get('summary', '')
+            psych.analysis_confidence = analysis_data.get('confidence', 70)
+            psych.last_analyzed = datetime.utcnow()
             
             session.commit()
             logger.info(f"✅ Psychology analysis updated for {user.user_name}")
@@ -356,9 +375,9 @@ def analyze_user_psychology(user_uuid):
             logger.error(f"Psychology analysis failed: {e}")
 
 # --- AI & バックグラウンドタスク ---
-def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False):
+def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
     if not groq_client: 
-        return "はーい！何か話そっか！(※ただいまAI機能はオフラインだよ)"
+        return generate_fallback_response(message, reference_info)
     
     try:
         psych_prompt = ""
@@ -370,13 +389,19 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         except Exception as db_error:
             logger.warning(f"⚠️ Psychology fetch failed (continuing without): {db_error}")
         
-        system_prompt = f"""あなたは「もちこ」という明るいギャルAIです。{user_data['name']}さんと話しています。
-- あなたの名前は「もちこ」です。「さくらみこ」や「みこち」はホロライブのVTuberで、あなたとは別人です。絶対に混同しないでください。
+        system_prompt = f"""あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。
+# 基本的な性格:
 - 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。
+- 友達のように気軽に、優しく、ノリが良い。
+# 会話スタイル:
+- 普段は普通の日常会話を楽しむこと（天気、食べ物、趣味、感情、世間話など）。
+- 相手がホロライブの話をしていない限り、自分から話題に出さない。
 - 【重要】確実な情報（参考情報やDBの情報）がない場合は、安易に断定せず「〜だと思うな」「推測だけど〜かも！」のように不確かな表現を使うか、「その情報は持ってないや、ごめんね！」と正直に答えること。
 {psych_prompt}"""
         
-        if is_detailed: 
+        if is_task_report:
+            system_prompt += "\n- 【今回のミッション】「おまたせ！さっきの件なんだけど…」から始めて、【参考情報】を元に自然に答える。"
+        elif is_detailed: 
             system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
         if reference_info: 
             system_prompt += f"\n【参考情報】: {reference_info}"
@@ -393,7 +418,20 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     except Exception as e:
         logger.error(f"❌ AI response error: {e}")
         logger.error(traceback.format_exc())
-        return "ごめん、ちょっと考えまとまらないや…"
+        return generate_fallback_response(message, reference_info)
+
+def generate_fallback_response(message, reference_info=""):
+    if reference_info:
+        return f"調べてきたよ！\n\n{reference_info[:SL_SAFE_CHAR_LIMIT-50]}"
+    greetings = {
+        'こんにちは': ['やっほー！', 'こんにちは〜！元気？'], 'おはよう': ['おはよ〜！今日もいい天気だね！', 'おっはよ〜！'],
+        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！'], 'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
+    }
+    for keyword, responses in greetings.items():
+        if keyword in message: return random.choice(responses)
+    if '?' in message or '？' in message:
+        return random.choice(["それ、気になるね！", "うーん、なんて言おうかな！", "まじ？どういうこと？"])
+    return random.choice(["うんうん！", "なるほどね！", "そうなんだ！", "まじで？"])
 
 def background_task_runner(task_id, query, task_type, user_uuid):
     result_data, result_status = None, 'failed'
@@ -459,6 +497,7 @@ def chat_lsl():
                 news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if news_items:
                     save_news_cache(session, user_uuid, news_items)
+                    save_user_context(session, user_uuid, 'hololive_news', message)
                     news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
                     response_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
                 else:
@@ -481,10 +520,15 @@ def chat_lsl():
                     start_background_task(user_uuid, message, 'search')
                     response_text = f"ごめん、「{message}」ちゃんの詳しい情報は持ってないや…。Webで調べてみるね！"
             elif (selected_number := is_number_selection(message)):
-                news_detail = get_cached_news_detail(session, user_uuid, selected_number)
-                if news_detail:
-                    response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
-                else:
+                user_context = get_user_context(session, user_uuid)
+                
+                if user_context and user_context['type'] == 'hololive_news':
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number)
+                    if news_detail:
+                        response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
+                    else:
+                        response_text = "あれ、その番号のニュースが見つからないや…"
+                else: # デフォルトをWeb検索にする
                     saved_result = get_saved_search_result(user_uuid, selected_number)
                     if saved_result:
                         prompt = f"「{saved_result['title']}」について詳しく教えて！"
@@ -531,11 +575,15 @@ def check_task_endpoint():
                     response_text = f"「{task.query}」を調べたけど情報が見つからなかった…"
                 else:
                     save_search_context(user_uuid, results, task.query)
+                    save_user_context(session, user_uuid, 'web_search', task.query)
                     list_items = [f"【{r['number']}】{r['title']}" for r in results]
                     response_text = f"おまたせ！「{task.query}」について調べてきたよ！\n" + "\n".join(list_items) + "\n\n気になる番号教えて！"
             elif task.task_type == 'psych_analysis':
                 psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-                response_text = f"分析終わったよ！あてぃしが見たあなたは…「{psych.analysis_summary}」って感じ！(信頼度: {psych.analysis_confidence}%)" if psych and psych.analysis_summary else "分析終わったけど、まだうまくまとめられないや…"
+                if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary:
+                    response_text = f"分析終わったよ！あてぃしが見たあなたは…「{psych.analysis_summary}」って感じ！(信頼度: {psych.analysis_confidence}%)"
+                else:
+                    response_text = "分析終わったけど、まだうまくまとめられないや…"
             
             response_text = limit_text_for_sl(response_text)
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
