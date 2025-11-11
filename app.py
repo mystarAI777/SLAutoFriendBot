@@ -491,7 +491,7 @@ def update_news_task():
 
 def cleanup_old_data_task():
     with Session() as session:
-        cutoff = datetime.utcnow() - timedelta(days=90)
+        cutoff = datetime.utcnow() - timedelta(days=30)
         session.query(ConversationHistory).filter(ConversationHistory.timestamp < cutoff).delete()
         session.query(HololiveNews).filter(HololiveNews.created_at < cutoff).delete()
         session.query(SpecializedNews).filter(SpecializedNews.created_at < cutoff).delete()
