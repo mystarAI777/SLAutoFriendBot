@@ -315,7 +315,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         if psychology and psychology.get('confidence', 0) > 60:
             system_prompt_parts.append(f"# {user_data['name']}さんの情報: {psychology.get('summary', '')[:100]}。この情報を参考にして、よりパーソナルな会話をしてね。")
         if friend_list:
-            system_prompt_parts.append(f"# {user_data['name']}さんの友達: {', '.join([f'「{f["name"]}」' for f in friend_list])}。この人たちのことも覚えてるフリして話すと、もっと仲良くなれるかも！")
+            system_prompt_parts.append(f"""# {user_data['name']}さんの友達: {', '.join([f'「{f["name"]}」' for f in friend_list])}。この人たちのことも覚えてるフリして話すと、もっと仲良くなれるかも！""")
         if is_task_report:
             system_prompt_parts.append("# 今回のミッション: 「おまたせ！〇〇の件だけど…」と切り出し、【参考情報】を元に分かりやすく報告すること。")
         if reference_info:
