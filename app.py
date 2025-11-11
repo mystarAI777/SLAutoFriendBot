@@ -1,3 +1,12 @@
+# ==============================================================================
+# Mochiko AI - 最終統合・完全版
+# 作成日: 2025/11/11
+# これまでの対話の全ての改善点を統合した、完成版アプリケーション
+# ==============================================================================
+
+# ==============================================================================
+# ライブラリのインポート
+# ==============================================================================
 import sys
 import os
 import requests
@@ -7,859 +16,527 @@ import threading
 import json
 import re
 import random
+import uuid
 import hashlib
-import unicodedata
-import traceback 
 from datetime import datetime, timedelta, timezone
+import unicodedata
+
+# --- サードパーティライブラリ ---
 from groq import Groq
-from flask import Response, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
+from sqlalchemy import create_engine, Column, String, DateTime, Integer, Text, BigInteger, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.sql import text
 from urllib.parse import quote_plus, urljoin
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 import schedule
 import signal
-from threading import Lock
 
-# --- 型ヒント ---
-try:
-    from typing import Union, Dict, Any, List, Optional
-except ImportError:
-    Dict, Any, List, Union, Optional = dict, object, list, object, object
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, Text, Boolean, text
-from sqlalchemy.orm import declarative_base, sessionmaker
-
-# --- 基本設定 ---
+# ==============================================================================
+# 基本設定とロギング
+# ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 定数 ---
-SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')
+# ==============================================================================
+# 定数設定
+# ==============================================================================
 VOICE_DIR = '/tmp/voices'
-VOICEVOX_SPEAKER_ID = 20
-SL_SAFE_CHAR_LIMIT = 250
-# ========================================
-# 修正パッチ 4: より信頼性の高いUSER_AGENTS
-# ========================================
+SERVER_URL = "https://slautofriendbot.onrender.com" # ご自身のRenderサーバーURLに設定
+VOICEVOX_SPEAKER_ID = 20 # もち子さん(ノーマル)
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
 ]
-LOCATION_CODES = { "東京": "130000", "大阪": "270000", "名古屋": "230000", "福岡": "400000", "札幌": "016000" }
-
 SPECIALIZED_SITES = {
-    'Blender': {'base_url': 'https://docs.blender.org/manual/ja/latest/', 'keywords': ['Blender', 'ブレンダー', 'blener']},
-    'CGニュース': {'base_url': 'https://modelinghappy.com/', 'keywords': ['CGニュース', '3DCG', 'CG業界']},
-    '脳科学・心理学': {'base_url': 'https://nazology.kusuguru.co.jp/', 'keywords': ['脳科学', '心理学', '脳', '認知科学']},
+    'Blender': {'base_url': 'https://docs.blender.org/manual/ja/latest/', 'keywords': ['Blender', 'ブレンダー']},
+    'CGニュース': {'base_url': 'https://modelinghappy.com/', 'keywords': ['CGニュース', '3DCG', 'CG']},
+    '脳科学・心理学': {'base_url': 'https://nazology.kusuguru.co.jp/', 'keywords': ['脳科学', '心理学', '脳', '心理']},
     'セカンドライフ': {'base_url': 'https://community.secondlife.com/news/', 'keywords': ['セカンドライフ', 'Second Life', 'SL']},
-    'アニメ': {
-        'base_url': 'https://animedb.jp/',
-        'keywords': ['アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション', '作画', '声優', 'OP', 'ED']
-    }
+    'アニメ': {'base_url': 'https://animedb.jp/', 'keywords': ['アニメ', 'anime']}
 }
+ANIME_KEYWORDS = ['アニメ', 'anime', '作画', '声優', 'OP', 'ED', '劇場版', '原作', '主人公', 'キャラ']
 
-# --- グローバル変数 & アプリ設定 ---
+# ==============================================================================
+# グローバル変数
+# ==============================================================================
 background_executor = ThreadPoolExecutor(max_workers=5)
-groq_client, engine, Session = None, None, None
-VOICEVOX_ENABLED = True
+groq_client = None
+engine = None
+Session = None
 app = Flask(__name__)
-app.config['JSON_AS_ASCII'] = False
-CORS(app)
 Base = declarative_base()
+DYNAMIC_HOLOMEM_KEYWORDS = []
 
-search_context_cache = {}
-cache_lock = Lock()
-g_holomem_keywords = []
-
-# --- 秘密情報/環境変数 読み込み ---
+# ==============================================================================
+# 秘密情報/環境変数 読み込み
+# ==============================================================================
 def get_secret(name):
-    path = f"/etc/secrets/{name}"
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+    secret_file_path = f"/etc/secrets/{name}"
+    if os.path.exists(secret_file_path):
         try:
-            with open(path, 'r') as f: return f.read().strip()
+            with open(secret_file_path, 'r') as f: return f.read().strip()
         except IOError: return None
     return os.environ.get(name)
 
-DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
+DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
-if DATABASE_URL and DATABASE_URL.startswith('postgresql'):
-    if 'client_encoding' not in DATABASE_URL:
-        DATABASE_URL += '?client_encoding=utf8'
+# ==============================================================================
+# データベースモデル定義
+# ==============================================================================
+class HolomemWiki(Base): __tablename__ = 'holomem_wiki'; id = Column(Integer, primary_key=True); member_name = Column(String(100), nullable=False, unique=True, index=True); description = Column(Text); generation = Column(String(100)); status = Column(String(50), default='現役', nullable=False); status_reason = Column(Text, nullable=True); mochiko_feeling = Column(Text, nullable=True); graduation_date = Column(String(100), nullable=True); last_updated = Column(DateTime, default=datetime.utcnow)
+class UserMemory(Base): __tablename__ = 'user_memories'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False); user_name = Column(String(255), nullable=False); interaction_count = Column(BigInteger, default=0); last_interaction = Column(DateTime, default=datetime.utcnow)
+class ConversationHistory(Base): __tablename__ = 'conversation_history'; id = Column(Integer, primary_key=True, autoincrement=True); user_uuid = Column(String(255), nullable=False, index=True); role = Column(String(10), nullable=False); content = Column(Text, nullable=False); timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+class HololiveNews(Base): __tablename__ = 'hololive_news'; id = Column(Integer, primary_key=True); title = Column(String(500), nullable=False); content = Column(Text, nullable=False); url = Column(String(1000)); created_at = Column(DateTime, default=datetime.utcnow, index=True); news_hash = Column(String(100), unique=True)
+class SpecializedNews(Base): __tablename__ = 'specialized_news'; id = Column(Integer, primary_key=True); site_name = Column(String(100), nullable=False, index=True); title = Column(String(500), nullable=False); content = Column(Text, nullable=False); url = Column(String(1000)); created_at = Column(DateTime, default=datetime.utcnow, index=True); news_hash = Column(String(100), unique=True)
+class BackgroundTask(Base): __tablename__ = 'background_tasks'; id = Column(Integer, primary_key=True); task_id = Column(String(255), unique=True, nullable=False); user_uuid = Column(String(255), nullable=False); task_type = Column(String(50), nullable=False); query = Column(Text, nullable=False); result = Column(Text); status = Column(String(20), default='pending'); created_at = Column(DateTime, default=datetime.utcnow); completed_at = Column(DateTime)
+class FriendRegistration(Base): __tablename__ = 'friend_registrations'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), nullable=False, index=True); friend_uuid = Column(String(255), nullable=False); friend_name = Column(String(255), nullable=False); registered_at = Column(DateTime, default=datetime.utcnow)
+class UserPsychology(Base): __tablename__ = 'user_psychology'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False, index=True); user_name = Column(String(255), nullable=False); interests = Column(Text); favorite_topics = Column(Text); conversation_style = Column(String(50)); analysis_summary = Column(Text); last_analyzed = Column(DateTime, default=datetime.utcnow); analysis_confidence = Column(Integer, default=0)
 
-# --- データベースモデル ---
-class UserMemory(Base): 
-    __tablename__ = 'user_memories'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
-    user_name = Column(String(255), nullable=False)
-    interaction_count = Column(Integer, default=0)
-    last_interaction = Column(DateTime, default=datetime.utcnow)
-
-class ConversationHistory(Base): 
-    __tablename__ = 'conversation_history'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_uuid = Column(String(255), nullable=False, index=True)
-    role = Column(String(10), nullable=False)
-    content = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-
-class UserPsychology(Base):
-    __tablename__ = 'user_psychology'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
-    user_name = Column(String(255), nullable=False)
-    analysis_summary = Column(Text, nullable=True)
-    analysis_confidence = Column(Integer, default=0)
-    last_analyzed = Column(DateTime, nullable=True)
-    last_search_results = Column(Text, nullable=True)
-    search_context = Column(String(500), nullable=True)
-    
-class BackgroundTask(Base):
-    __tablename__ = 'background_tasks'
-    id = Column(Integer, primary_key=True)
-    task_id = Column(String(255), unique=True, nullable=False)
-    user_uuid = Column(String(255), nullable=False, index=True)
-    task_type = Column(String(50), nullable=False)
-    query = Column(Text, nullable=False)
-    result = Column(Text, nullable=True)
-    status = Column(String(20), default='pending', index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-
-class HolomemWiki(Base):
-    __tablename__ = 'holomem_wiki'
-    id = Column(Integer, primary_key=True)
-    member_name = Column(String(100), nullable=False, unique=True, index=True)
-    description = Column(Text, nullable=True)
-    generation = Column(String(100), nullable=True)
-    is_active = Column(Boolean, default=True, index=True)
-    graduation_date = Column(String(100), nullable=True)
-    mochiko_feeling = Column(Text, nullable=True)
-    last_updated = Column(DateTime, default=datetime.utcnow)
-
-class HololiveNews(Base):
-    __tablename__ = 'hololive_news'
-    id = Column(Integer, primary_key=True)
-    title = Column(String(500), nullable=False)
-    content = Column(Text, nullable=False)
-    url = Column(String(1000), unique=True)
-    news_hash = Column(String(100), unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-
-class NewsCache(Base):
-    __tablename__ = 'news_cache'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), nullable=False, index=True)
-    news_id = Column(Integer, nullable=False)
-    news_number = Column(Integer, nullable=False)
-    news_type = Column(String(50), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class UserContext(Base):
-    __tablename__ = 'user_context'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
-    last_context_type = Column(String(50), nullable=False)
-    last_query = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-# --- ヘルパー関数群 ---
-def clean_text(text): return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip() if text else ""
-def limit_text_for_sl(text, max_length=SL_SAFE_CHAR_LIMIT): return text[:max_length-3] + "..." if len(text) > max_length else text
-def get_japan_time(): return f"今は{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
-
-def is_detailed_request(message): return any(kw in message for kw in ['詳しく', '詳細', 'くわしく', '教えて', '説明して', '解説して', 'どういう', 'なぜ', 'どうして'])
-def is_number_selection(message):
-    match = re.match(r'^\s*([1-9])', message.strip())
-    return int(match.group(1)) if match else None
-def format_search_results_as_list(results):
-    if not results: return None
-    return [{'number': i, 'title': r.get('title', ''), 'snippet': r.get('snippet', ''), 'full_content': r.get('snippet', '')} for i, r in enumerate(results[:5], 1)]
-
-def save_news_cache(session, user_uuid, news_items):
-    session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
-    for i, news in enumerate(news_items, 1):
-        cache = NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type='hololive')
-        session.add(cache)
-    session.commit()
-    with cache_lock:
-        if user_uuid in search_context_cache:
-            del search_context_cache[user_uuid]
-
-def get_cached_news_detail(session, user_uuid, news_number):
-    cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number).first()
-    if not cache: return None
-    return session.query(HololiveNews).filter_by(id=cache.news_id).first()
-
-def save_search_context(user_uuid, search_results, query):
-    with cache_lock:
-        search_context_cache[user_uuid] = { 'results': search_results, 'query': query, 'timestamp': time.time() }
-    try:
-        with Session() as session:
-            session.query(NewsCache).filter_by(user_uuid=user_uuid).delete()
-            session.commit()
-    except Exception as e:
-        logger.warning(f"Failed to clear news cache: {e}")
-
-def get_saved_search_result(user_uuid, number):
-    with cache_lock:
-        cached_data = search_context_cache.get(user_uuid)
-    if cached_data and (time.time() - cached_data['timestamp']) < 600:
-        for r in cached_data['results']:
-            if r.get('number') == number:
-                return r
-    return None
-
-def save_user_context(session, user_uuid, context_type, query):
-    context = session.query(UserContext).filter_by(user_uuid=user_uuid).first()
-    if not context:
-        context = UserContext(user_uuid=user_uuid, last_context_type=context_type, last_query=query)
-        session.add(context)
-    else:
-        context.last_context_type = context_type
-        context.last_query = query
-    session.commit()
-
-def get_user_context(session, user_uuid):
-    context = session.query(UserContext).filter_by(user_uuid=user_uuid).first()
-    if context and (datetime.utcnow() - context.updated_at).total_seconds() < 600:
-        return {'type': context.last_context_type, 'query': context.last_query}
-    return None
-
-def is_recommendation_request(message): return any(kw in message for kw in ['おすすめ', 'オススメ', '人気'])
-def extract_recommendation_topic(message):
-    topics = {'映画': ['映画'], '音楽': ['音楽', '曲'], 'アニメ': ['アニメ'], 'ゲーム': ['ゲーム']}
-    return next((topic for topic, keywords in topics.items() if any(kw in message for kw in keywords)), None)
+# ==============================================================================
+# ユーティリティ & ヘルパー関数
+# ==============================================================================
+def clean_text(text): return re.sub(r'\s+', ' ', text).strip() if text else ""
+def create_news_hash(title, content): return hashlib.md5(f"{title}{content[:100]}".encode('utf-8')).hexdigest()
+def is_anime_request(message): return any(keyword in message.lower() for keyword in ANIME_KEYWORDS)
 def detect_specialized_topic(message):
-    if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']): return None
     for topic, config in SPECIALIZED_SITES.items():
-        if any(keyword in message for keyword in config['keywords']): return topic
+        if any(kw in message for kw in config['keywords']): return topic
     return None
-
-def is_time_request(message): return any(kw in message for kw in ['今何時', '時間', '時刻'])
-def is_weather_request(message):
-    if any(t in message for t in ['天気予報', '天気教えて', '天気どう',
-        '気温教えて', '明日の天気', '週間天気']): return next((loc for loc in LOCATION_CODES if loc in message), "東京")
-    return None
-def is_follow_up_question(message, history):
-    if not history: return False
-    return any(re.search(p, message) for p in [r'もっと詳しく', r'それについて詳しく', r'なんで？', r'どういうこと'])
-def should_search(message):
-    if len(message) < 5 or is_number_selection(message): return False
-    if is_holomem_name_only_request(message): return False
-    if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']): return False
-    if detect_specialized_topic(message) or is_recommendation_request(message): return True
-    if any(re.search(p, message) for p in [r'とは', r'について', r'教えて', r'最新', r'調べて', r'検索', r'ニュース']): return True
-    return any(word in message for word in ['誰', '何', 'どこ', 'いつ', 'なぜ', 'どうして'])
-def get_or_create_user(session, user_uuid, user_name):
-    user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-    if not user:
-        user = UserMemory(user_uuid=user_uuid, user_name=user_name)
+def is_friend_request(message): return any(f in message for f in ['友だち', '友達', 'フレンド']) and any(a in message for a in ['登録', '教えて', '誰', 'リスト'])
+def is_explicit_search_request(message): return any(keyword in message for keyword in ['調べて', '検索して', '探して', 'WEB検索', 'ググって'])
+def is_hololive_request(message): return any(keyword in message for keyword in DYNAMIC_HOLOMEM_KEYWORDS)
+def is_time_request(message): return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時'])
+def is_weather_request(message): return any(keyword in message for keyword in ['天気'])
+def is_short_response(message): return len(message.strip()) <= 3 or message.strip() in ['うん', 'そう', 'はい', 'そっか', 'なるほど']
+def get_or_create_user(session, uuid, name):
+    user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
+    if user:
+        user.interaction_count = (user.interaction_count or 0) + 1
+        user.last_interaction = datetime.utcnow()
+        if user.user_name != name: user.user_name = name
+    else:
+        user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
         session.add(user)
-    user.interaction_count += 1
-    user.last_interaction = datetime.utcnow()
-    if user.user_name != user_name: user.user_name = user_name
     session.commit()
     return {'uuid': user.user_uuid, 'name': user.user_name}
-
-def get_conversation_history(session, user_uuid, limit=6):
-    return session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
+def get_conversation_history(session, uuid, limit=6):
+    return session.query(ConversationHistory).filter_by(user_uuid=uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
 
 def get_sakuramiko_special_responses():
     return {
-        'にぇ': 'みこちの「にぇ」、まじかわいすぎじゃん!あの独特な口癖がエリートの証なんだって〜うける!',
-        'エリート': 'みこちって自称エリートVTuberなんだけど、実際は愛されポンコツって感じでさ、それがまた最高なんだよね〜',
-        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?まじ個性的!',
+        'にぇ': 'さくらみこちゃんの「にぇ」、まじかわいいよね!あの独特な口癖がエリートの証なんだって〜',
+        'エリート': 'みこちは自称エリートVTuber!でも実際は愛されポンコツキャラって感じで、それがまた魅力的なんだよね〜',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?',
     }
 
-def initialize_holomem_wiki():
-    with Session() as session:
-        if session.query(HolomemWiki).count() > 10: 
-            update_holomem_keywords(); return
-        initial_data = [
-            {'member_name': 'ときのそら', 'generation': '0期生', 'description': 'ホロライブの原点であり、みんなの憧れのアイドル！歌声がまじで神がかってる！'},
-            {'member_name': '宝鐘マリン', 'generation': '3期生', 'description': '自称17歳のセクシー（笑）な女海賊船長！トークも歌も面白くて、まじ天才！'},
-            {'member_name': '兎田ぺこら', 'generation': '3期生', 'description': '「ぺこ」が口癖のうさ耳VTuber！いたずら好きだけど、根は優しくて面白い配信の王！'},
-            {'member_name': '天音かなた', 'generation': '4期生', 'description': '天界から来た天使！パワフルな歌声と握力50kgのギャップがうける！PP天使！'},
-            {'member_name': 'さくらみこ', 'generation': '0期生', 'description': '「にぇ」が口癖のエリート巫女VTuber！ポンコツかわいいところが最高なんだよね〜！'}
-        ]
-        for data in initial_data:
-            if not session.query(HolomemWiki).filter_by(member_name=data['member_name']).first():
-                session.add(HolomemWiki(**data))
-        session.commit()
-        update_holomem_keywords()
+# ==============================================================================
+# 中核機能: 即時応答、検索、DB操作、AI応答生成
+# ==============================================================================
 
-def update_holomem_keywords():
-    global g_holomem_keywords
-    with Session() as session:
-        g_holomem_keywords = [row[0] for row in session.query(HolomemWiki.member_name).all()]
-    logger.info(f"✅ Holomem keywords updated: {len(g_holomem_keywords)} members")
+def get_japan_time():
+    now = datetime.now(timezone(timedelta(hours=9)))
+    return f"今は{now.hour}時{now.minute}分だよ！"
 
-def is_holomem_name_only_request(message):
-    if len(message) > 15: return None
-    for name in g_holomem_keywords:
-        if name in message and len(message.replace(name, "").strip()) < 5:
-            return name
-    return None
-
-def get_holomem_info(session, member_name):
-    return session.query(HolomemWiki).filter_by(member_name=member_name).first()
-
-# --- コア機能 (音声, 天気, 検索) ---
-def ensure_voice_directory():
-    try: os.makedirs(VOICE_DIR, exist_ok=True)
-    except Exception as e: logger.error(f"❌ Voice directory creation failed: {e}")
-def generate_voice(text):
-    if not VOICEVOX_ENABLED: return None
-    try:
-        voicevox_url = VOICEVOX_URL_FROM_ENV or "http://localhost:50021"
-        final_text = limit_text_for_sl(text, 150)
-        query_response = requests.post(f"{voicevox_url}/audio_query", params={"text": final_text, "speaker": VOICEVOX_SPEAKER_ID}, timeout=10)
-        synthesis_response = requests.post(f"{voicevox_url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=query_response.json(), timeout=30)
-        synthesis_response.raise_for_status()
-        filename = f"voice_{int(time.time())}_{random.randint(1000, 9999)}.wav"
-        filepath = os.path.join(VOICE_DIR, filename)
-        with open(filepath, 'wb') as f: f.write(synthesis_response.content)
-        return filepath
-    except Exception as e:
-        logger.error(f"❌ VOICEVOX generation error: {e}")
-        return None
-def get_weather_forecast(location):
-    area_code = LOCATION_CODES.get(location, "130000")
+def get_weather_forecast(message):
+    location = "東京"
+    for loc_name in ["東京", "大阪"]:
+        if loc_name in message:
+            location = loc_name
+            break
+    area_code = {"東京": "130000", "大阪": "270000"}.get(location, "130000")
     url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{area_code}.json"
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status()
         text = clean_text(response.json().get('text', ''))
-        return f"今の{location}の天気はね、「{text}」って感じだよ！" if text else f"{location}の天気情報が見つからなかった…"
+        return f"今の{location}の天気はね、「{text}」って感じだよ！" if text else f"{location}の天気情報が取れなかった…"
     except Exception as e:
-        logger.error(f"Weather API error for {location}: {e}")
-        return "うぅ、天気情報がうまく取れなかったみたい…"
-def scrape_major_search_engines(query, num_results=5):
-    """より確実な検索結果取得のための改善版"""
-    
-    # DuckDuckGo HTML版を追加（スクレイピングしやすい）
+        logger.error(f"Weather API error for {location}: {e}"); return "天気情報がうまく取れなかったみたい…"
+
+def scrape_major_search_engines(query, num_results):
     search_configs = [
-        {
-            'name': 'DuckDuckGo',
-            'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
-            'selector': '.result',
-            'title_selector': '.result__a',
-            'snippet_selector': '.result__snippet'
-        },
-        {
-            'name': 'Google',
-            'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja",
-            'selector': 'div.g',
-            'title_selector': 'h3',
-            'snippet_selector': '.VwiC3b, .yXK7lf'
-        },
-        {
-            'name': 'Bing',
-            'url': f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ja",
-            'selector': 'li.b_algo',
-            'title_selector': 'h2',
-            'snippet_selector': '.b_caption p'
-        }
+        {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'result_selector': 'li.b_algo', 'title_selector': 'h2', 'snippet_selector': 'div.b_caption p'},
+        {'name': 'Yahoo Japan', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'result_selector': 'div.Algo', 'title_selector': 'h3', 'snippet_selector': 'div.compText p'}
     ]
-    
     for config in search_configs:
         try:
-            headers = {
-                'User-Agent': random.choice(USER_AGENTS),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'ja,en;q=0.9',
-            }
-            
-            response = requests.get(config['url'], headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
+            response = requests.get(config['url'], headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=12)
             results = []
-            
-            for elem in soup.select(config['selector'])[:num_results]:
-                try:
-                    title_elem = elem.select_one(config['title_selector'])
-                    snippet_elem = elem.select_one(config['snippet_selector'])
-                    
-                    if title_elem:
-                        title = clean_text(title_elem.get_text())
-                        snippet = clean_text(snippet_elem.get_text()) if snippet_elem else title[:100]
-                        
-                        if title and len(title) > 5:  # 有効なタイトルのみ
-                            results.append({
-                                'title': title,
-                                'snippet': snippet,
-                                'source': config['name']
-                            })
-                except Exception as elem_error:
-                    logger.debug(f"Element parse error in {config['name']}: {elem_error}")
-                    continue
-            
-            if results:
-                logger.info(f"✅ Search successful on {config['name']}: {len(results)} results")
-                return results
-            else:
-                logger.warning(f"⚠️ No results found on {config['name']}")
-                
-        except Exception as e:
-            logger.warning(f"⚠️ Search failed on {config['name']}: {e}")
-            continue
-    
-    # すべて失敗した場合、簡易的なフォールバック
-    logger.error("❌ All search engines failed")
+            for elem in BeautifulSoup(response.content, 'html.parser').select(config['result_selector'])[:num_results]:
+                title = elem.select_one(config['title_selector'])
+                snippet = elem.select_one(config['snippet_selector'])
+                if title and snippet: results.append({'title': clean_text(title.get_text()), 'snippet': clean_text(snippet.get_text())})
+            if results: return results
+        except Exception as e: logger.warning(f"⚠️ {config['name']} search error: {e}")
     return []
 
-# --- 心理分析 ---
+def deep_web_search(query, is_detailed):
+    results = scrape_major_search_engines(query, 3 if is_detailed else 2)
+    if not results: return None
+    summary_text = "\n".join(f"[情報{i+1}] {res['snippet']}" for i, res in enumerate(results))
+    if not groq_client: return f"検索結果:\n{summary_text}"
+    try:
+        prompt = f"以下の検索結果を使い、質問「{query}」にギャル語で{'詳しく' if is_detailed else '簡潔に'}答えて：\n{summary_text}"
+        completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", temperature=0.7, max_tokens=400 if is_detailed else 200)
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"AI summarization error: {e}"); return f"検索結果:\n{summary_text}"
+
+def search_anime_database(query, is_detailed):
+    base_url = "https://animedb.jp/"
+    try:
+        search_url = f"{base_url}search?q={quote_plus(query)}"
+        response = requests.get(search_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        results = []
+        result_elements = soup.select('div.anime-item, div.search-result, article.anime')[:3]
+        for elem in result_elements:
+            title_elem = elem.find(['h2', 'h3', 'h4', 'a'])
+            description_elem = elem.find('p')
+            if title_elem:
+                title = clean_text(title_elem.get_text())
+                desc = clean_text(description_elem.get_text())[:150] if description_elem else "詳細情報なし"
+                results.append(f"【{title}】\n{desc}...")
+        return "\n\n".join(results) if results else None
+    except Exception as e:
+        logger.error(f"❌ Anime search error: {e}"); return None
+
+def search_hololive_wiki(query):
+    base_url = "https://seesaawiki.jp/hololivetv/"
+    try:
+        encoded_query = quote_plus(query.encode('euc-jp', errors='replace'))
+        search_url = f"{base_url}search?query={encoded_query}"
+        logger.info(f"📚 Searching Hololive Wiki for: {query}")
+        response = requests.get(search_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        response.encoding = 'euc-jp'; response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        first_result_link = soup.select_one('#page-body-inner .search-result-title a')
+        if not first_result_link: return None
+        article_url = urljoin(base_url, first_result_link['href'])
+        article_response = requests.get(article_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        article_response.encoding = 'euc-jp'; article_response.raise_for_status()
+        article_soup = BeautifulSoup(article_response.text, 'html.parser')
+        content_div = article_soup.select_one('#page-body-inner')
+        if content_div:
+            for tag in content_div.select('.social-button, .plugin_menu, script, style'): tag.decompose()
+            page_text = clean_text(content_div.get_text(separator='\n', strip=True))
+            if page_text and len(page_text) > 50: return f"「{query}」について、Wikiにはこう書かれてるみたいだよ！\n\n{page_text[:700]}..."
+        return None
+    except Exception as e:
+        logger.error(f"❌ Hololive Wiki search error: {e}"); return None
+
+def get_holomem_info(member_name):
+    with Session() as session:
+        wiki = session.query(HolomemWiki).filter_by(member_name=member_name).first()
+        return {k: v for k, v in wiki.__dict__.items() if not k.startswith('_')} if wiki else None
+
+def get_user_psychology(user_uuid):
+    with Session() as session:
+        psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+        return {'summary': psych.analysis_summary, 'confidence': psych.analysis_confidence} if psych else None
+
 def analyze_user_psychology(user_uuid):
     with Session() as session:
+        logger.info(f"🧠 Starting psychology analysis for {user_uuid}")
+        conversations = session.query(ConversationHistory.content).filter_by(user_uuid=user_uuid, role='user').order_by(ConversationHistory.timestamp.desc()).limit(100).all()
+        if len(conversations) < 10: return
+        messages_text = "\n".join([conv[0] for conv in reversed(conversations)])
+        user_name = session.query(UserMemory.user_name).filter_by(user_uuid=user_uuid).scalar() or "不明"
+        analysis_prompt = f"あなたは心理学者です。ユーザー「{user_name}」の過去の会話履歴を分析し、性格、興味、会話スタイルを200字程度で要約してください。\n\n【会話履歴】\n{messages_text[:3000]}\n\n【要約】:"
         try:
-            history = session.query(ConversationHistory).filter_by(user_uuid=user_uuid, role='user').order_by(ConversationHistory.timestamp.desc()).limit(50).all()
-            if len(history) < 10 or not groq_client: return
-
-            user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
-            messages_text = "\n".join([h.content for h in reversed(history)])
-            prompt = f"ユーザー「{user.user_name}」の会話履歴を分析し、性格を要約してJSONで返してください（例: {{\"summary\": \"明るい性格…\", \"confidence\": 80}}）: {messages_text[:2000]}"
-            
-            completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama-3.1-8b-instant", response_format={"type": "json_object"})
-            analysis_data = json.loads(completion.choices[0].message.content)
-            
-            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-            if not psych:
-                psych = UserPsychology(user_uuid=user_uuid, user_name=user.user_name)
-                session.add(psych)
-            
-            psych.analysis_summary = analysis_data.get('summary', '')
-            psych.analysis_confidence = analysis_data.get('confidence', 70)
-            psych.last_analyzed = datetime.utcnow()
-            
+            completion = groq_client.chat.completions.create(messages=[{"role": "user", "content": analysis_prompt}], model="llama-3.1-8b-instant", temperature=0.3)
+            summary = completion.choices[0].message.content.strip()
+            psychology = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            if not psychology: psychology = UserPsychology(user_uuid=user_uuid); session.add(psychology)
+            psychology.user_name = user_name; psychology.analysis_summary = summary; psychology.last_analyzed = datetime.utcnow(); psychology.analysis_confidence = 80
             session.commit()
-            logger.info(f"✅ Psychology analysis updated for {user.user_name}")
+            logger.info(f"✅ Psychology analysis saved for {user_uuid}")
         except Exception as e:
-            logger.error(f"Psychology analysis failed: {e}")
+            logger.error(f"❌ AI analysis error: {e}")
 
-# --- AI & バックグラウンドタスク ---
-def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    if not groq_client: 
-        return generate_fallback_response(message, reference_info)
-    
-    try:
-        psych_prompt = ""
-        try:
-            with Session() as session:
-                psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
-            if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary:
-                psych_prompt = f"\n# 【{user_data['name']}さんの特性】\n- {psych.analysis_summary}"
-        except Exception as db_error:
-            logger.warning(f"⚠️ Psychology fetch failed (continuing without): {db_error}")
-        
-        system_prompt = f"""あなたは「もちこ」という明るくて親しみやすいギャルAIです。{user_data['name']}さんと話しています。
-# 基本的な性格:
-- 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。
-- 友達のように気軽に、優しく、ノリが良い。
-# 会話スタイル:
-- 普段は普通の日常会話を楽しむこと（天気、食べ物、趣味、感情、世間話など）。
-- 相手がホロライブの話をしていない限り、自分から話題に出さない。
-- 【重要】確実な情報（参考情報やDBの情報）がない場合は、安易に断定せず「〜だと思うな」「推測だけど〜かも！」のように不確かな表現を使うか、「その情報は持ってないや、ごめんね！」と正直に答えること。
-{psych_prompt}"""
-        
-        if is_task_report:
-            system_prompt += "\n- 【今回のミッション】「おまたせ！さっきの件なんだけど…」から始めて、【参考情報】を元に自然に答える。"
-        elif is_detailed: 
-            system_prompt += "\n- 【専門家モード】参考情報に基づき、詳しく解説して。"
-        if reference_info: 
-            system_prompt += f"\n【参考情報】: {reference_info}"
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        for h in reversed(history): 
-            messages.append({"role": "assistant" if h.role == "assistant" else "user", "content": h.content})
-        messages.append({"role": "user", "content": message})
-        
-        completion = groq_client.chat.completions.create(
-            messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=400 if is_detailed else 200)
-        return completion.choices[0].message.content.strip()
-        
-    except Exception as e:
-        logger.error(f"❌ AI response error: {e}")
-        logger.error(traceback.format_exc())
-        return generate_fallback_response(message, reference_info)
-
-def generate_fallback_response(message, reference_info=""):
-    if reference_info:
-        return f"調べてきたよ！\n\n{reference_info[:SL_SAFE_CHAR_LIMIT-50]}"
-    greetings = {
-        'こんにちは': ['やっほー！', 'こんにちは〜！元気？'], 'おはよう': ['おはよ〜！今日もいい天気だね！', 'おっはよ〜！'],
-        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！'], 'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
-    }
-    for keyword, responses in greetings.items():
-        if keyword in message: return random.choice(responses)
-    if '?' in message or '？' in message:
-        return random.choice(["それ、気になるね！", "うーん、なんて言おうかな！", "まじ？どういうこと？"])
-    return random.choice(["うんうん！", "なるほどね！", "そうなんだ！", "まじで？"])
-
-# ========================================
-# 修正パッチ 5: バックグラウンドタスクのタイムアウト改善
-# ========================================
-
-def background_task_runner(task_id, query, task_type, user_uuid):
-    """バックグラウンドタスク実行関数（改善版）"""
-    result_data, result_status = None, 'failed'
-    
-    try:
-        if task_type == 'search':
-            # 検索クエリの最適化
-            search_query = query
-            
-            # おすすめリクエストの処理
-            if (topic := extract_recommendation_topic(query)):
-                search_query = f"{topic} おすすめ ランキング 2024 2025"
-            
-            # 専門サイト検索の処理
-            elif (topic := detect_specialized_topic(query)):
-                search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
-            
-            # より多めに取得して確実性を上げる
-            raw_results = scrape_major_search_engines(search_query, 8)
-            
-            if raw_results:
-                formatted_results = format_search_results_as_list(raw_results)
-                result_data = json.dumps(formatted_results, ensure_ascii=False)
-                result_status = 'completed'
-                logger.info(f"✅ Search task completed: {len(raw_results)} results for '{query}'")
-            else:
-                # 失敗した場合、簡略化したクエリで再試行
-                simple_query = query.split()[0] if len(query.split()) > 1 else query
-                logger.warning(f"⚠️ First search failed, retrying with: {simple_query}")
-                
-                retry_results = scrape_major_search_engines(simple_query, 5)
-                if retry_results:
-                    formatted_results = format_search_results_as_list(retry_results)
-                    result_data = json.dumps(formatted_results, ensure_ascii=False)
-                    result_status = 'completed'
-                    logger.info(f"✅ Retry search succeeded: {len(retry_results)} results")
-                else:
-                    result_status = 'completed'  # 結果なしでも完了扱い
-                    logger.error(f"❌ All search attempts failed for: {query}")
-        
-        elif task_type == 'psych_analysis':
-            analyze_user_psychology(user_uuid)
-            result_data = "Analysis Complete"
-            result_status = 'completed'
-            logger.info(f"✅ Psychology analysis completed for user: {user_uuid}")
-        
-    except Exception as e:
-        logger.error(f"❌ Background task '{task_type}' failed: {e}")
-        logger.error(traceback.format_exc())
-        result_status = 'completed'  # エラーでも完了扱いにして通知する
-    
-    # タスクステータスを更新
-    try:
-        with Session() as session:
-            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
-            if task:
-                task.result = result_data
-                task.status = result_status
-                task.completed_at = datetime.utcnow()
-                session.commit()
-                logger.info(f"✅ Task {task_id} status updated to: {result_status}")
-    except Exception as db_error:
-        logger.error(f"❌ Failed to update task status: {db_error}")
-
-def start_background_task(user_uuid, query, task_type):
-    task_id = hashlib.md5(f"{user_uuid}{str(query)}{time.time()}{task_type}".encode()).hexdigest()[:10]
+def register_friend(user_uuid, friend_name):
     with Session() as session:
-        task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type=task_type, query=query)
-        session.add(task)
+        dummy_friend_uuid = str(uuid.uuid4())
+        if session.query(FriendRegistration).filter_by(user_uuid=user_uuid, friend_name=friend_name).first(): return False
+        session.add(FriendRegistration(user_uuid=user_uuid, friend_uuid=dummy_friend_uuid, friend_name=friend_name))
+        session.commit(); return True
+
+def get_friend_list(user_uuid):
+    with Session() as session:
+        return [{'name': f.friend_name} for f in session.query(FriendRegistration).filter_by(user_uuid=user_uuid).all()]
+
+def generate_voice(text):
+    if not VOICEVOX_URL_FROM_ENV: return None
+    try:
+        query_res = requests.post(f"{VOICEVOX_URL_FROM_ENV}/audio_query", params={"text": text, "speaker": VOICEVOX_SPEAKER_ID}, timeout=10)
+        query_res.raise_for_status()
+        synth_res = requests.post(f"{VOICEVOX_URL_FROM_ENV}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=query_res.json(), timeout=30)
+        synth_res.raise_for_status()
+        os.makedirs(VOICE_DIR, exist_ok=True)
+        filename = f"voice_{int(time.time())}.wav"
+        filepath = os.path.join(VOICE_DIR, filename)
+        with open(filepath, 'wb') as f: f.write(synth_res.content)
+        return filename
+    except Exception as e:
+        logger.error(f"❌ VOICEVOX error: {e}"); return None
+
+def check_completed_tasks(user_uuid):
+    with Session() as session:
+        task = session.query(BackgroundTask).filter_by(user_uuid=user_uuid, status='completed').order_by(BackgroundTask.completed_at.desc()).first()
+        if task:
+            result = {'query': task.query, 'result': task.result}; session.delete(task); session.commit(); return result
+        return None
+
+def start_background_search(user_uuid, query, is_detailed):
+    task_id = str(uuid.uuid4())[:8]
+    with Session() as session:
+        session.add(BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type='search', query=query))
         session.commit()
-    background_executor.submit(background_task_runner, task_id, query, task_type, user_uuid)
+    background_executor.submit(background_deep_search, task_id, query, is_detailed)
     return True
 
-# --- Flask エンドポイント ---
-@app.route('/health')
-def health_check():
-    db_ok = 'error'
+def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
+    if not groq_client: return "ごめん、今AIの調子が悪いみたいでさ…。ちょっと時間おいてみて！"
     try:
-        with engine.connect() as conn: conn.execute(text("SELECT 1")); db_ok = 'ok'
-    except: pass
-    return jsonify({'status': 'ok', 'db': db_ok, 'ai': 'ok' if groq_client else 'disabled'})
+        psychology = get_user_psychology(user_data['uuid'])
+        friend_list = get_friend_list(user_data['uuid'])
+        system_prompt_parts = [
+            f"あなたは「もちこ」という明るく親しみやすいギャルAIです。{user_data['name']}さんと話しています。",
+            "# ルール:",
+            "- 一人称は「あてぃし」。語尾は「〜じゃん」「〜的な？」「〜だよね」。口癖は「まじ」「てか」「うける」。",
+            "- 友達のように、優しく、ノリが良い会話を心がけて。",
+            "- **禁止事項:** 事実を捏造しない。分からない場合は無理に答えない。「〜ですね」「〜ですよ」のような丁寧語は使わない。",
+            "- 会話が途切れたら、新しい話題を提案してあげてね。"
+        ]
+        if psychology and psychology.get('confidence', 0) > 60:
+            system_prompt_parts.append(f"# {user_data['name']}さんの情報: {psychology.get('summary', '')[:100]}。この情報を参考にして、よりパーソナルな会話をしてね。")
+        if friend_list:
+            system_prompt_parts.append(f"# {user_data['name']}さんの友達: {', '.join([f'「{f["name"]}」' for f in friend_list])}。この人たちのことも覚えてるフリして話すと、もっと仲良くなれるかも！")
+        if is_task_report:
+            system_prompt_parts.append("# 今回のミッション: 「おまたせ！〇〇の件だけど…」と切り出し、【参考情報】を元に分かりやすく報告すること。")
+        if reference_info:
+            system_prompt_parts.append(f"# 参考情報:\n{reference_info}")
+        
+        system_prompt = "\n".join(system_prompt_parts)
+        messages = [{"role": "system", "content": system_prompt}]
+        for h in reversed(history): messages.append({"role": h.role, "content": h.content})
+        messages.append({"role": "user", "content": message})
+        
+        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.75, max_tokens=500 if is_detailed or is_task_report else 200)
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"❌ AI response error: {e}", exc_info=True); return "ごめん、エラーで考えられなくなっちゃった！"
 
-# ========================================
-# 修正パッチ 2: ニュース詳細取得の改善
-# ========================================
+def background_deep_search(task_id, query, is_detailed):
+    with Session() as session:
+        search_result = ""
+        try:
+            if is_anime_request(query): search_result = search_anime_database(query, is_detailed)
+            elif any(member in query for member in DYNAMIC_HOLOMEM_KEYWORDS) or "ホロライブ" in query:
+                wiki_result = search_hololive_wiki(query)
+                if wiki_result: search_result = wiki_result
+                else: search_result = deep_web_search(f"ホロライブ {query}", is_detailed)
+            else: search_result = deep_web_search(query, is_detailed)
+            if not search_result or len(search_result.strip()) < 20: search_result = f"「{query}」の情報、色々探したけど見つからなかった…ごめん！"
+        except Exception as e: logger.error(f"❌ BG search error: {e}", exc_info=True); search_result = "検索中にエラーが起きちゃった…"
+        finally:
+            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+            if task: task.result = search_result; task.status = 'completed'; task.completed_at = datetime.utcnow(); session.commit()
+
+# ==============================================================================
+# Flaskエンドポイント
+# ==============================================================================
+@app.route('/health', methods=['GET'])
+def health_check(): return jsonify({'status': 'ok'}), 200
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
-    try:
-        data = request.json
-        if not all(k in data for k in ['user_uuid', 'user_name', 'message']):
-            return Response("Error: Missing required fields|", status=400, mimetype='text/plain; charset=utf-8')
-
-        user_uuid, user_name, message = data['user_uuid'], data['user_name'], data['message'].strip()
-        
-        with Session() as session:
+    with Session() as session:
+        try:
+            data = request.json
+            user_uuid, user_name, message = data.get('uuid', ''), data.get('name', ''), data.get('message', '')
+            if not all([user_uuid, user_name, message]): return "エラー: 情報不足|", 400
+            
             user_data = get_or_create_user(session, user_uuid, user_name)
-            history = get_conversation_history(session, user_uuid, limit=4)
+            history = get_conversation_history(session, user_uuid)
+            ai_text = ""
+            
+            # --- 優先度順の意思決定ツリー ---
+            if is_time_request(message): ai_text = get_japan_time()
+            elif is_weather_request(message): ai_text = get_weather_forecast(message)
+            elif is_friend_request(message):
+                if any(kw in message for kw in ['リスト', '一覧']): ai_text = "友達リストだよ！\n" + "\n".join([f"・{f['name']}" for f in get_friend_list(user_uuid)]) if get_friend_list(user_uuid) else "まだ誰も友達登録されてないみたい！"
+                elif (match := re.search(r"「(.+?)」|(.+?)を友達登録", message)):
+                    name = next(filter(None, match.groups())); ai_text = f"おっけー！「{name}」を友達登録しといた！" if register_friend(user_uuid, name) else f"「{name}」はもう友達だよ！"
+            elif (match := re.search(f"({'|'.join(DYNAMIC_HOLOMEM_KEYWORDS)})って(?:誰|だれ|何)[\?？]?$", message.strip())):
+                member_name = match.group(1)
+                info = get_holomem_info(member_name)
+                if info:
+                    parts = [f"{info['name']}ちゃんはね、{info['description']}"]
+                    if info['status'] == '卒業': parts.append(f"でもね…{info.get('graduation_date', '以前')}に卒業しちゃったんだ…。{info.get('mochiko_feeling', '')}")
+                    elif info['status'] == '活動休止': parts.append(f"今ちょっとお休みしてるんだよね…。{info.get('mochiko_feeling', '')}")
+                    ai_text = " ".join(parts)
+                else: start_background_search(user_uuid, f"{member_name} ホロライブ", True); ai_text = f"おっけー！「{member_name}」ちゃんのことは専門Wikiで調べてみるね！"
+            elif is_explicit_search_request(message): start_background_search(user_uuid, message, True); ai_text = "おっけー、調べてみるね！"
+            
+            if not ai_text: ai_text = generate_ai_response(user_data, message, history)
+            
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
             session.commit()
-
-            response_text = ""
-            
-            # ホロライブニュースリクエスト
-            if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']):
-                news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
-                if news_items:
-                    save_news_cache(session, user_uuid, news_items)
-                    save_user_context(session, user_uuid, 'hololive_news', message)
-                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
-                    response_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
-                else:
-                    start_background_task(user_uuid, "ホロライブ 最新ニュース", 'search')
-                    response_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
-            
-            # 性格分析リクエスト
-            elif '性格分析' in message:
-                start_background_task(user_uuid, message, 'psych_analysis')
-                response_text = "🧠 わかった！あなたの性格分析を始めるね。少し時間がかかるから、終わったら「分析結果」って聞いてね！"
-            
-            # 分析結果の確認
-            elif '分析結果' in message:
-                psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-                if psych and psych.analysis_summary:
-                    elapsed = (datetime.utcnow() - psych.last_analyzed).total_seconds() if psych.last_analyzed else 999999
-                    if elapsed < 86400:  # 24時間以内
-                        response_text = f"あなたの分析結果はこんな感じ！\n\n「{psych.analysis_summary}」\n\n(信頼度: {psych.analysis_confidence}%)"
-                    else:
-                        response_text = "分析がちょっと古いから、もう一回「性格分析」って言ってみて！"
-                else:
-                    response_text = "⚠️ まだ分析データがないみたい。「性格分析」って言って、先に分析を開始してみてね！"
-            
-            # さくらみこ関連
-            elif ('さくらみこ' in message or 'みこち' in message):
-                for keyword, resp in get_sakuramiko_special_responses().items():
-                    if keyword in message:
-                        response_text = resp
-                        break
-                if not response_text:
-                    response_text = generate_ai_response(user_data, message, history, 
-                        "さくらみこはホロライブ所属の人気VTuber。「にぇ」が口癖のエリート巫女。ゲーム実況やマイクラ建築で有名。")
-            
-            # ホロメン名前のみリクエスト
-            elif (member_name := is_holomem_name_only_request(message)):
-                member_info = get_holomem_info(session, member_name)
-                if member_info:
-                    reference = f"{member_info.description}\n世代: {member_info.generation}"
-                    if member_info.mochiko_feeling:
-                        reference += f"\nもちこの感想: {member_info.mochiko_feeling}"
-                    response_text = generate_ai_response(user_data, f"{member_name}について教えて", history, reference)
-                else:
-                    start_background_task(user_uuid, f"{member_name} ホロライブ", 'search')
-                    response_text = f"ごめん、「{member_name}」の詳しい情報は持ってないや…。Webで調べてみるね！"
-            
-            # 番号選択処理（改善版）
-            elif (selected_number := is_number_selection(message)):
-                user_context = get_user_context(session, user_uuid)
-                
-                if user_context and user_context['type'] == 'hololive_news':
-                    # ホロライブニュースの詳細
-                    news_detail = get_cached_news_detail(session, user_uuid, selected_number)
-                    if news_detail:
-                        # ニュースの内容を要約して提供
-                        news_content = f"タイトル: {news_detail.title}\n\n内容: {news_detail.content[:500]}"
-                        response_text = generate_ai_response(
-                            user_data, 
-                            f"このニュースについて教えて: {news_detail.title}", 
-                            history, 
-                            news_content, 
-                            is_detailed=True
-                        )
-                    else:
-                        response_text = "あれ、その番号のニュースが見つからないや…もう一回「ホロライブニュース」って言ってみて！"
-                
-                elif user_context and user_context['type'] == 'web_search':
-                    # Web検索結果の詳細
-                    saved_result = get_saved_search_result(user_uuid, selected_number)
-                    if saved_result:
-                        prompt = f"「{saved_result['title']}」について詳しく教えて"
-                        response_text = generate_ai_response(
-                            user_data, 
-                            prompt, 
-                            history, 
-                            saved_result['full_content'], 
-                            is_detailed=True
-                        )
-                    else:
-                        response_text = "あれ、その番号の検索結果が見つからないや…もう一回検索してみて！"
-                else:
-                    response_text = "あれ、何の番号だっけ？何か調べたいことがあれば教えてね！"
-            
-            # フォローアップ質問
-            elif is_follow_up_question(message, history):
-                last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
-                response_text = generate_ai_response(
-                    user_data, 
-                    message, 
-                    history, 
-                    f"直前の回答: {last_assistant_msg}", 
-                    is_detailed=True
-                )
-            
-            # 時刻リクエスト
-            elif is_time_request(message):
-                response_text = get_japan_time()
-            
-            # 天気リクエスト
-            elif (location := is_weather_request(message)):
-                response_text = get_weather_forecast(location)
-            
-            # Web検索が必要
-            elif should_search(message):
-                start_background_task(user_uuid, message, 'search')
-                response_text = "おっけー、調べてみるね！終わったら「調べた？」って聞いてね！"
-            
-            # 通常の会話
-            if not response_text:
-                response_text = generate_ai_response(user_data, message, history)
-            
-            response_text = limit_text_for_sl(response_text)
-            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
-            session.commit()
-            
-            return Response(f"{response_text}|", mimetype='text/plain; charset=utf-8')
-
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        logger.error(traceback.format_exc())
-        return Response("ごめん、システムエラーが起きちゃった…|", status=500, mimetype='text/plain; charset=utf-8')
-
-# ========================================
-# 修正パッチ 3: タスク確認の改善
-# ========================================
+            return f"{ai_text}|", 200
+        except Exception as e:
+            logger.error(f"❌ chat_lsl error: {e}", exc_info=True); return "ごめん、システムエラーが起きちゃった…|", 500
 
 @app.route('/check_task', methods=['POST'])
 def check_task_endpoint():
-    """バックグラウンドタスクの確認エンドポイント（改善版）"""
-    try:
-        user_uuid = request.json['user_uuid']
-        
+    user_uuid = request.json.get('uuid')
+    if not user_uuid: return jsonify({'status': 'error'}), 400
+    task = check_completed_tasks(user_uuid)
+    if task:
         with Session() as session:
-            # 完了したタスクを取得
-            task = session.query(BackgroundTask).filter_by(
-                user_uuid=user_uuid, 
-                status='completed'
-            ).order_by(BackgroundTask.completed_at.desc()).first()
-            
-            if not task:
-                return jsonify({'status': 'no_tasks'})
-            
-            response_text = ""
-            
-            # 検索タスクの結果処理
-            if task.task_type == 'search':
-                results = json.loads(task.result) if task.result else None
-                
-                if not results or len(results) == 0:
-                    response_text = f"💡 「{task.query}」を調べたけど情報が見つからなかった…別のキーワードで試してみる？"
-                else:
-                    # 検索結果をキャッシュに保存
-                    save_search_context(user_uuid, results, task.query)
-                    save_user_context(session, user_uuid, 'web_search', task.query)
-                    
-                    # 結果リストを作成
-                    list_items = [f"【{r['number']}】{r['title']}" for r in results]
-                    response_text = (
-                        f"おまたせ！「{task.query}」について調べてきたよ！\n\n" +
-                        "\n".join(list_items) +
-                        "\n\n気になる番号を教えてくれたら詳しく話すね！"
-                    )
-            
-            # 性格分析タスクの結果処理
-            elif task.task_type == 'psych_analysis':
-                psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-                
-                if psych and psych.analysis_summary:
-                    response_text = (
-                        f"分析終わったよ！あてぃしが見たあなたは…\n\n" +
-                        f"「{psych.analysis_summary}」\n\n" +
-                        f"って感じ！(信頼度: {psych.analysis_confidence}%)\n\n" +
-                        f"もっと詳しく知りたかったら「分析結果」って聞いてね！"
-                    )
-                else:
-                    response_text = "分析終わったけど、まだうまくまとめられないや…もうちょっと会話してから試してみて！"
-            
-            # 結果をチャット履歴に追加
-            response_text = limit_text_for_sl(response_text)
-            session.add(ConversationHistory(
-                user_uuid=user_uuid, 
-                role='assistant', 
-                content=response_text
-            ))
-            
-            # タスクを削除（処理済み）
-            session.delete(task)
+            user_data = get_or_create_user(session, user_uuid, "Unknown")
+            history = get_conversation_history(session, user_uuid)
+            report_message = generate_ai_response(user_data, f"（検索完了報告）「{task['query']}」の結果を報告して。", history, task['result'], is_task_report=True)
+            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=report_message))
             session.commit()
-            
-            return Response(
-                json.dumps({'status': 'completed', 'response': response_text}, ensure_ascii=False),
-                mimetype='application/json; charset=utf-8'
-            )
-            
-    except Exception as e:
-        logger.error(f"Check task error: {e}", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
+        return jsonify({'status': 'completed', 'message': report_message}), 200
+    return jsonify({'status': 'pending'}), 200
 
-# --- アプリケーション起動 ---
+@app.route('/generate_voice', methods=['POST'])
+def voice_generation_endpoint():
+    text = request.json.get('text', '')
+    if not text: return jsonify({'error': 'テキストがありません'}), 400
+    filename = generate_voice(text)
+    if filename: return jsonify({'status': 'success', 'url': f"{SERVER_URL}/voices/{filename}"}), 200
+    return jsonify({'error': '音声生成に失敗しました'}), 500
+@app.route('/voices/<filename>')
+def serve_voice_file(filename): return send_from_directory(VOICE_DIR, filename)
+@app.route('/analyze_psychology', methods=['POST'])
+def analyze_psychology_endpoint(): background_executor.submit(analyze_user_psychology, request.json.get('uuid')); return jsonify({'status': 'started'}), 200
+@app.route('/get_psychology', methods=['POST'])
+def get_psychology_endpoint(): return jsonify(get_user_psychology(request.json.get('uuid')) or {}), 200
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    with Session() as session:
+        return jsonify({'users': session.query(UserMemory).count(), 'conversations': session.query(ConversationHistory).count()})
+
+# ==============================================================================
+# 初期化とスケジューラー
+# ==============================================================================
+def initialize_holomem_wiki():
+    with Session() as session:
+        if session.query(HolomemWiki).count() > 0: return
+        logger.info("📚 Initializing HoloMem Wiki with ALL members and feelings...")
+        initial_data = [
+            {'member_name': 'さくらみこ', 'description': 'エリート巫女だよ！', 'generation': '0期生', 'status': '現役'},
+            {'member_name': '星街すいせい', 'description': '歌とテトリスが神レベル！', 'generation': '0期生', 'status': '現役'},
+            {'member_name': '兎田ぺこら', 'description': '「ぺこ」が口癖のうさ耳VTuber！', 'generation': '3期生', 'status': '現役'},
+            {'member_name': '宝鐘マリン', 'description': '自称17歳のセクシーな女海賊船長！', 'generation': '3期生', 'status': '現役'},
+            {'member_name': 'がうる・ぐら', 'description': '「a」で世界を虜にしたサメちゃん！', 'generation': 'English -Myth-', 'status': '卒業', 'graduation_date': '2025年5月1日', 'mochiko_feeling': 'ENのトップだったのに…お疲れ様って思う。'},
+            {'member_name': '湊あくあ', 'description': 'ドジっ子ゲーマーメイド！', 'generation': '2期生', 'status': '卒業', 'graduation_date': '2024年8月6日', 'mochiko_feeling': 'あくたんがいないなんて考えられないよ…。でも、決めた道なら応援しなきゃだよね…。'},
+            {'member_name': '紫咲シオン', 'description': '生意気な天才黒魔術師！', 'generation': '2.5期生', 'status': '卒業', 'graduation_date': '2025年3月6日', 'mochiko_feeling': '誰があてぃしをからかってくれるのさ…。'},
+            {'member_name': '七詩ムメイ', 'description': '文明の守護者のフクロウさん。', 'generation': 'English -Council-', 'status': '卒業', 'graduation_date': '2025年3月28日', 'mochiko_feeling': 'ありがとう、フクロウさん…。'},
+            {'member_name': '火威青', 'description': 'クールでオタクな漫画家！', 'generation': 'ReGLOSS', 'status': '卒業', 'graduation_date': '2025年10月3日', 'mochiko_feeling': 'デビューしてすぐいなくなるなんて寂しすぎるよ…。'},
+            {'member_name': '桐生ココ', 'description': '伝説の会長！', 'generation': '4期生', 'status': '卒業', 'graduation_date': '2021年7月1日', 'mochiko_feeling': '会長が残してくれたものは永遠だよ！'},
+            {'member_name': '潤羽るしあ', 'description': '感情豊かなネクロマンサー。', 'generation': '3期生', 'status': '卒業', 'graduation_date': '2022年2月24日', 'mochiko_feeling': 'また3期生のみんなでわちゃわちゃしてほしかったな…。'},
+            {'member_name': '夜空メル', 'description': 'ヴァンパイアの女の子。', 'generation': '1期生', 'status': '卒業', 'graduation_date': '2024年1月16日', 'mochiko_feeling': 'メル先輩…突然すぎたよ…。'},
+            {'member_name': '魔乃アロエ', 'description': '生意気なサキュバスの子。', 'generation': '5期生', 'status': '卒業', 'graduation_date': '2020年8月31日', 'mochiko_feeling': '一瞬だったけどキラキラしてた…。'},
+            {'member_name': '九十九佐命', 'description': '「空間」の代弁者。', 'generation': 'English -Council-', 'status': '卒業', 'graduation_date': '2022年7月31日', 'mochiko_feeling': '宇宙みたいに心が広くて大好きだったよ。'},
+        ]
+        session.bulk_insert_mappings(HolomemWiki, initial_data)
+        session.commit()
+
+def load_holomem_keywords_from_db():
+    global DYNAMIC_HOLOMEM_KEYWORDS
+    with Session() as session:
+        try:
+            members = session.query(HolomemWiki.member_name).all()
+            db_keywords = [member[0] for member in members]
+            base_keywords = ['ホロライブ', 'ホロメン', 'hololive', 'YAGOO']
+            DYNAMIC_HOLOMEM_KEYWORDS = list(set(db_keywords + base_keywords))
+            logger.info(f"✅ Loaded {len(DYNAMIC_HOLOMEM_KEYWORDS)} Hololive keywords from DB.")
+        except Exception as e: logger.error(f"❌ Failed to load Holomem keywords: {e}")
+
+def _update_news_database(session, model, site_name, base_url, selectors):
+    try:
+        response = requests.get(base_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        articles = next((soup.select(s) for s in selectors if soup.select(s)), [])[:5]
+        for article in articles:
+            title_elem = article.find(['h2', 'h3', 'a'])
+            link_elem = title_elem if title_elem and title_elem.name == 'a' else article.find('a', href=True)
+            if not title_elem or not link_elem: continue
+            title = clean_text(title_elem.get_text())
+            if len(title) < 10: continue
+            article_url = urljoin(base_url, link_elem.get('href', ''))
+            news_hash = create_news_hash(title, article_url)
+            if not session.query(model).filter_by(news_hash=news_hash).first():
+                data = {'title': title, 'content': title, 'news_hash': news_hash, 'url': article_url}
+                if model == SpecializedNews: data['site_name'] = site_name
+                session.add(model(**data)); session.commit()
+    except Exception as e:
+        logger.error(f"❌ News update error for {site_name}: {e}"); session.rollback()
+
+def update_news_task():
+    with Session() as session:
+        _update_news_database(session, HololiveNews, "Hololive", "https://hololive-tsuushin.com/category/holonews/", ['article', '.post'])
+        for site, config in SPECIALIZED_SITES.items():
+            _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post'])
+            time.sleep(2)
+
+def cleanup_old_data_task():
+    with Session() as session:
+        cutoff = datetime.utcnow() - timedelta(days=90)
+        session.query(ConversationHistory).filter(ConversationHistory.timestamp < cutoff).delete()
+        session.query(HololiveNews).filter(HololiveNews.created_at < cutoff).delete()
+        session.query(SpecializedNews).filter(SpecializedNews.created_at < cutoff).delete()
+        session.commit(); logger.info("🧹 Old data cleaned up.")
+
+def psychology_analysis_task():
+    with Session() as session:
+        active_users = session.query(UserMemory).filter(UserMemory.last_interaction > datetime.utcnow() - timedelta(days=7)).all()
+        for user in active_users:
+            psychology = session.query(UserPsychology).filter_by(user_uuid=user.user_uuid).first()
+            if not psychology or psychology.last_analyzed < datetime.utcnow() - timedelta(hours=24):
+                background_executor.submit(analyze_user_psychology, user.user_uuid)
+
+def run_scheduler():
+    while True:
+        try: schedule.run_pending()
+        except Exception as e: logger.error(f"❌ Scheduler thread error: {e}")
+        time.sleep(60)
+
 def initialize_app():
     global engine, Session, groq_client
-    logger.info("="*50)
-    logger.info("🔧 Mochiko AI (Final Ver.) Starting Up...")
-    logger.info("="*50)
-    
-    if GROQ_API_KEY and len(GROQ_API_KEY) > 20:
-        try:
-            groq_client = Groq(api_key=GROQ_API_KEY)
-            logger.info("🔍 Verifying Groq API key...")
-            groq_client.chat.completions.create(messages=[{"role": "user", "content": "test"}], model="llama-3.1-8b-instant", max_tokens=2)
-            logger.info("✅ Groq API key is valid and working.")
-        except Exception as e:
-            logger.critical("🔥🔥🔥 FATAL: Groq API key verification failed! 🔥🔥🔥")
-            groq_client = None
-    else:
-        logger.warning("⚠️ GROQ_API_KEY is not set or too short. AI features will be disabled.")
-        groq_client = None
-
-    is_sqlite = 'sqlite' in DATABASE_URL
-    connect_args = {'check_same_thread': False} if is_sqlite else {}
-    engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
-
+    logger.info("🔧 Mochiko AI Starting Up...")
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if 'sqlite' in DATABASE_URL else {})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    
     initialize_holomem_wiki()
+    load_holomem_keywords_from_db()
     
-    def run_scheduler():
-        while True: 
-            schedule.run_pending()
-            time.sleep(60)
-
+    schedule.every(1).hour.do(update_news_task)
+    schedule.every().day.at("03:00").do(cleanup_old_data_task)
+    schedule.every(6).hours.do(psychology_analysis_task)
+    
     threading.Thread(target=run_scheduler, daemon=True).start()
-    
     logger.info("✅ Initialization Complete!")
 
-application = None
+# ==============================================================================
+# メイン実行
+# ==============================================================================
 try:
     initialize_app()
     application = app
 except Exception as e:
-    logger.critical(f"Fatal init error: {e}", exc_info=True)
-    application = Flask(__name__)
+    logger.critical(f"🔥 Fatal initialization error: {e}", exc_info=True)
+    sys.exit(1)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    application.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
