@@ -245,7 +245,8 @@ def detect_specialized_topic(message):
 
 def is_time_request(message): return any(kw in message for kw in ['今何時', '時間', '時刻'])
 def is_weather_request(message):
-    if any(t in message for t in ['天気予報']): return next((loc for loc in LOCATION_CODES if loc in message), "東京")
+    if any(t in message for t in ['天気予報', '天気教えて', '天気どう',
+        '気温教えて', '明日の天気', '週間天気']): return next((loc for loc in LOCATION_CODES if loc in message), "東京")
     return None
 def is_follow_up_question(message, history):
     if not history: return False
