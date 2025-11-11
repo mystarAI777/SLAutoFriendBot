@@ -70,8 +70,27 @@ LOCATION_CODES = { "東京": "130000", "大阪": "270000", "名古屋": "230000"
 # ==============================================================================
 # 秘密情報/環境変数 読み込み
 # ==============================================================================
+# === app.py の get_secret 関数を以下のように修正 ===
 def get_secret(name):
-    return os.environ.get(name)
+    """環境変数から秘密情報を取得（Render環境での標準的な方法）"""
+    
+    # RenderはSecret Fileを環境変数として展開するため、これでほとんどのケースをカバーできる
+    env_value = os.environ.get(name)
+    if env_value and env_value.strip():
+        return env_value.strip()
+        
+    # 安全のため、ファイルからも試す（過去のバージョンがこのロジックだった場合の後方互換）
+    try:
+        # Renderの標準的なSecretパス: /etc/secrets/
+        with open(f'/etc/secrets/{name}', 'r') as f: 
+            file_value = f.read().strip()
+            if file_value:
+                return file_value
+    except Exception:
+        pass # ファイルが見つからなくても続行
+        
+    return None
+# ===================================================
 
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./test.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
