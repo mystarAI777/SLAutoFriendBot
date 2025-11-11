@@ -40,7 +40,16 @@ SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')
 VOICE_DIR = '/tmp/voices'
 VOICEVOX_SPEAKER_ID = 20
 SL_SAFE_CHAR_LIMIT = 250
-USER_AGENTS = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36']
+# ========================================
+# 修正パッチ 4: より信頼性の高いUSER_AGENTS
+# ========================================
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+]
 LOCATION_CODES = { "東京": "130000", "大阪": "270000", "名古屋": "230000", "福岡": "400000", "札幌": "016000" }
 
 SPECIALIZED_SITES = {
@@ -236,7 +245,7 @@ def detect_specialized_topic(message):
 
 def is_time_request(message): return any(kw in message for kw in ['今何時', '時間', '時刻'])
 def is_weather_request(message):
-    if any(t in message for t in ['天気', '気温']): return next((loc for loc in LOCATION_CODES if loc in message), "東京")
+    if any(t in message for t in ['天気予報']): return next((loc for loc in LOCATION_CODES if loc in message), "東京")
     return None
 def is_follow_up_question(message, history):
     if not history: return False
@@ -332,28 +341,79 @@ def get_weather_forecast(location):
     except Exception as e:
         logger.error(f"Weather API error for {location}: {e}")
         return "うぅ、天気情報がうまく取れなかったみたい…"
-def scrape_major_search_engines(query, num_results=3):
+def scrape_major_search_engines(query, num_results=5):
+    """より確実な検索結果取得のための改善版"""
+    
+    # DuckDuckGo HTML版を追加（スクレイピングしやすい）
     search_configs = [
-        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja", 'selector': 'div.g'},
-        {'name': 'Yahoo', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'selector': 'div.Algo'}
+        {
+            'name': 'DuckDuckGo',
+            'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+            'selector': '.result',
+            'title_selector': '.result__a',
+            'snippet_selector': '.result__snippet'
+        },
+        {
+            'name': 'Google',
+            'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja",
+            'selector': 'div.g',
+            'title_selector': 'h3',
+            'snippet_selector': '.VwiC3b, .yXK7lf'
+        },
+        {
+            'name': 'Bing',
+            'url': f"https://www.bing.com/search?q={quote_plus(query)}&setlang=ja",
+            'selector': 'li.b_algo',
+            'title_selector': 'h2',
+            'snippet_selector': '.b_caption p'
+        }
     ]
+    
     for config in search_configs:
         try:
-            response = requests.get(config['url'], headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'ja,en;q=0.9',
+            }
+            
+            response = requests.get(config['url'], headers=headers, timeout=15)
             response.raise_for_status()
+            
             soup = BeautifulSoup(response.content, 'html.parser')
             results = []
+            
             for elem in soup.select(config['selector'])[:num_results]:
-                title_elem = elem.select_one('h2, h3, .LC20lb')
-                snippet_elem = elem.select_one('.b_caption p, .compText, .VwiC3b')
-                if title_elem and snippet_elem:
-                    results.append({'title': clean_text(title_elem.get_text()), 'snippet': clean_text(snippet_elem.get_text())})
-            if results: 
-                logger.info(f"✅ Search successful on {config['name']}")
+                try:
+                    title_elem = elem.select_one(config['title_selector'])
+                    snippet_elem = elem.select_one(config['snippet_selector'])
+                    
+                    if title_elem:
+                        title = clean_text(title_elem.get_text())
+                        snippet = clean_text(snippet_elem.get_text()) if snippet_elem else title[:100]
+                        
+                        if title and len(title) > 5:  # 有効なタイトルのみ
+                            results.append({
+                                'title': title,
+                                'snippet': snippet,
+                                'source': config['name']
+                            })
+                except Exception as elem_error:
+                    logger.debug(f"Element parse error in {config['name']}: {elem_error}")
+                    continue
+            
+            if results:
+                logger.info(f"✅ Search successful on {config['name']}: {len(results)} results")
                 return results
+            else:
+                logger.warning(f"⚠️ No results found on {config['name']}")
+                
         except Exception as e:
             logger.warning(f"⚠️ Search failed on {config['name']}: {e}")
             continue
+    
+    # すべて失敗した場合、簡易的なフォールバック
+    logger.error("❌ All search engines failed")
     return []
 
 # --- 心理分析 ---
@@ -443,30 +503,73 @@ def generate_fallback_response(message, reference_info=""):
         return random.choice(["それ、気になるね！", "うーん、なんて言おうかな！", "まじ？どういうこと？"])
     return random.choice(["うんうん！", "なるほどね！", "そうなんだ！", "まじで？"])
 
+# ========================================
+# 修正パッチ 5: バックグラウンドタスクのタイムアウト改善
+# ========================================
+
 def background_task_runner(task_id, query, task_type, user_uuid):
+    """バックグラウンドタスク実行関数（改善版）"""
     result_data, result_status = None, 'failed'
+    
     try:
         if task_type == 'search':
+            # 検索クエリの最適化
             search_query = query
-            if (topic := extract_recommendation_topic(query)): search_query = f"おすすめ {topic} ランキング"
-            elif (topic := detect_specialized_topic(query)): search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
-            raw_results = scrape_major_search_engines(search_query, 5)
-            result_data = json.dumps(format_search_results_as_list(raw_results), ensure_ascii=False) if raw_results else None
+            
+            # おすすめリクエストの処理
+            if (topic := extract_recommendation_topic(query)):
+                search_query = f"{topic} おすすめ ランキング 2024 2025"
+            
+            # 専門サイト検索の処理
+            elif (topic := detect_specialized_topic(query)):
+                search_query = f"site:{SPECIALIZED_SITES[topic]['base_url']} {query}"
+            
+            # より多めに取得して確実性を上げる
+            raw_results = scrape_major_search_engines(search_query, 8)
+            
+            if raw_results:
+                formatted_results = format_search_results_as_list(raw_results)
+                result_data = json.dumps(formatted_results, ensure_ascii=False)
+                result_status = 'completed'
+                logger.info(f"✅ Search task completed: {len(raw_results)} results for '{query}'")
+            else:
+                # 失敗した場合、簡略化したクエリで再試行
+                simple_query = query.split()[0] if len(query.split()) > 1 else query
+                logger.warning(f"⚠️ First search failed, retrying with: {simple_query}")
+                
+                retry_results = scrape_major_search_engines(simple_query, 5)
+                if retry_results:
+                    formatted_results = format_search_results_as_list(retry_results)
+                    result_data = json.dumps(formatted_results, ensure_ascii=False)
+                    result_status = 'completed'
+                    logger.info(f"✅ Retry search succeeded: {len(retry_results)} results")
+                else:
+                    result_status = 'completed'  # 結果なしでも完了扱い
+                    logger.error(f"❌ All search attempts failed for: {query}")
+        
         elif task_type == 'psych_analysis':
             analyze_user_psychology(user_uuid)
             result_data = "Analysis Complete"
-        result_status = 'completed'
+            result_status = 'completed'
+            logger.info(f"✅ Psychology analysis completed for user: {user_uuid}")
+        
     except Exception as e:
         logger.error(f"❌ Background task '{task_type}' failed: {e}")
         logger.error(traceback.format_exc())
-
-    with Session() as session:
-        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
-        if task:
-            task.result = result_data
-            task.status = result_status
-            task.completed_at = datetime.utcnow()
-            session.commit()
+        result_status = 'completed'  # エラーでも完了扱いにして通知する
+    
+    # タスクステータスを更新
+    try:
+        with Session() as session:
+            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+            if task:
+                task.result = result_data
+                task.status = result_status
+                task.completed_at = datetime.utcnow()
+                session.commit()
+                logger.info(f"✅ Task {task_id} status updated to: {result_status}")
+    except Exception as db_error:
+        logger.error(f"❌ Failed to update task status: {db_error}")
 
 def start_background_task(user_uuid, query, task_type):
     task_id = hashlib.md5(f"{user_uuid}{str(query)}{time.time()}{task_type}".encode()).hexdigest()[:10]
@@ -486,6 +589,10 @@ def health_check():
     except: pass
     return jsonify({'status': 'ok', 'db': db_ok, 'ai': 'ok' if groq_client else 'disabled'})
 
+# ========================================
+# 修正パッチ 2: ニュース詳細取得の改善
+# ========================================
+
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     try:
@@ -503,6 +610,7 @@ def chat_lsl():
 
             response_text = ""
             
+            # ホロライブニュースリクエスト
             if 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報']):
                 news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if news_items:
@@ -513,49 +621,108 @@ def chat_lsl():
                 else:
                     start_background_task(user_uuid, "ホロライブ 最新ニュース", 'search')
                     response_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
+            
+            # 性格分析リクエスト
             elif '性格分析' in message:
                 start_background_task(user_uuid, message, 'psych_analysis')
-                response_text = "おっけー！あなたのこと、分析しちゃうね！ちょっと時間かかるかも！"
+                response_text = "🧠 わかった！あなたの性格分析を始めるね。少し時間がかかるから、終わったら「分析結果」って聞いてね！"
+            
+            # 分析結果の確認
+            elif '分析結果' in message:
+                psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+                if psych and psych.analysis_summary:
+                    elapsed = (datetime.utcnow() - psych.last_analyzed).total_seconds() if psych.last_analyzed else 999999
+                    if elapsed < 86400:  # 24時間以内
+                        response_text = f"あなたの分析結果はこんな感じ！\n\n「{psych.analysis_summary}」\n\n(信頼度: {psych.analysis_confidence}%)"
+                    else:
+                        response_text = "分析がちょっと古いから、もう一回「性格分析」って言ってみて！"
+                else:
+                    response_text = "⚠️ まだ分析データがないみたい。「性格分析」って言って、先に分析を開始してみてね！"
+            
+            # さくらみこ関連
             elif ('さくらみこ' in message or 'みこち' in message):
                 for keyword, resp in get_sakuramiko_special_responses().items():
                     if keyword in message:
-                        response_text = resp; break
+                        response_text = resp
+                        break
                 if not response_text:
-                    response_text = generate_ai_response(user_data, message, history, "さくらみこはホロライブ所属の人気VTuber。独特な口癖やゲーム実況が人気。")
+                    response_text = generate_ai_response(user_data, message, history, 
+                        "さくらみこはホロライブ所属の人気VTuber。「にぇ」が口癖のエリート巫女。ゲーム実況やマイクラ建築で有名。")
+            
+            # ホロメン名前のみリクエスト
             elif (member_name := is_holomem_name_only_request(message)):
                 member_info = get_holomem_info(session, member_name)
                 if member_info:
-                    response_text = generate_ai_response(user_data, f"{member_name}について教えて", history, member_info.description)
+                    reference = f"{member_info.description}\n世代: {member_info.generation}"
+                    if member_info.mochiko_feeling:
+                        reference += f"\nもちこの感想: {member_info.mochiko_feeling}"
+                    response_text = generate_ai_response(user_data, f"{member_name}について教えて", history, reference)
                 else:
-                    start_background_task(user_uuid, message, 'search')
-                    response_text = f"ごめん、「{message}」ちゃんの詳しい情報は持ってないや…。Webで調べてみるね！"
+                    start_background_task(user_uuid, f"{member_name} ホロライブ", 'search')
+                    response_text = f"ごめん、「{member_name}」の詳しい情報は持ってないや…。Webで調べてみるね！"
+            
+            # 番号選択処理（改善版）
             elif (selected_number := is_number_selection(message)):
                 user_context = get_user_context(session, user_uuid)
                 
                 if user_context and user_context['type'] == 'hololive_news':
+                    # ホロライブニュースの詳細
                     news_detail = get_cached_news_detail(session, user_uuid, selected_number)
                     if news_detail:
-                        response_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
+                        # ニュースの内容を要約して提供
+                        news_content = f"タイトル: {news_detail.title}\n\n内容: {news_detail.content[:500]}"
+                        response_text = generate_ai_response(
+                            user_data, 
+                            f"このニュースについて教えて: {news_detail.title}", 
+                            history, 
+                            news_content, 
+                            is_detailed=True
+                        )
                     else:
-                        response_text = "あれ、その番号のニュースが見つからないや…"
-                else: 
+                        response_text = "あれ、その番号のニュースが見つからないや…もう一回「ホロライブニュース」って言ってみて！"
+                
+                elif user_context and user_context['type'] == 'web_search':
+                    # Web検索結果の詳細
                     saved_result = get_saved_search_result(user_uuid, selected_number)
                     if saved_result:
-                        prompt = f"「{saved_result['title']}」について詳しく教えて！"
-                        response_text = generate_ai_response(user_data, prompt, history, saved_result['full_content'], is_detailed=True)
+                        prompt = f"「{saved_result['title']}」について詳しく教えて"
+                        response_text = generate_ai_response(
+                            user_data, 
+                            prompt, 
+                            history, 
+                            saved_result['full_content'], 
+                            is_detailed=True
+                        )
                     else:
-                        response_text = "あれ、何の番号だっけ？もう一回検索してみて！"
+                        response_text = "あれ、その番号の検索結果が見つからないや…もう一回検索してみて！"
+                else:
+                    response_text = "あれ、何の番号だっけ？何か調べたいことがあれば教えてね！"
+            
+            # フォローアップ質問
             elif is_follow_up_question(message, history):
                 last_assistant_msg = next((h.content for h in history if h.role == 'assistant'), "")
-                response_text = generate_ai_response(user_data, message, history, f"直前の回答: {last_assistant_msg}", is_detailed=True)
+                response_text = generate_ai_response(
+                    user_data, 
+                    message, 
+                    history, 
+                    f"直前の回答: {last_assistant_msg}", 
+                    is_detailed=True
+                )
+            
+            # 時刻リクエスト
             elif is_time_request(message):
                 response_text = get_japan_time()
+            
+            # 天気リクエスト
             elif (location := is_weather_request(message)):
                 response_text = get_weather_forecast(location)
+            
+            # Web検索が必要
             elif should_search(message):
                 start_background_task(user_uuid, message, 'search')
-                response_text = "おっけー、調べてみるね！終わったら教える！"
+                response_text = "おっけー、調べてみるね！終わったら「調べた？」って聞いてね！"
             
+            # 通常の会話
             if not response_text:
                 response_text = generate_ai_response(user_data, message, history)
             
@@ -570,37 +737,77 @@ def chat_lsl():
         logger.error(traceback.format_exc())
         return Response("ごめん、システムエラーが起きちゃった…|", status=500, mimetype='text/plain; charset=utf-8')
 
+# ========================================
+# 修正パッチ 3: タスク確認の改善
+# ========================================
+
 @app.route('/check_task', methods=['POST'])
 def check_task_endpoint():
+    """バックグラウンドタスクの確認エンドポイント（改善版）"""
     try:
         user_uuid = request.json['user_uuid']
+        
         with Session() as session:
-            task = session.query(BackgroundTask).filter_by(user_uuid=user_uuid, status='completed').order_by(BackgroundTask.completed_at.desc()).first()
-            if not task: return jsonify({'status': 'no_tasks'})
+            # 完了したタスクを取得
+            task = session.query(BackgroundTask).filter_by(
+                user_uuid=user_uuid, 
+                status='completed'
+            ).order_by(BackgroundTask.completed_at.desc()).first()
+            
+            if not task:
+                return jsonify({'status': 'no_tasks'})
             
             response_text = ""
+            
+            # 検索タスクの結果処理
             if task.task_type == 'search':
                 results = json.loads(task.result) if task.result else None
-                if not results:
-                    response_text = f"「{task.query}」を調べたけど情報が見つからなかった…"
+                
+                if not results or len(results) == 0:
+                    response_text = f"💡 「{task.query}」を調べたけど情報が見つからなかった…別のキーワードで試してみる？"
                 else:
+                    # 検索結果をキャッシュに保存
                     save_search_context(user_uuid, results, task.query)
                     save_user_context(session, user_uuid, 'web_search', task.query)
+                    
+                    # 結果リストを作成
                     list_items = [f"【{r['number']}】{r['title']}" for r in results]
-                    response_text = f"おまたせ！「{task.query}」について調べてきたよ！\n" + "\n".join(list_items) + "\n\n気になる番号教えて！"
+                    response_text = (
+                        f"おまたせ！「{task.query}」について調べてきたよ！\n\n" +
+                        "\n".join(list_items) +
+                        "\n\n気になる番号を教えてくれたら詳しく話すね！"
+                    )
+            
+            # 性格分析タスクの結果処理
             elif task.task_type == 'psych_analysis':
                 psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
-                if psych and hasattr(psych, 'analysis_summary') and psych.analysis_summary:
-                    response_text = f"分析終わったよ！あてぃしが見たあなたは…「{psych.analysis_summary}」って感じ！(信頼度: {psych.analysis_confidence}%)"
+                
+                if psych and psych.analysis_summary:
+                    response_text = (
+                        f"分析終わったよ！あてぃしが見たあなたは…\n\n" +
+                        f"「{psych.analysis_summary}」\n\n" +
+                        f"って感じ！(信頼度: {psych.analysis_confidence}%)\n\n" +
+                        f"もっと詳しく知りたかったら「分析結果」って聞いてね！"
+                    )
                 else:
-                    response_text = "分析終わったけど、まだうまくまとめられないや…"
+                    response_text = "分析終わったけど、まだうまくまとめられないや…もうちょっと会話してから試してみて！"
             
+            # 結果をチャット履歴に追加
             response_text = limit_text_for_sl(response_text)
-            session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=response_text))
+            session.add(ConversationHistory(
+                user_uuid=user_uuid, 
+                role='assistant', 
+                content=response_text
+            ))
+            
+            # タスクを削除（処理済み）
             session.delete(task)
             session.commit()
             
-            return Response(json.dumps({'status': 'completed', 'response': response_text}, ensure_ascii=False), mimetype='application/json; charset=utf-8')
+            return Response(
+                json.dumps({'status': 'completed', 'response': response_text}, ensure_ascii=False),
+                mimetype='application/json; charset=utf-8'
+            )
             
     except Exception as e:
         logger.error(f"Check task error: {e}", exc_info=True)
