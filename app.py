@@ -112,6 +112,45 @@ app = Flask(__name__)
 # ===== 【修正】文字化け対策: JSONのASCIIエンコードを無効化 =====
 app.config['JSON_AS_ASCII'] = False
 CORS(app)
+def get_or_create_user(session, uuid, name):
+    """ユーザー情報を取得または作成"""
+    try:
+        user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
+        if user:
+            user.interaction_count += 1
+            user.last_interaction = datetime.utcnow()
+            if user.user_name != name:
+                user.user_name = name
+                logger.info(f"👤 ユーザー名更新: {name}")
+        else:
+            user = UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
+            session.add(user)
+            logger.info(f"👤 新規ユーザー作成: {name}")
+        
+        session.commit()
+        return user
+        
+    except Exception as e:
+        logger.error(f"❌ ユーザー作成/更新エラー: {e}")
+        session.rollback()
+        # エラーが発生した場合でも、メモリ上の仮のユーザーオブジェクトを返す
+        return UserMemory(user_uuid=uuid, user_name=name, interaction_count=1)
+
+def get_conversation_history(session, uuid, limit=8):
+    """会話履歴を取得"""
+    try:
+        history = session.query(ConversationHistory).filter_by(
+            user_uuid=uuid
+        ).order_by(
+            ConversationHistory.timestamp.desc()
+        ).limit(limit).all()
+        
+        # AIモデルは新しい順ではなく時系列順の履歴を期待するため、逆順にする
+        return list(reversed(history))
+        
+    except Exception as e:
+        logger.error(f"❌ 会話履歴取得エラー: {e}")
+        return []
 
 # (v14.0の create_db_engine_with_retry 関数はそのまま使用)
 def create_db_engine_with_retry(max_retries=5, retry_delay=5):
