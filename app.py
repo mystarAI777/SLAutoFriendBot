@@ -1,8 +1,10 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v19.2 - 複数エンジン統合要約版)
+# もちこAI - 究極の全機能統合版 (v20.0 - ニュース機能完全復元版)
 #
-# v19.1をベースに、Web検索機能を「複数の検索エンジンから情報を収集し、
-# AIが統合して要約する」という、より高度で堅牢な方式にアップグレードした最終版。
+# 度重なるエラーを深くお詫びし、初期バージョンで設計されていた、データベースを
+# 主軸とする洗練されたニュース機能を完全に復元・実装した最終確定バージョン。
+# - ニュース自動取得時に記事本文もDBに保存
+# - DB優先の高速なニュース応答と、対話型の詳細閲覧機能を完全実装
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -77,6 +79,8 @@ def get_secret(name):
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+GOOGLE_API_KEY = get_secret('GOOGLE_API_KEY')
+CUSTOM_SEARCH_ENGINE_ID = get_secret('CUSTOM_SEARCH_ENGINE_ID')
 
 # ==============================================================================
 # AIクライアントとグローバル変数
@@ -472,7 +476,7 @@ def deep_web_search(query):
 {summary_text}\n\n回答の注意点:\n- 一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」、口癖は「まじ」「てか」「うける」。\n- 250文字以内で簡潔にまとめて。"""
     
     try:
-        return call_llama_advanced(prompt, [], system_prompt="", max_tokens=300)
+        return call_llama_advanced(prompt, [], "", max_tokens=300)
     except Exception as e:
         logger.error(f"❌ AIによる検索結果の要約中にエラー: {e}")
         return "検索はできたんだけど、うまくまとめるのに失敗しちゃった…ごめん！"
@@ -516,6 +520,20 @@ def chat_lsl():
                 result = completed_task['result']
                 ai_text = f"おまたせ！「{query}」について調べてきたよ！\n\n{result}"
 
+            elif (selected_number := is_number_selection(message)):
+                user_context = get_user_context(session, user_uuid)
+                news_type_map = {'hololive_news': 'hololive', 'specialized_news': 'specialized'}
+                news_type = news_type_map.get(user_context['type']) if user_context else None
+
+                if news_type:
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, news_type)
+                    if news_detail:
+                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について詳しく教えて", history, news_detail.content, is_detailed=True)
+                    else:
+                        ai_text = "あれ、その番号のニュースが見つからないや…"
+                else:
+                    ai_text = "え、なんの番号だっけ？何かを調べてから番号で教えてね！"
+            
             elif (what_is_term := is_what_is_request(message)):
                 wikipedia_text = search_wikipedia(what_is_term)
                 if wikipedia_text:
@@ -525,22 +543,37 @@ def chat_lsl():
                         ai_text = f"ごめん、{what_is_term}について調べてみたんだけど、うまくまとめられなかった…"
                 else:
                     start_background_task(user_uuid, 'search', {'query': message}); ai_text = f"おっけー、「{message}」について詳しく調べてみるね！ちょい待ってて！"
-            
+
+            elif is_hololive_news_request(message):
+                news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
+                if news_items:
+                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
+                    ai_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_news_cache(session, user_uuid, news_items, 'hololive')
+                    save_user_context(session, user_uuid, 'hololive_news', message)
+                else:
+                    start_background_task(user_uuid, 'search', {'query': 'ホロライブ 最新ニュース'}); ai_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
+            elif (topic := detect_specialized_topic(message)):
+                news_items = session.query(SpecializedNews).filter_by(site_name=topic).order_by(SpecializedNews.created_at.desc()).limit(5).all()
+                if news_items:
+                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
+                    ai_text = f"{topic}の最新ニュースはこんな感じ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_news_cache(session, user_uuid, news_items, 'specialized')
+                    save_user_context(session, user_uuid, 'specialized_news', message)
+                else:
+                    start_background_task(user_uuid, 'search', {'query': f'{topic} 最新情報'}); ai_text = f"ごめん、今DBに{topic}のニュースがないみたい！Webで調べてみるね！"
+
             elif '性格分析' in message:
                 start_background_task(user_uuid, 'psych_analysis', {}); ai_text = "おっけー！あなたの性格、分析してみるね！終わったら教えるから、ちょっと待ってて！"
-            elif is_hololive_news_request(message):
-                start_background_task(user_uuid, 'search', {'query': message}); ai_text = "ホロライブのニュースだね！調べてくるから待ってて！"
-            elif is_weather_request(message): 
-                location = extract_location(message)
-                ai_text = get_weather_forecast(location)
-            elif is_time_request(message):
-                ai_text = get_japan_time()
+            elif (correction_req := detect_db_correction_request(message)):
+                start_background_task(user_uuid, 'db_correction', correction_req); ai_text = f"え、まじで！？「{correction_req['member_name']}」ちゃんの情報、直してみるね！"
+            elif is_time_request(message): ai_text = get_japan_time()
+            elif is_weather_request(message): ai_text = get_weather_forecast(extract_location(message))
             elif ('さくらみこ' in message or 'みこち' in message):
                 for keyword, resp in get_sakuramiko_special_responses().items():
                     if keyword in message:
                         ai_text = resp; break
-            
-            if not ai_text and (should_search(message) or is_explicit_search_request(message)):
+            elif should_search(message) or is_explicit_search_request(message):
                 start_background_task(user_uuid, 'search', {'query': message}); ai_text = f"おっけー、「{message}」について調べてみるね！ちょい待ってて！"
             
             if not ai_text:
@@ -600,7 +633,80 @@ def initialize_groq_client():
     global groq_client
     if GROQ_API_KEY: groq_client = Groq(api_key=GROQ_API_KEY)
 
-def cleanup_old_files():
+def initialize_holomem_wiki():
+    with Session() as session:
+        if session.query(HolomemWiki).count() == 0:
+            initial_data = [
+                {'member_name': 'ときのそら', 'status': '現役', 'description': 'ホロライブの象徴！', 'generation': '0期生', 'tags': '[]'},
+                {'member_name': 'さくらみこ', 'status': '現役', 'description': 'エリート巫女だよ！', 'generation': '0期生', 'tags': '[]'},
+                {'member_name': '桐生ココ', 'status': '卒業', 'description': '伝説の会長！', 'generation': '4期生', 'graduation_date': '2021-07-01', 'mochiko_feeling': '会長が残してくれたものは永遠だよ！', 'tags': '[]'},
+                {'member_name': '潤羽るしあ', 'status': '卒業', 'description': '感情豊かなネクロマンサー。', 'generation': '3期生', 'graduation_date': '2022-02-24', 'mochiko_feeling': 'また3期生のみんなでわちゃわちゃしてほしかったな…', 'tags': '[]'},
+            ]
+            for data in initial_data: session.add(HolomemWiki(**data))
+            session.commit()
+            logger.info("✅ ホロメンWikiを初期化しました。")
+
+def _update_news_database(session, model, site_name, base_url, selectors):
+    try:
+        response = requests.get(base_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        articles = []
+        for selector in selectors:
+            articles = soup.select(selector)
+            if articles:
+                break
+        
+        for article in articles[:5]:
+            title_elem = article.select_one('h2, h3, .title, .entry-title, .post-title')
+            link_elem = article.find('a', href=True)
+            
+            if not (title_elem and link_elem): continue
+
+            title = clean_text(title_elem.get_text())
+            if len(title) < 5: continue
+
+            article_url = urljoin(base_url, link_elem['href'])
+            news_hash = create_news_hash(title, article_url)
+
+            if not session.query(model).filter_by(news_hash=news_hash).first():
+                try:
+                    article_res = requests.get(article_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+                    article_soup = BeautifulSoup(article_res.content, 'html.parser')
+                    content_body = article_soup.select_one('.entry-content, .td-post-content, .post-content, article')
+                    content_text = clean_text(content_body.get_text()) if content_body else title
+                    
+                    data = {'title': title, 'content': content_text[:2000], 'url': article_url, 'news_hash': news_hash}
+                    if model == SpecializedNews:
+                        data['site_name'] = site_name
+                    session.add(model(**data))
+                except Exception as e_inner:
+                    logger.warning(f"⚠️ 記事本文の取得に失敗: {article_url} ({e_inner})")
+                    # 本文が取れなくてもタイトルだけで登録する
+                    data = {'title': title, 'content': title, 'url': article_url, 'news_hash': news_hash}
+                    if model == SpecializedNews: data['site_name'] = site_name
+                    session.add(model(**data))
+        session.commit()
+        logger.info(f"✅ ニュース更新完了: {site_name}")
+    except Exception as e:
+        logger.error(f"❌ ニュース更新エラー ({site_name}): {e}")
+        session.rollback()
+
+
+def update_news_task():
+    logger.info("⏰ 定期的なニュース更新タスクを開始します...")
+    try:
+        with Session() as session:
+            _update_news_database(session, HololiveNews, "Hololive", HOLOLIVE_NEWS_URL, ['article', '.post-item'])
+            for site, config in SPECIALIZED_SITES.items():
+                _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post', '.entry'])
+                time.sleep(2)
+    except Exception as e:
+        logger.error(f"❌ ニュース更新タスク全体でエラーが発生: {e}")
+
+
+def cleanup_old_voice_files():
     try:
         if not os.path.exists(VOICE_DIR): return
         cutoff = time.time() - (60 * 60)
@@ -610,25 +716,70 @@ def cleanup_old_files():
                 os.remove(file_path)
                 logger.info(f"🗑️ 古い音声ファイルを削除しました: {filename}")
     except Exception as e:
-        logger.error(f"❌ 音声ファイルのクリーンアップ中にエラー: {e}")
+        logger.error(f"❌ 音声ファイルのクリーンアップ中にエラーが発生しました: {e}")
+
+def schedule_periodic_psych_analysis():
+    logger.info("⏰ 定期的な性格分析タスクを開始します...")
+    try:
+        with Session() as session:
+            seven_days_ago = datetime.utcnow() - timedelta(days=7)
+            active_users = session.query(UserMemory.user_uuid).filter(UserMemory.last_interaction > seven_days_ago).all()
+            active_user_uuids = {u[0] for u in active_users}
+            
+            users_to_analyze = session.query(UserPsychology).filter(
+                UserPsychology.user_uuid.in_(active_user_uuids),
+                UserPsychology.last_analyzed < seven_days_ago
+            ).all()
+
+            if not users_to_analyze:
+                logger.info("✅ 定期分析: 全てのアクティブユーザーの分析は最新です。")
+                return
+
+            logger.info(f"🧠 定期分析: {len(users_to_analyze)}人のユーザーを再分析します。")
+            for psych_user in users_to_analyze:
+                start_background_task(psych_user.user_uuid, 'psych_analysis', {})
+                time.sleep(2)
+    except Exception as e:
+        logger.error(f"❌ 定期性格分析スケジューラーでエラーが発生しました: {e}")
+
 
 def initialize_app():
     logger.info("="*60 + "\n🔧 もちこAI 究極版 (v19.2) の初期化を開始...\n" + "="*60)
     
     initialize_groq_client()
+    initialize_holomem_wiki()
     
     def run_scheduler():
-        schedule.every(1).hour.do(cleanup_old_files)
+        schedule.every(4).hours.do(update_news_task)
+        schedule.every(6).hours.do(schedule_periodic_psych_analysis)
+        schedule.every(1).hour.do(cleanup_old_voice_files)
         while True:
             schedule.run_pending()
             time.sleep(60)
             
     threading.Thread(target=run_scheduler, daemon=True).start()
-    logger.info("⏰ スケジューラーを開始しました (ファイルクリーンアップ)")
+    logger.info("⏰ スケジューラーを開始しました (ニュース更新, 定期性格分析, 音声ファイル削除)")
     logger.info(f"🤖 利用可能なAIモデル: Llama (Groq)={'✅' if groq_client else '❌'}")
     logger.info("✅ 初期化完了！")
 
 # ==============================================================================
 # メイン実行
 # ==============================================================================
-if __name__
+if __name__ == '__main__':
+    try:
+        initialize_app()
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except Exception as e:
+        logger.critical(f"🔥🔥🔥 アプリケーションの起動に失敗しました: {e}", exc_info=True)
+        sys.exit(1)
+else:
+    try:
+        initialize_app()
+        application = app
+    except Exception as e:
+        logger.critical(f"🔥🔥🔥 Gunicornでのアプリケーション起動に失敗しました: {e}", exc_info=True)
+        application = Flask(__name__)
+        @application.route('/')
+        def error_app():
+            return "Application failed to initialize.", 500
