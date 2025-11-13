@@ -1,11 +1,9 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v16.2 - Final Integrated / No Omissions)
+# もちこAI - 究極の全機能統合版 (v16.3 - バックアップ機能削除版)
 #
-# このコードは、v16.0の堅牢な基盤に、対話型検索フローなどのUX向上機能を完全に統合した最終版です。
-# いかなる部分も省略せず、すべての機能が実装されています。
+# このコードは、v16.2からデータベースの自動バックアップ機能を削除したバージョンです。
 # - ハイブリッドAI (Gemini高速応答 + Llama 70B 高精度分析)
 # - 詳細なユーザー心理分析と、それを活用したパーソナライズ応答
-# - データベースの自動暗号化バックアップ機能 (GitHub連携)
 # - ユーザーからの指摘によるデータベース修正機能
 # - 対話型のWeb検索＆ニュース閲覧機能（リスト表示と番号選択）
 # - ユーザーコンテキスト管理機能
@@ -33,8 +31,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 import unicodedata
 from urllib.parse import quote_plus, urljoin
-import subprocess
-from functools import wraps  # ← この行を追加（または元に戻す）
+from functools import wraps
 from threading import Lock
 
 # --- サードパーティライブラリ ---
@@ -48,7 +45,6 @@ import schedule
 import signal
 from groq import Groq
 import google.generativeai as genai
-
 
 # ==============================================================================
 # 基本設定とロギング
@@ -107,7 +103,6 @@ ADMIN_TOKEN = get_secret('ADMIN_TOKEN')
 groq_client = None
 gemini_model = None
 VOICEVOX_ENABLED = True if VOICEVOX_URL_FROM_ENV else False
-fernet = None
 search_context_cache = {}
 cache_lock = Lock()
 
@@ -500,57 +495,6 @@ def background_deep_search(task_id, query, is_detailed):
             session.commit()
 
 # ==============================================================================
-# DBバックアップ機能
-# ==============================================================================
-def commit_encrypted_backup_to_github():
-    if not fernet: logger.error("❌ 暗号化キーが未設定のためバックアップを中止します。"); return
-    logger.info("🚀 Committing encrypted backup to GitHub...")
-    try:
-        with Session() as session:
-            backup_data = {'timestamp': datetime.utcnow().isoformat(), 'tables': {}}
-            tables = {'user_memories': UserMemory, 'user_psychology': UserPsychology, 'holomem_wiki': HolomemWiki}
-            for name, model in tables.items():
-                records = session.query(model).all()
-                backup_data['tables'][name] = [{c.name: getattr(r, c.name).isoformat() if isinstance(getattr(r, c.name), datetime) else getattr(r, c.name) for c in r.__table__.columns} for r in records]
-        
-        json_data = json.dumps(backup_data, ensure_ascii=False).encode('utf-8')
-        encrypted_data = fernet.encrypt(json_data)
-        
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        backup_file = os.path.join(BACKUP_DIR, 'database_backup.json.encrypted')
-        with open(backup_file, 'wb') as f:
-            f.write(encrypted_data)
-        
-        repo_backup_file = os.path.join(os.getcwd(), 'database_backup.json.encrypted')
-        os.rename(backup_file, repo_backup_file)
-
-        commands = [
-            ['git', 'config', 'user.email', 'mochiko-bot@example.com'],
-            ['git', 'config', 'user.name', 'Mochiko Backup Bot'],
-            ['git', 'add', repo_backup_file],
-            ['git', 'commit', '-m', f'🔒 Encrypted DB Backup {datetime.utcnow().isoformat()}'],
-            ['git', 'push']
-        ]
-        for cmd in commands:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0 and 'nothing to commit' not in result.stdout:
-                logger.error(f"❌ Git command failed: {cmd}\n{result.stderr}")
-                return
-        logger.info("✅ Encrypted backup committed to GitHub")
-    except Exception as e:
-        logger.error(f"❌ GitHub commit error: {e}")
-
-def require_admin_auth(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not ADMIN_TOKEN: return create_json_response({'error': 'Server configuration error'}, 500)
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or f'Bearer {ADMIN_TOKEN}' != auth_header:
-            return create_json_response({'error': 'Invalid credentials'}, 401)
-        return f(*args, **kwargs)
-    return decorated_function
-
-# ==============================================================================
 # Flask エンドポイント (文字化け対策済み & 完全版)
 # ==============================================================================
 @app.route('/health')
@@ -654,12 +598,6 @@ def check_task_endpoint():
         return create_json_response({'status': 'completed', 'task': completed_task})
     return create_json_response({'status': 'pending'})
 
-@app.route('/admin/backup', methods=['POST'])
-@require_admin_auth
-def admin_backup():
-    background_executor.submit(commit_encrypted_backup_to_github)
-    return create_json_response({'status': 'Backup process started in background.'})
-
 @app.route('/generate_voice', methods=['POST'])
 def generate_voice_endpoint():
     if not VOICEVOX_ENABLED:
@@ -747,18 +685,20 @@ def initialize_holomem_wiki():
             session.commit()
             logger.info("✅ ホロメンWikiを初期化しました。")
 def initialize_app():
-    global fernet
-    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.2) の初期化を開始...\n" + "="*60)
+    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.3) の初期化を開始...\n" + "="*60)
     
-   
-    initialize_gemini_client(); initialize_groq_client()
+    initialize_gemini_client()
+    initialize_groq_client()
     initialize_holomem_wiki()
+    
     def run_scheduler():
-        schedule.every().day.at("03:00").do(analyze_user_psychology, user_uuid=None) # Placeholder for periodic analysis
-          while True:
-            schedule.run_pending(); time.sleep(60)
+        schedule.every().day.at("03:00").do(analyze_user_psychology, user_uuid=None) # 全ユーザーの定期分析（仮）
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+            
     threading.Thread(target=run_scheduler, daemon=True).start()
-    logger.info("⏰ スケジューラーを開始しました (DBバックアップ & 定期性格分析)")
+    logger.info("⏰ スケジューラーを開始しました (定期性格分析)")
     logger.info(f"🤖 利用可能なAIモデル: Gemini={'✅' if gemini_model else '❌'} | Llama={'✅' if groq_client else '❌'}")
     logger.info("✅ 初期化完了！")
 
