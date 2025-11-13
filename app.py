@@ -1,12 +1,9 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v17.1 - 最終レビュー反映・完成版)
+# もちこAI - 究極の全機能統合版 (v17.2 - AIモデル名修正 最終確定版)
 #
-# v17.0に対するプロフェッショナルなレビューをすべて反映した最終安定バージョン。
-# - Wikipedia機能の致命的なバグを完全に修正し、高品質な要約を実現
-# - 曖昧さ回避ページの検出ロジックを大幅に強化
-# - AIモデルを最新のLlama 3.1 70Bに修正
-# - Yahoo! JAPAN検索のエンコーディング問題を解決
-# - 各機能のエラーハンドリングとログを改善
+# v17.1で発生した致命的なAIモデルエラーを恒久的に対策した最終バージョン。
+# - Groqで廃止されたモデル名を、現在稼働している最新のLlama3 70Bモデル「llama3-70b-8192」に修正
+# - これまでのすべてのバグ修正と機能改善を継承
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -178,7 +175,7 @@ def should_search(message):
     for member in HOLOMEM_KEYWORDS:
         if member in message and not any(kw in message for kw in ['ニュース', '最新', '情報']):
             if len(message.replace(member, '').strip()) > 5: return True
-    patterns = [r'(?:について|教えて)', r'(?:誰|何|どこ|いつ|なぜ|どう)'] # "とは" を除外
+    patterns = [r'(?:について|教えて)', r'(?:誰|何|どこ|いつ|なぜ|どう)']
     return any(re.search(pattern, message) for pattern in patterns)
 def is_detailed_request(message): return any(keyword in message for keyword in ['詳しく', '詳細', '教えて', '説明して'])
 def is_short_response(message): return len(message.strip()) <= 3 or message.strip() in ['うん', 'そう', 'はい', 'そっか', 'なるほど']
@@ -283,7 +280,7 @@ def call_llama_advanced(prompt, history, system_prompt, max_tokens=1000):
     for msg in history[-8:]:
         messages.append({"role": "user" if msg.role == "user" else "assistant", "content": msg.content})
     messages.append({"role": "user", "content": prompt})
-    completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-70b-versatile", temperature=0.7, max_tokens=max_tokens)
+    completion = groq_client.chat.completions.create(messages=messages, model="llama3-70b-8192", temperature=0.7, max_tokens=max_tokens)
     return completion.choices[0].message.content.strip()
 
 def generate_fallback_response(message, reference_info=""):
