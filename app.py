@@ -100,7 +100,6 @@ GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 ADMIN_TOKEN = get_secret('ADMIN_TOKEN')
-BACKUP_ENCRYPTION_KEY = get_secret('BACKUP_ENCRYPTION_KEY')
 
 # ==============================================================================
 # AIクライアントとグローバル変数
@@ -751,19 +750,12 @@ def initialize_app():
     global fernet
     logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.2) の初期化を開始...\n" + "="*60)
     
-    if BACKUP_ENCRYPTION_KEY:
-        fernet = Fernet(BACKUP_ENCRYPTION_KEY.encode('utf-8'))
-        logger.info("✅ バックアップ暗号化キーをロードしました。")
-    else:
-        logger.warning("⚠️ バックアップ暗号化キーが未設定です。バックアップ機能は無効になります。")
-
+   
     initialize_gemini_client(); initialize_groq_client()
     initialize_holomem_wiki()
     def run_scheduler():
         schedule.every().day.at("03:00").do(analyze_user_psychology, user_uuid=None) # Placeholder for periodic analysis
-        if fernet:
-            schedule.every().day.at("18:00").do(commit_encrypted_backup_to_github)
-        while True:
+          while True:
             schedule.run_pending(); time.sleep(60)
     threading.Thread(target=run_scheduler, daemon=True).start()
     logger.info("⏰ スケジューラーを開始しました (DBバックアップ & 定期性格分析)")
