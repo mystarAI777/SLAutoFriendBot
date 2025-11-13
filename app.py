@@ -1,11 +1,10 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v16.5 - ニュース機能完全復元版)
+# もちこAI - 究極の全機能統合版 (v16.8 - Groq単一モデル版)
 #
-# v16.4をベースに、ご指摘いただいたニュース自動取得機能（ホロライブ＆専門サイト）を
-# 本来あるべき形で完全に復元・実装したバージョンです。
-# - 定期的なニュース自動取得タスクをスケジューラーで実行
-# - 会話ロジックを「DB優先、なければWeb検索」のハイブリッド方式に修正
-# - NewsCacheテーブルを正しく活用した対話フロー
+# v16.7をベースに、AIモデルをGroq (Llama) のみに絞り、Geminiへの依存を完全に排除したバージョン。
+# - AIモデル呼び出しをGroqに一本化し、コードをシンプル化
+# - API呼び出しの自動リトライ機能は維持
+# - その他すべての堅牢性向上策はv16.7から継承
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -36,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor
 import schedule
 import signal
 from groq import Groq
-import google.generativeai as genai
 
 # ==============================================================================
 # 基本設定とロギング
@@ -62,7 +60,6 @@ SPECIALIZED_SITES = {
     'CGニュース': {'base_url': 'https://modelinghappy.com/', 'keywords': ['CGニュース', '3DCG', 'CG', 'CG業界']},
     '脳科学・心理学': {'base_url': 'https://nazology.kusuguru.co.jp/', 'keywords': ['脳科学', '心理学', '脳', '認知科学']},
     'セカンドライフ': {'base_url': 'https://community.secondlife.com/news/', 'keywords': ['セカンドライフ', 'Second Life', 'SL']},
-    'アニメ': {'base_url': 'https://animedb.jp/', 'keywords': ['アニメ', 'anime']}
 }
 HOLOMEM_KEYWORDS = [
     'ときのそら', 'ロボ子さん', 'さくらみこ', '星街すいせい', 'AZKi', '夜空メル', 'アキ・ローゼンタール', '赤井はあと', '白上フブキ', '夏色まつり', '湊あくあ', '紫咲シオン', '百鬼あやめ', '癒月ちょこ', '大空スバル', '大神ミオ', '猫又おかゆ', '戌神ころね', '兎田ぺこら', '不知火フレア', '白銀ノエル', '宝鐘マリン', '天音かなた', '角巻わため', '常闇トワ', '姫森ルーナ', '雪花ラミィ', '桃鈴ねね', '獅白ぼたん', '尾丸ポルカ', 'ラプラス・ダークネス', '鷹嶺ルイ', '博衣こより', '沙花叉クロヱ', '風真いろは', '森カリオペ', '小鳥遊キアラ', '一伊那尓栖', 'がうる・ぐら', 'ワトソン・アメリア', 'IRyS', 'セレス・ファウナ', 'オーロ・クロニー', '七詩ムメイ', 'ハコス・ベールズ', 'シオリ・ノヴェラ', '古石ビジュー', 'ネリッサ・レイヴンクロフト', 'フワワ・アビスガード', 'モココ・アビスガード', 'アユンダ・リス', 'ムーナ・ホシノヴァ', 'アイラニ・イオフィフティーン', 'クレイジー・オリー', 'アーニャ・メルフィッサ', 'パヴォリア・レイネ', '火威青', '音乃瀬奏', '一条莉々華', '儒烏風亭らでん', '轟はじめ', 'ホロライブ', 'ホロメン', 'hololive', 'YAGOO', '桐生ココ', '潤羽るしあ', '魔乃アロエ', '九十九佐命'
@@ -85,14 +82,12 @@ def get_secret(name):
 
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
-GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
 # ==============================================================================
 # AIクライアントとグローバル変数
 # ==============================================================================
 groq_client = None
-gemini_model = None
 VOICEVOX_ENABLED = True if VOICEVOX_URL_FROM_ENV else False
 search_context_cache = {}
 cache_lock = Lock()
@@ -252,33 +247,41 @@ def start_background_task(user_uuid, task_type, query_data):
     return task_id
 
 # ==============================================================================
-# AIモデル呼び出し関数 (ハイブリッドAI)
+# AIモデル呼び出し関数 (リトライ機能付き)
 # ==============================================================================
-def call_gemini(prompt, history, system_context):
-    if not gemini_model: return None
-    try:
-        full_prompt = system_context + "\n\n"
-        for msg in history[-5:]:
-            full_prompt += f"{'ユーザー' if msg.role == 'user' else 'AI'}: {msg.content}\n"
-        full_prompt += f"ユーザー: {prompt}\nAI: "
-        response = gemini_model.generate_content(full_prompt, generation_config={"temperature": 0.7, "max_output_tokens": 200})
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"❌ Gemini APIエラー: {e}")
+def _with_retry(api_call_function):
+    """API呼び出しにリトライ機能を追加するデコレーター"""
+    @wraps(api_call_function)
+    def wrapper(*args, **kwargs):
+        max_retries = 3
+        delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                return api_call_function(*args, **kwargs)
+            except Exception as e:
+                if "429" in str(e):
+                    if attempt < max_retries - 1:
+                        wait_time = delay * (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(f"⚠️ APIレート制限エラー。{wait_time:.2f}秒待機して再試行します... ({attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"❌ API呼び出しがリトライ上限を超えました。エラー: {e}")
+                        raise
+                else:
+                    logger.error(f"❌ API呼び出し中に予期せぬエラーが発生しました: {e}")
+                    raise
         return None
+    return wrapper
 
+@_with_retry
 def call_llama_advanced(prompt, history, system_prompt, max_tokens=1000):
     if not groq_client: return None
-    try:
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in history[-8:]:
-            messages.append({"role": "user" if msg.role == "user" else "assistant", "content": msg.content})
-        messages.append({"role": "user", "content": prompt})
-        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=max_tokens)
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"❌ Llama APIエラー: {e}")
-        return None
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history[-8:]:
+        messages.append({"role": "user" if msg.role == "user" else "assistant", "content": msg.content})
+    messages.append({"role": "user", "content": prompt})
+    completion = groq_client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=max_tokens)
+    return completion.choices[0].message.content.strip()
 
 def generate_fallback_response(message, reference_info=""):
     if reference_info:
@@ -395,13 +398,12 @@ def get_user_context(session, user_uuid):
     return None
 
 # ==============================================================================
-# AI応答生成 (ハイブリッド版)
+# AI応答生成 (Groq単一モデル)
 # ==============================================================================
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    if not gemini_model and not groq_client:
+    if not groq_client:
         return generate_fallback_response(message, reference_info)
 
-    use_llama = is_detailed or is_task_report or len(reference_info) > 100 or any(kw in message for kw in ['分析', '詳しく', '説明'])
     personality_context = get_psychology_insight(user_data['uuid'])
     system_prompt = f"あなたは「もちこ」というギャルAIです。{user_data['name']}さんと話しています。\n# 口調ルール\n- 一人称は「あてぃし」。語尾は「〜じゃん」「〜的な？」。口癖は「まじ」「てか」「うける」。\n# ユーザー情報\n- {user_data['name']}さんは「{personality_context}人」という印象だよ。この情報を会話に活かしてね。"
     if is_task_report:
@@ -409,21 +411,16 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     system_prompt += f"\n## 【参考情報】:\n{reference_info if reference_info else '特になし'}"
 
     try:
-        if use_llama and groq_client:
-            logger.info("🧠 Llama 3.3 70Bを使用 (高精度)")
-            response = call_llama_advanced(message, history, system_prompt, 500 if is_detailed else 300)
-            if response: return response
-            logger.warning("⚠️ Llama失敗、Geminiにフォールバック")
-        
-        if gemini_model:
-            logger.info("🚀 Gemini 2.0 Flashを使用 (高速)")
-            response = call_gemini(message, history, system_prompt)
-            if response: return response
-
-        logger.error("⚠️ 全てのAIモデルが失敗")
-        return generate_fallback_response(message, reference_info)
+        logger.info("🧠 Groq Llama 3.3 70Bを使用")
+        response = call_llama_advanced(message, history, system_prompt, 500 if is_detailed else 300)
+        if response:
+            return response
+        else:
+            # LlamaがNoneを返した場合（リトライ失敗など）
+            logger.error("⚠️ Groq AIモデルが応答しませんでした。")
+            return generate_fallback_response(message, reference_info)
     except Exception as e:
-        logger.error(f"❌ AI応答生成エラー: {e}")
+        logger.error(f"❌ AI応答生成が最終的に失敗しました: {e}")
         return "うぅ、AIの調子が悪いみたい…ごめんね！"
 
 # ==============================================================================
@@ -431,59 +428,40 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
 # ==============================================================================
 def scrape_major_search_engines(query, num_results):
     search_configs = [
+        {'name': 'DuckDuckGo HTML', 'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", 'result_selector': 'div.result', 'title_selector': 'h2.result__title > a.result__a', 'snippet_selector': 'a.result__snippet'},
         {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'result_selector': 'li.b_algo', 'title_selector': 'h2', 'snippet_selector': 'div.b_caption p, .b_caption'},
-        {'name': 'Yahoo Japan', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'result_selector': 'div.Algo', 'title_selector': 'h3', 'snippet_selector': 'div.compText p, .compText'}
     ]
     for config in search_configs:
         try:
             response = requests.get(config['url'], headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=12); response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser'); results = []
             for elem in soup.select(config['result_selector'])[:num_results]:
-                title = elem.select_one(config['title_selector']); snippet = elem.select_one(config['snippet_selector'])
-                if title and snippet: results.append({'title': clean_text(title.get_text()), 'snippet': clean_text(snippet.get_text()), 'full_content': clean_text(snippet.get_text())})
-            if results: return results
-        except Exception as e: logger.warning(f"⚠️ {config['name']} search error: {e}")
+                title_elem = elem.select_one(config['title_selector'])
+                snippet_elem = elem.select_one(config['snippet_selector'])
+                if title_elem and snippet_elem and title_elem.get_text().strip():
+                     results.append({'title': clean_text(title_elem.get_text()), 'snippet': clean_text(snippet_elem.get_text()), 'full_content': clean_text(snippet_elem.get_text())})
+            if results:
+                logger.info(f"✅ {config['name']}での検索に成功しました。")
+                return results
+        except Exception as e:
+            logger.warning(f"⚠️ {config['name']}での検索中にエラーが発生: {e}")
+    logger.error("❌ 全ての検索エンジンでの検索に失敗しました。")
     return []
-def search_anime_database(query):
-    url = f"https://animedb.jp/search?q={quote_plus(query)}"
-    try:
-        response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15); response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser'); results = []
-        for elem in soup.select('div.anime-item, div.search-result')[:3]:
-            title = elem.select_one('h2, h3, a'); description = elem.select_one('p, div.description')
-            if title: results.append(f"【{clean_text(title.get_text())}】\n{clean_text(description.get_text()) if description else '詳細情報なし'}")
-        return "\n\n".join(results) if results else None
-    except Exception as e:
-        logger.error(f"❌ Anime search error: {e}"); return None
-def search_hololive_wiki(member_name, query_topic):
-    url = f"https://seesaawiki.jp/hololivetv/search?query={quote_plus(f'{member_name} {query_topic}'.encode('euc-jp'))}"
-    try:
-        response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15); response.encoding = 'euc-jp'; response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        page_text = clean_text(soup.select_one('#pagebody, .contents').get_text())
-        sentences = re.split(r'[。．\n]', page_text)
-        relevant = [s.strip() for s in sentences if member_name in s and query_topic in s]
-        return " ".join(relevant)[:1000] if relevant else page_text[:500]
-    except Exception as e:
-        logger.error(f"❌ Hololive Wiki search error: {e}"); return None
+
 def background_deep_search(task_id, query, is_detailed):
-    search_result = ""
+    search_result = "[]" # 失敗した場合でも空のJSON配列を返す
     try:
+        search_query = query
         if is_anime_request(query):
-            anime_result = search_anime_database(query)
-            if anime_result:
-                search_result = json.dumps([{'title': 'アニメDBからの情報', 'snippet': anime_result, 'full_content': anime_result}], ensure_ascii=False)
-        
-        if not search_result:
-            raw_results = scrape_major_search_engines(query, 5)
-            if raw_results:
-                formatted_results = [{'number': i, **r} for i, r in enumerate(raw_results, 1)]
-                search_result = json.dumps(formatted_results, ensure_ascii=False)
+            search_query = f"アニメ {query} あらすじ OR 感想 OR 評価"
+
+        raw_results = scrape_major_search_engines(search_query, 5)
+        if raw_results:
+            formatted_results = [{'number': i, **r} for i, r in enumerate(raw_results, 1)]
+            search_result = json.dumps(formatted_results, ensure_ascii=False)
 
     except Exception as e:
         logger.error(f"❌ Background search error: {e}")
-        search_result = json.dumps([{'title': 'エラー', 'snippet': '検索中にエラーが起きちゃった…ごめんね！', 'full_content': '検索中にエラーが起きちゃった…ごめんね！'}], ensure_ascii=False)
-
 
     with Session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
@@ -520,7 +498,7 @@ def chat_lsl():
                 task_type = completed_task['type']
 
                 if task_type == 'search':
-                    search_results = json.loads(result) if result else None
+                    search_results = json.loads(result) if result and result != "[]" else []
                     if search_results:
                         with cache_lock:
                             search_context_cache[user_uuid] = {'results': search_results, 'query': query, 'timestamp': time.time()}
@@ -539,7 +517,13 @@ def chat_lsl():
             elif (selected_number := is_number_selection(message)):
                 user_context = get_user_context(session, user_uuid)
                 if user_context and user_context['type'] == 'hololive_news':
-                    news_detail = get_cached_news_detail(session, user_uuid, selected_number)
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, 'hololive')
+                    if news_detail:
+                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
+                    else:
+                        ai_text = "あれ、その番号のニュースが見つからないや…"
+                elif user_context and user_context['type'] == 'specialized_news':
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, 'specialized')
                     if news_detail:
                         ai_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
                     else:
@@ -565,6 +549,7 @@ def chat_lsl():
                 if news_items:
                     news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
                     ai_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_news_cache(session, user_uuid, news_items, 'hololive')
                     save_user_context(session, user_uuid, 'hololive_news', message)
                 else:
                     start_background_task(user_uuid, 'search', {'query': 'ホロライブ 最新ニュース', 'is_detailed': True}); ai_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
@@ -573,6 +558,7 @@ def chat_lsl():
                 if news_items:
                     news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
                     ai_text = f"{topic}の最新ニュースはこんな感じ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_news_cache(session, user_uuid, news_items, 'specialized')
                     save_user_context(session, user_uuid, 'specialized_news', message)
                 else:
                     start_background_task(user_uuid, 'search', {'query': f'{topic} 最新情報', 'is_detailed': True}); ai_text = f"ごめん、今DBに{topic}のニュースがないみたい！Webで調べてみるね！"
@@ -686,9 +672,7 @@ def serve_voice_file(filename):
 def initialize_groq_client():
     global groq_client
     if GROQ_API_KEY: groq_client = Groq(api_key=GROQ_API_KEY)
-def initialize_gemini_client():
-    global gemini_model
-    if GEMINI_API_KEY: genai.configure(api_key=GEMINI_API_KEY); gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
 def initialize_holomem_wiki():
     with Session() as session:
         if session.query(HolomemWiki).count() == 0:
@@ -714,7 +698,7 @@ def _update_news_database(session, model, site_name, base_url, selectors):
             if articles:
                 break
         
-        for article in articles[:5]: # 最新5件を取得
+        for article in articles[:5]:
             title_elem = article.select_one('h2, h3, .title, .entry-title, .post-title')
             link_elem = article.find('a', href=True)
             
@@ -741,18 +725,15 @@ def _update_news_database(session, model, site_name, base_url, selectors):
 def update_news_task():
     logger.info("⏰ 定期的なニュース更新タスクを開始します...")
     with Session() as session:
-        # Hololive News
         _update_news_database(session, HololiveNews, "Hololive", HOLOLIVE_NEWS_URL, ['article', '.post-item'])
-        # Specialized News
         for site, config in SPECIALIZED_SITES.items():
-            _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post, .entry'])
-            time.sleep(2) # サーバー負荷軽減
+            _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post', '.entry'])
+            time.sleep(2)
 
 def cleanup_old_voice_files():
-    """古い音声ファイルを削除するスケジューラージョブ"""
     try:
         if not os.path.exists(VOICE_DIR): return
-        cutoff = time.time() - (60 * 60)  # 1時間前
+        cutoff = time.time() - (60 * 60)
         for filename in os.listdir(VOICE_DIR):
             file_path = os.path.join(VOICE_DIR, filename)
             if os.path.isfile(file_path) and os.path.getmtime(file_path) < cutoff:
@@ -762,7 +743,6 @@ def cleanup_old_voice_files():
         logger.error(f"❌ 音声ファイルのクリーンアップ中にエラーが発生しました: {e}")
 
 def schedule_periodic_psych_analysis():
-    """アクティブだが長期間分析されていないユーザーを定期的に再分析する"""
     logger.info("⏰ 定期的な性格分析タスクを開始します...")
     with Session() as session:
         try:
@@ -788,9 +768,8 @@ def schedule_periodic_psych_analysis():
 
 
 def initialize_app():
-    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.5) の初期化を開始...\n" + "="*60)
+    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.8) の初期化を開始...\n" + "="*60)
     
-    initialize_gemini_client()
     initialize_groq_client()
     initialize_holomem_wiki()
     
@@ -804,7 +783,7 @@ def initialize_app():
             
     threading.Thread(target=run_scheduler, daemon=True).start()
     logger.info("⏰ スケジューラーを開始しました (ニュース更新, 定期性格分析, 音声ファイル削除)")
-    logger.info(f"🤖 利用可能なAIモデル: Gemini={'✅' if gemini_model else '❌'} | Llama={'✅' if groq_client else '❌'}")
+    logger.info(f"🤖 利用可能なAIモデル: Llama (Groq)={'✅' if groq_client else '❌'}")
     logger.info("✅ 初期化完了！")
 
 # ==============================================================================
