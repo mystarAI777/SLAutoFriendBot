@@ -1,9 +1,9 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v17.3 - AIモデル名 実績ベース修正版)
+# もちこAI - 究極の全機能統合版 (v18.0 - Google Search API 最終移行版)
 #
-# 度重なるエラーを深くお詫びし、過去の動作ログに基づき、確実に動作する
-# AIモデル「llama-3.1-8b-instant」に修正した最終確定バージョン。
-# これまでのすべてのバグ修正と機能改善を継承。
+# 度重なるエラーを深くお詫びし、不安定なスクレイピングを完全に廃止。
+# Render環境でも確実に動作するGoogle Custom Search JSON APIを利用する方式に移行した最終確定版。
+# これにより、外部への接続タイムアウト問題を根本から解決する。
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -51,7 +51,6 @@ VOICEVOX_SPEAKER_ID = 20
 HOLOLIVE_NEWS_URL = "https://hololive-tsuushin.com/category/holonews/"
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
 ]
 LOCATION_CODES = { "東京": "130000", "大阪": "270000", "名古屋": "230000", "福岡": "400000", "札幌": "016000" }
 SPECIALIZED_SITES = {
@@ -79,6 +78,9 @@ def get_secret(name):
 DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+# 【重要】Google検索APIのために新たに追加する環境変数
+GOOGLE_API_KEY = get_secret('GOOGLE_API_KEY')
+CUSTOM_SEARCH_ENGINE_ID = get_secret('CUSTOM_SEARCH_ENGINE_ID')
 
 # ==============================================================================
 # AIクライアントとグローバル変数
@@ -117,7 +119,7 @@ engine = create_db_engine_with_retry()
 Base = declarative_base()
 
 # ==============================================================================
-# データベースモデル (全機能分)
+# データベースモデル (変更なし)
 # ==============================================================================
 class UserMemory(Base): __tablename__ = 'user_memories'; id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False); user_name = Column(String(255), nullable=False); interaction_count = Column(Integer, default=0); last_interaction = Column(DateTime, default=datetime.utcnow)
 class ConversationHistory(Base): __tablename__ = 'conversation_history'; id = Column(Integer, primary_key=True, autoincrement=True); user_uuid = Column(String(255), nullable=False, index=True); role = Column(String(10), nullable=False); content = Column(Text, nullable=False); timestamp = Column(DateTime, default=datetime.utcnow, index=True)
@@ -139,7 +141,6 @@ class NewsCache(Base): __tablename__ = 'news_cache'; id = Column(Integer, primar
 class UserContext(Base):
     __tablename__ = 'user_context'
     id = Column(Integer, primary_key=True); user_uuid = Column(String(255), unique=True, nullable=False, index=True); last_context_type = Column(String(50), nullable=False); last_query = Column(Text, nullable=True); updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
 
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
@@ -208,7 +209,7 @@ def get_sakuramiko_special_responses():
     }
 
 # ==============================================================================
-# データベースとバックグラウンドタスク管理
+# データベースとバックグラウンドタスク管理 (変更なし)
 # ==============================================================================
 def get_or_create_user(session, uuid, name):
     user = session.query(UserMemory).filter_by(user_uuid=uuid).first()
@@ -297,7 +298,7 @@ def generate_fallback_response(message, reference_info=""):
     return random.choice(["うんうん！", "なるほどね！", "そうなんだ！", "まじで？"])
 
 # ==============================================================================
-# 性格分析 & 活用関数
+# 性格分析 & 活用関数 (変更なし)
 # ==============================================================================
 def analyze_user_psychology(user_uuid):
     with Session() as session:
@@ -339,7 +340,7 @@ def get_psychology_insight(user_uuid):
         return "".join(insights)
 
 # ==============================================================================
-# コア機能: 天気, Wiki, DB修正, コンテキスト管理
+# コア機能: 天気, Wiki, DB修正, コンテキスト管理 (変更なし)
 # ==============================================================================
 def get_weather_forecast(location):
     url = f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{LOCATION_CODES.get(location, '130000')}.json"
@@ -424,7 +425,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     system_prompt += f"\n## 【参考情報】:\n{reference_info if reference_info else '特になし'}"
 
     try:
-        logger.info("🧠 Groq Llama 3.1 8Bを使用")
+        logger.info(f"🧠 Groq {MODEL_NAME}を使用")
         response = call_llama_advanced(message, history, system_prompt, 500 if is_detailed else 300)
         if response:
             return response
@@ -436,61 +437,37 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         return "うぅ、AIの調子が悪いみたい…ごめんね！"
 
 # ==============================================================================
-# 外部情報検索機能
+# 外部情報検索機能 (Google Search APIへ移行)
 # ==============================================================================
-def search_wikipedia(term):
-    API_ENDPOINT = "https://ja.wikipedia.org/w/api.php"
-    params = { 'action': 'query', 'format': 'json', 'titles': term, 'prop': 'extracts', 'exintro': True, 'explaintext': True, 'redirects': 1 }
+def google_custom_search(query, num_results=5):
+    if not GOOGLE_API_KEY or not CUSTOM_SEARCH_ENGINE_ID:
+        logger.error("❌ Google APIキーまたは検索エンジンIDが設定されていません。")
+        return []
+    
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        'key': GOOGLE_API_KEY,
+        'cx': CUSTOM_SEARCH_ENGINE_ID,
+        'q': query,
+        'num': num_results
+    }
     try:
-        response = requests.get(API_ENDPOINT, params=params, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
         data = response.json()
-        pages = data.get('query', {}).get('pages')
-        if not pages:
-            logger.warning(f"Wikipedia APIから予期せぬ応答: {data}")
-            return None
-            
-        page_id = next(iter(pages))
-        if page_id != "-1":
-            extract = pages[page_id].get('extract', '')
-            disambig_patterns = ['曖昧さ回避', 'この項目では', '他の用法については', 'Disambiguation']
-            if extract and not any(pattern in extract for pattern in disambig_patterns):
-                logger.info(f"✅ Wikipediaで「{term}」の情報を取得しました。")
-                return extract
-            else:
-                logger.info(f"Wikipediaで「{term}」は見つかりましたが、曖昧さ回避ページまたは内容が空でした。")
-        else:
-            logger.info(f"Wikipediaに「{term}」の項目が見つかりませんでした。")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Wikipedia APIへのリクエスト中にエラーが発生: {e}")
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Wikipedia APIの応答(JSON)の解析に失敗: {e}")
+        
+        results = []
+        for item in data.get('items', []):
+            results.append({
+                'title': item.get('title'),
+                'snippet': item.get('snippet'),
+                'full_content': item.get('snippet') # snippetを代用
+            })
+        logger.info(f"✅ Google Custom Searchで「{query}」の検索に成功しました。")
+        return results
     except Exception as e:
-        logger.error(f"❌ Wikipedia検索中に予期せぬエラーが発生: {e}")
-    return None
-
-def scrape_major_search_engines(query, num_results):
-    search_configs = [
-        {'name': 'DuckDuckGo HTML', 'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", 'result_selector': 'div.result', 'title_selector': 'h2.result__title > a.result__a', 'snippet_selector': 'a.result__snippet'},
-        {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'result_selector': 'li.b_algo', 'title_selector': 'h2', 'snippet_selector': 'div.b_caption p, .b_caption'},
-        {'name': 'Yahoo Japan', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}&ei=UTF-8", 'result_selector': 'div.Algo', 'title_selector': 'h3', 'snippet_selector': 'div.compText p, .compText'}
-    ]
-    for config in search_configs:
-        try:
-            response = requests.get(config['url'], headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=12); response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser'); results = []
-            for elem in soup.select(config['result_selector'])[:num_results]:
-                title_elem = elem.select_one(config['title_selector'])
-                snippet_elem = elem.select_one(config['snippet_selector'])
-                if title_elem and snippet_elem and title_elem.get_text().strip():
-                     results.append({'title': clean_text(title_elem.get_text()), 'snippet': clean_text(snippet_elem.get_text()), 'full_content': clean_text(snippet_elem.get_text())})
-            if results:
-                logger.info(f"✅ {config['name']}での検索に成功しました。")
-                return results
-        except Exception as e:
-            logger.warning(f"⚠️ {config['name']}での検索中にエラーが発生: {e}")
-    logger.error("❌ 全ての検索エンジンでの検索に失敗しました。")
-    return []
+        logger.error(f"❌ Google Custom Search APIエラー: {e}")
+        return []
 
 def background_deep_search(task_id, query, is_detailed):
     search_result = "[]"
@@ -499,7 +476,7 @@ def background_deep_search(task_id, query, is_detailed):
         if is_anime_request(query):
             search_query = f"アニメ {query} あらすじ OR 感想 OR 評価"
 
-        raw_results = scrape_major_search_engines(search_query, 5)
+        raw_results = google_custom_search(search_query, 5)
         if raw_results:
             formatted_results = [{'number': i, **r} for i, r in enumerate(raw_results, 1)]
             search_result = json.dumps(formatted_results, ensure_ascii=False)
