@@ -33,6 +33,8 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 import unicodedata
 from urllib.parse import quote_plus, urljoin
+import subprocess
+from functools import wraps  # ← この行を追加（または元に戻す）
 from threading import Lock
 
 # --- サードパーティライブラリ ---
@@ -46,6 +48,7 @@ import schedule
 import signal
 from groq import Groq
 import google.generativeai as genai
+
 
 # ==============================================================================
 # 基本設定とロギング
