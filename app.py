@@ -1,9 +1,9 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v17.2 - AIモデル名修正 最終確定版)
+# もちこAI - 究極の全機能統合版 (v17.3 - AIモデル名 実績ベース修正版)
 #
-# v17.1で発生した致命的なAIモデルエラーを恒久的に対策した最終バージョン。
-# - Groqで廃止されたモデル名を、現在稼働している最新のLlama3 70Bモデル「llama3-70b-8192」に修正
-# - これまでのすべてのバグ修正と機能改善を継承
+# 度重なるエラーを深くお詫びし、過去の動作ログに基づき、確実に動作する
+# AIモデル「llama-3.1-8b-instant」に修正した最終確定バージョン。
+# これまでのすべてのバグ修正と機能改善を継承。
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -280,7 +280,7 @@ def call_llama_advanced(prompt, history, system_prompt, max_tokens=1000):
     for msg in history[-8:]:
         messages.append({"role": "user" if msg.role == "user" else "assistant", "content": msg.content})
     messages.append({"role": "user", "content": prompt})
-    completion = groq_client.chat.completions.create(messages=messages, model="llama3-70b-8192", temperature=0.7, max_tokens=max_tokens)
+    completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.7, max_tokens=max_tokens)
     return completion.choices[0].message.content.strip()
 
 def generate_fallback_response(message, reference_info=""):
@@ -424,7 +424,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     system_prompt += f"\n## 【参考情報】:\n{reference_info if reference_info else '特になし'}"
 
     try:
-        logger.info("🧠 Groq Llama 3.1 70Bを使用")
+        logger.info("🧠 Groq Llama 3.1 8Bを使用")
         response = call_llama_advanced(message, history, system_prompt, 500 if is_detailed else 300)
         if response:
             return response
@@ -818,7 +818,7 @@ def schedule_periodic_psych_analysis():
 
 
 def initialize_app():
-    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v17.1) の初期化を開始...\n" + "="*60)
+    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v17.2) の初期化を開始...\n" + "="*60)
     
     initialize_groq_client()
     initialize_holomem_wiki()
