@@ -1,19 +1,11 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v16.3 - バックアップ機能削除版)
+# もちこAI - 究極の全機能統合版 (v16.5 - ニュース機能完全復元版)
 #
-# このコードは、v16.2からデータベースの自動バックアップ機能を削除したバージョンです。
-# - ハイブリッドAI (Gemini高速応答 + Llama 70B 高精度分析)
-# - 詳細なユーザー心理分析と、それを活用したパーソナライズ応答
-# - ユーザーからの指摘によるデータベース修正機能
-# - 対話型のWeb検索＆ニュース閲覧機能（リスト表示と番号選択）
-# - ユーザーコンテキスト管理機能
-# - 音声合成機能の完全な実装
-# - 特定キーワード（さくらみこ等）への特殊応答
-# - 卒業生情報 (もちこの気持ちを含む) の管理
-# - 完全なUTF-8文字化け対策
-# - LSLクライアント連携用の非同期タスクチェック機能
-# - 洗練された優先度分岐による高度な会話ロジック
-# - 全てのヘルパー関数と堅牢な初期化処理
+# v16.4をベースに、ご指摘いただいたニュース自動取得機能（ホロライブ＆専門サイト）を
+# 本来あるべき形で完全に復元・実装したバージョンです。
+# - 定期的なニュース自動取得タスクをスケジューラーで実行
+# - 会話ロジックを「DB優先、なければWeb検索」のハイブリッド方式に修正
+# - NewsCacheテーブルを正しく活用した対話フロー
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -95,7 +87,6 @@ DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
-ADMIN_TOKEN = get_secret('ADMIN_TOKEN')
 
 # ==============================================================================
 # AIクライアントとグローバル変数
@@ -172,17 +163,19 @@ def create_news_hash(title, content): return hashlib.md5(f"{title}{content[:100]
 
 def is_time_request(message): return any(keyword in message for keyword in ['今何時', '時間', '時刻'])
 def is_weather_request(message): return any(keyword in message for keyword in ['天気予報', '明日の天気は？', '今日の天気は？'])
-def is_hololive_request(message): return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
+def is_hololive_news_request(message): return 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報'])
 def is_friend_request(message): return any(fk in message for fk in ['友だち', '友達']) and any(ak in message for ak in ['登録', '誰', 'リスト'])
 def is_anime_request(message): return any(keyword in message for keyword in ANIME_KEYWORDS)
 def detect_specialized_topic(message):
     for topic, config in SPECIALIZED_SITES.items():
-        if any(keyword in message for keyword in config['keywords']): return topic
+        if any(keyword in message for keyword in config['keywords']) and any(kw in message for kw in ['ニュース', '最新', '情報']):
+            return topic
     return None
 def is_explicit_search_request(message): return any(keyword in message for keyword in ['調べて', '検索して', '探して'])
 def should_search(message):
-    if is_short_response(message) or is_explicit_search_request(message) or is_number_selection(message): return False
-    if detect_specialized_topic(message) or is_anime_request(message): return True
+    if is_short_response(message) or is_explicit_search_request(message) or is_number_selection(message) or is_hololive_news_request(message) or detect_specialized_topic(message):
+        return False
+    if is_anime_request(message): return True
     for member in HOLOMEM_KEYWORDS:
         if member in message and not any(kw in message for kw in ['ニュース', '最新', '情報']):
             if len(message.replace(member, '').strip()) > 5: return True
@@ -362,8 +355,8 @@ def get_holomem_info(member_name):
 
 def background_db_correction(task_id, correction):
     result = f"「{correction['member_name']}」ちゃんの情報修正、やってみたけど失敗しちゃった…。ごめん！"
-    with Session() as session:
-        try:
+    try:
+        with Session() as session:
             wiki = session.query(HolomemWiki).filter_by(member_name=correction['member_name']).first()
             if wiki:
                 field_map = {'説明': 'description', 'デビュー日': 'debut_date', '期': 'generation', 'タグ': 'tags', 'ステータス': 'status', '卒業日': 'graduation_date', 'もちこの気持ち': 'mochiko_feeling'}
@@ -375,9 +368,11 @@ def background_db_correction(task_id, correction):
                     result = f"おっけー！「{correction['member_name']}」ちゃんの「{correction['field']}」の情報を「{correction['value']}」に更新しといたよ！教えてくれてまじ助かる！"
                 else: result = f"ごめん、「{correction['field']}」っていう項目はないみたい…"
             else: result = f"ごめん、「{correction['member_name']}」ちゃんがデータベースに見つからなかった…"
-        except Exception as e:
-            logger.error(f"❌ DB Correction error: {e}"); session.rollback()
-        
+    except Exception as e:
+        logger.error(f"❌ DB Correction error: {e}")
+        result = "ごめん、データベースの修正中にエラーが起きちゃった…"
+    
+    with Session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task:
             task.result = result; task.status = 'completed'; task.completed_at = datetime.utcnow()
@@ -487,6 +482,8 @@ def background_deep_search(task_id, query, is_detailed):
 
     except Exception as e:
         logger.error(f"❌ Background search error: {e}")
+        search_result = json.dumps([{'title': 'エラー', 'snippet': '検索中にエラーが起きちゃった…ごめんね！', 'full_content': '検索中にエラーが起きちゃった…ごめんね！'}], ensure_ascii=False)
+
 
     with Session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
@@ -528,7 +525,7 @@ def chat_lsl():
                         with cache_lock:
                             search_context_cache[user_uuid] = {'results': search_results, 'query': query, 'timestamp': time.time()}
                         save_user_context(session, user_uuid, 'web_search', query)
-                        list_items = [f"【{r['number']}】{r['title']}" for r in search_results]
+                        list_items = [f"【{r.get('number', i+1)}】{r['title']}" for i, r in enumerate(search_results)]
                         ai_text = f"おまたせ！「{query}」について調べてきたよ！\n" + "\n".join(list_items) + "\n\n気になる番号教えて！"
                     else:
                         ai_text = f"ごめん、「{query}」について調べたけど、良い情報が見つからなかった…"
@@ -541,7 +538,13 @@ def chat_lsl():
             # 優先度2: 番号選択
             elif (selected_number := is_number_selection(message)):
                 user_context = get_user_context(session, user_uuid)
-                if user_context and user_context['type'] == 'web_search':
+                if user_context and user_context['type'] == 'hololive_news':
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number)
+                    if news_detail:
+                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
+                    else:
+                        ai_text = "あれ、その番号のニュースが見つからないや…"
+                elif user_context and user_context['type'] == 'web_search':
                     with cache_lock:
                         cached_data = search_context_cache.get(user_uuid)
                     if cached_data and (time.time() - cached_data['timestamp']) < 600:
@@ -557,6 +560,23 @@ def chat_lsl():
                     ai_text = "え、なんの番号だっけ？何かを調べてから番号で教えてね！"
             
             # 優先度3: 機能的リクエスト
+            elif is_hololive_news_request(message):
+                news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
+                if news_items:
+                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
+                    ai_text = "ホロライブの最新ニュース、こんな感じだよ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_user_context(session, user_uuid, 'hololive_news', message)
+                else:
+                    start_background_task(user_uuid, 'search', {'query': 'ホロライブ 最新ニュース', 'is_detailed': True}); ai_text = "ごめん、今DBにニュースがないや！Webで調べてみるからちょっと待ってて！"
+            elif (topic := detect_specialized_topic(message)):
+                news_items = session.query(SpecializedNews).filter_by(site_name=topic).order_by(SpecializedNews.created_at.desc()).limit(5).all()
+                if news_items:
+                    news_titles = [f"【{i+1}】{item.title}" for i, item in enumerate(news_items)]
+                    ai_text = f"{topic}の最新ニュースはこんな感じ！\n" + "\n".join(news_titles) + "\n\n気になる番号を教えてくれたら詳しく話すよ！"
+                    save_user_context(session, user_uuid, 'specialized_news', message)
+                else:
+                    start_background_task(user_uuid, 'search', {'query': f'{topic} 最新情報', 'is_detailed': True}); ai_text = f"ごめん、今DBに{topic}のニュースがないみたい！Webで調べてみるね！"
+
             elif '性格分析' in message:
                 start_background_task(user_uuid, 'psych_analysis', {}); ai_text = "おっけー！あなたの性格、分析してみるね！終わったら教えるから、ちょっと待ってて！"
             elif (correction_req := detect_db_correction_request(message)):
@@ -575,7 +595,7 @@ def chat_lsl():
                 ai_text = generate_ai_response(user_data, message, history)
             
             # 自動性格分析
-            if user_data_obj.interaction_count % 50 == 0 and user_data_obj.interaction_count > 10:
+            if user_data_obj.interaction_count > 0 and user_data_obj.interaction_count % 50 == 0:
                 start_background_task(user_uuid, 'psych_analysis', {})
 
             session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
@@ -642,18 +662,15 @@ def get_psychology_endpoint():
         if not psych:
             return create_json_response({'status': 'not_analyzed', 'message': 'No psychology data found for this user.'})
         
-        # データベースから取得したデータを辞書に変換
         psych_data = {c.name: getattr(psych, c.name) for c in psych.__table__.columns}
         
-        # JSON形式の文字列をPythonオブジェクトに変換
         for key in ['interests', 'favorite_topics']:
             if isinstance(psych_data[key], str):
                 try:
                     psych_data[key] = json.loads(psych_data[key])
                 except json.JSONDecodeError:
-                    psych_data[key] = [] # パース失敗時は空リスト
+                    psych_data[key] = []
         
-        # 日付オブジェクトをISO形式の文字列に変換
         if isinstance(psych_data.get('last_analyzed'), datetime):
             psych_data['last_analyzed'] = psych_data['last_analyzed'].isoformat()
 
@@ -684,21 +701,109 @@ def initialize_holomem_wiki():
             for data in initial_data: session.add(HolomemWiki(**data))
             session.commit()
             logger.info("✅ ホロメンWikiを初期化しました。")
+
+def _update_news_database(session, model, site_name, base_url, selectors):
+    try:
+        response = requests.get(base_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        articles = []
+        for selector in selectors:
+            articles = soup.select(selector)
+            if articles:
+                break
+        
+        for article in articles[:5]: # 最新5件を取得
+            title_elem = article.select_one('h2, h3, .title, .entry-title, .post-title')
+            link_elem = article.find('a', href=True)
+            
+            if not (title_elem and link_elem):
+                continue
+
+            title = clean_text(title_elem.get_text())
+            if len(title) < 5: continue
+
+            article_url = urljoin(base_url, link_elem['href'])
+            news_hash = create_news_hash(title, article_url)
+
+            if not session.query(model).filter_by(news_hash=news_hash).first():
+                data = {'title': title, 'content': title, 'url': article_url, 'news_hash': news_hash}
+                if model == SpecializedNews:
+                    data['site_name'] = site_name
+                session.add(model(**data))
+        session.commit()
+        logger.info(f"✅ ニュース更新完了: {site_name}")
+    except Exception as e:
+        logger.error(f"❌ ニュース更新エラー ({site_name}): {e}")
+        session.rollback()
+
+def update_news_task():
+    logger.info("⏰ 定期的なニュース更新タスクを開始します...")
+    with Session() as session:
+        # Hololive News
+        _update_news_database(session, HololiveNews, "Hololive", HOLOLIVE_NEWS_URL, ['article', '.post-item'])
+        # Specialized News
+        for site, config in SPECIALIZED_SITES.items():
+            _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post, .entry'])
+            time.sleep(2) # サーバー負荷軽減
+
+def cleanup_old_voice_files():
+    """古い音声ファイルを削除するスケジューラージョブ"""
+    try:
+        if not os.path.exists(VOICE_DIR): return
+        cutoff = time.time() - (60 * 60)  # 1時間前
+        for filename in os.listdir(VOICE_DIR):
+            file_path = os.path.join(VOICE_DIR, filename)
+            if os.path.isfile(file_path) and os.path.getmtime(file_path) < cutoff:
+                os.remove(file_path)
+                logger.info(f"🗑️ 古い音声ファイルを削除しました: {filename}")
+    except Exception as e:
+        logger.error(f"❌ 音声ファイルのクリーンアップ中にエラーが発生しました: {e}")
+
+def schedule_periodic_psych_analysis():
+    """アクティブだが長期間分析されていないユーザーを定期的に再分析する"""
+    logger.info("⏰ 定期的な性格分析タスクを開始します...")
+    with Session() as session:
+        try:
+            seven_days_ago = datetime.utcnow() - timedelta(days=7)
+            active_users = session.query(UserMemory.user_uuid).filter(UserMemory.last_interaction > seven_days_ago).all()
+            active_user_uuids = {u[0] for u in active_users}
+            
+            users_to_analyze = session.query(UserPsychology).filter(
+                UserPsychology.user_uuid.in_(active_user_uuids),
+                UserPsychology.last_analyzed < seven_days_ago
+            ).all()
+
+            if not users_to_analyze:
+                logger.info("✅ 定期分析: 全てのアクティブユーザーの分析は最新です。")
+                return
+
+            logger.info(f"🧠 定期分析: {len(users_to_analyze)}人のユーザーを再分析します。")
+            for psych_user in users_to_analyze:
+                start_background_task(psych_user.user_uuid, 'psych_analysis', {})
+                time.sleep(2)
+        except Exception as e:
+            logger.error(f"❌ 定期性格分析スケジューラーでエラーが発生しました: {e}")
+
+
 def initialize_app():
-    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.3) の初期化を開始...\n" + "="*60)
+    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.5) の初期化を開始...\n" + "="*60)
     
     initialize_gemini_client()
     initialize_groq_client()
     initialize_holomem_wiki()
     
     def run_scheduler():
-        schedule.every().day.at("03:00").do(analyze_user_psychology, user_uuid=None) # 全ユーザーの定期分析（仮）
+        schedule.every(4).hours.do(update_news_task)
+        schedule.every(6).hours.do(schedule_periodic_psych_analysis)
+        schedule.every(1).hour.do(cleanup_old_voice_files)
         while True:
             schedule.run_pending()
             time.sleep(60)
             
     threading.Thread(target=run_scheduler, daemon=True).start()
-    logger.info("⏰ スケジューラーを開始しました (定期性格分析)")
+    logger.info("⏰ スケジューラーを開始しました (ニュース更新, 定期性格分析, 音声ファイル削除)")
     logger.info(f"🤖 利用可能なAIモデル: Gemini={'✅' if gemini_model else '❌'} | Llama={'✅' if groq_client else '❌'}")
     logger.info("✅ 初期化完了！")
 
