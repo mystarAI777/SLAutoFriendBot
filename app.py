@@ -1,10 +1,9 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v16.8 - Groq単一モデル版)
+# もちこAI - 究極の全機能統合版 (v17.0 - Wikipedia要約機能搭載版)
 #
-# v16.7をベースに、AIモデルをGroq (Llama) のみに絞り、Geminiへの依存を完全に排除したバージョン。
-# - AIモデル呼び出しをGroqに一本化し、コードをシンプル化
-# - API呼び出しの自動リトライ機能は維持
-# - その他すべての堅牢性向上策はv16.7から継承
+# v16.9をベースに、「〇〇とは？」という質問に対してWikipediaの情報をAIが要約して
+# 応答する専用ロジックを搭載。さらにWeb検索エンジンにYahoo! JAPANを復活させ、
+# 3段階のフォールバックを持つ極めて堅牢な検索機能を実現した。
 # ==============================================================================
 
 # ===== ライブラリのインポート =====
@@ -63,9 +62,6 @@ SPECIALIZED_SITES = {
 }
 HOLOMEM_KEYWORDS = [
     'ときのそら', 'ロボ子さん', 'さくらみこ', '星街すいせい', 'AZKi', '夜空メル', 'アキ・ローゼンタール', '赤井はあと', '白上フブキ', '夏色まつり', '湊あくあ', '紫咲シオン', '百鬼あやめ', '癒月ちょこ', '大空スバル', '大神ミオ', '猫又おかゆ', '戌神ころね', '兎田ぺこら', '不知火フレア', '白銀ノエル', '宝鐘マリン', '天音かなた', '角巻わため', '常闇トワ', '姫森ルーナ', '雪花ラミィ', '桃鈴ねね', '獅白ぼたん', '尾丸ポルカ', 'ラプラス・ダークネス', '鷹嶺ルイ', '博衣こより', '沙花叉クロヱ', '風真いろは', '森カリオペ', '小鳥遊キアラ', '一伊那尓栖', 'がうる・ぐら', 'ワトソン・アメリア', 'IRyS', 'セレス・ファウナ', 'オーロ・クロニー', '七詩ムメイ', 'ハコス・ベールズ', 'シオリ・ノヴェラ', '古石ビジュー', 'ネリッサ・レイヴンクロフト', 'フワワ・アビスガード', 'モココ・アビスガード', 'アユンダ・リス', 'ムーナ・ホシノヴァ', 'アイラニ・イオフィフティーン', 'クレイジー・オリー', 'アーニャ・メルフィッサ', 'パヴォリア・レイネ', '火威青', '音乃瀬奏', '一条莉々華', '儒烏風亭らでん', '轟はじめ', 'ホロライブ', 'ホロメン', 'hololive', 'YAGOO', '桐生ココ', '潤羽るしあ', '魔乃アロエ', '九十九佐命'
-]
-ANIME_KEYWORDS = [
-    'アニメ', 'anime', 'ANIME', 'ｱﾆﾒ', 'アニメーション', '作画', '声優', 'OP', 'ED', '劇場版', '映画', '原作', '漫画', 'ラノベ'
 ]
 
 # ==============================================================================
@@ -156,11 +152,17 @@ def clean_text(text): return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text or 
 def get_japan_time(): return f"今は{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 def create_news_hash(title, content): return hashlib.md5(f"{title}{content[:100]}".encode('utf-8')).hexdigest()
 
+def is_what_is_request(message):
+    """「〇〇とは？」形式の質問を検知し、キーワードを返す"""
+    match = re.search(r'(.+?)\s*(?:とは|って何|ってなに)\??$', message.strip())
+    if match:
+        return match.group(1).strip()
+    return None
 def is_time_request(message): return any(keyword in message for keyword in ['今何時', '時間', '時刻'])
 def is_weather_request(message): return any(keyword in message for keyword in ['天気予報', '明日の天気は？', '今日の天気は？'])
 def is_hololive_news_request(message): return 'ホロライブ' in message and any(kw in message for kw in ['ニュース', '最新', '情報'])
 def is_friend_request(message): return any(fk in message for fk in ['友だち', '友達']) and any(ak in message for ak in ['登録', '誰', 'リスト'])
-def is_anime_request(message): return any(keyword in message for keyword in ANIME_KEYWORDS)
+def is_anime_request(message): return any(kw in message for kw in ['アニメ', 'anime', 'あにめ'])
 def detect_specialized_topic(message):
     for topic, config in SPECIALIZED_SITES.items():
         if any(keyword in message for keyword in config['keywords']) and any(kw in message for kw in ['ニュース', '最新', '情報']):
@@ -168,7 +170,7 @@ def detect_specialized_topic(message):
     return None
 def is_explicit_search_request(message): return any(keyword in message for keyword in ['調べて', '検索して', '探して'])
 def should_search(message):
-    if is_short_response(message) or is_explicit_search_request(message) or is_number_selection(message) or is_hololive_news_request(message) or detect_specialized_topic(message):
+    if is_short_response(message) or is_explicit_search_request(message) or is_number_selection(message) or is_hololive_news_request(message) or detect_specialized_topic(message) or is_what_is_request(message):
         return False
     if is_anime_request(message): return True
     for member in HOLOMEM_KEYWORDS:
@@ -250,7 +252,6 @@ def start_background_task(user_uuid, task_type, query_data):
 # AIモデル呼び出し関数 (リトライ機能付き)
 # ==============================================================================
 def _with_retry(api_call_function):
-    """API呼び出しにリトライ機能を追加するデコレーター"""
     @wraps(api_call_function)
     def wrapper(*args, **kwargs):
         max_retries = 3
@@ -280,7 +281,7 @@ def call_llama_advanced(prompt, history, system_prompt, max_tokens=1000):
     for msg in history[-8:]:
         messages.append({"role": "user" if msg.role == "user" else "assistant", "content": msg.content})
     messages.append({"role": "user", "content": prompt})
-    completion = groq_client.chat.completions.create(messages=messages, model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=max_tokens)
+    completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-70b-versatile", temperature=0.7, max_tokens=max_tokens)
     return completion.choices[0].message.content.strip()
 
 def generate_fallback_response(message, reference_info=""):
@@ -393,12 +394,25 @@ def save_user_context(session, user_uuid, context_type, query):
 
 def get_user_context(session, user_uuid):
     context = session.query(UserContext).filter_by(user_uuid=user_uuid).first()
-    if context and (datetime.utcnow() - context.updated_at).total_seconds() < 600: # 10分有効
+    if context and (datetime.utcnow() - context.updated_at).total_seconds() < 600:
         return {'type': context.last_context_type, 'query': context.last_query}
     return None
 
+def save_news_cache(session, user_uuid, news_items, news_type):
+    session.query(NewsCache).filter_by(user_uuid=user_uuid, news_type=news_type).delete()
+    for i, news in enumerate(news_items, 1):
+        session.add(NewsCache(user_uuid=user_uuid, news_id=news.id, news_number=i, news_type=news_type))
+    session.commit()
+
+def get_cached_news_detail(session, user_uuid, news_number, news_type):
+    cache = session.query(NewsCache).filter_by(user_uuid=user_uuid, news_number=news_number, news_type=news_type).first()
+    if not cache: return None
+    
+    model = HololiveNews if news_type == 'hololive' else SpecializedNews
+    return session.query(model).filter_by(id=cache.news_id).first()
+
 # ==============================================================================
-# AI応答生成 (Groq単一モデル)
+# AI応答生成
 # ==============================================================================
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
     if not groq_client:
@@ -411,12 +425,11 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     system_prompt += f"\n## 【参考情報】:\n{reference_info if reference_info else '特になし'}"
 
     try:
-        logger.info("🧠 Groq Llama 3.3 70Bを使用")
+        logger.info("🧠 Groq Llama 3.1 70Bを使用")
         response = call_llama_advanced(message, history, system_prompt, 500 if is_detailed else 300)
         if response:
             return response
         else:
-            # LlamaがNoneを返した場合（リトライ失敗など）
             logger.error("⚠️ Groq AIモデルが応答しませんでした。")
             return generate_fallback_response(message, reference_info)
     except Exception as e:
@@ -424,12 +437,39 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
         return "うぅ、AIの調子が悪いみたい…ごめんね！"
 
 # ==============================================================================
-# 外部情報検索機能 (Web検索, Wiki検索, アニメ検索)
+# 外部情報検索機能
 # ==============================================================================
+def search_wikipedia(term):
+    """Wikipedia APIから指定された単語の概要を取得する"""
+    API_ENDPOINT = "https://ja.wikipedia.org/w/api.php"
+    params = {
+        'action': 'query',
+        'format': 'json',
+        'titles': term,
+        'prop': 'extracts',
+        'exintro': True,
+        'explaintext': True,
+        'redirects': 1, # リダイレクトを解決
+    }
+    try:
+        response = requests.get(API_ENDPOINT, params=params, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        pages = data['query']['pages']
+        page_id = next(iter(pages)) # 最初のページIDを取得
+        if page_id != "-1":
+            extract = pages[page_id].get('extract')
+            if extract and '曖昧さ回避' not in extract:
+                return extract
+    except Exception as e:
+        logger.error(f"❌ Wikipedia検索中にエラーが発生: {e}")
+    return None
+
 def scrape_major_search_engines(query, num_results):
     search_configs = [
         {'name': 'DuckDuckGo HTML', 'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", 'result_selector': 'div.result', 'title_selector': 'h2.result__title > a.result__a', 'snippet_selector': 'a.result__snippet'},
         {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}&mkt=ja-JP", 'result_selector': 'li.b_algo', 'title_selector': 'h2', 'snippet_selector': 'div.b_caption p, .b_caption'},
+        {'name': 'Yahoo Japan', 'url': f"https://search.yahoo.co.jp/search?p={quote_plus(query)}", 'result_selector': 'div.Algo', 'title_selector': 'h3', 'snippet_selector': 'div.compText p, .compText'}
     ]
     for config in search_configs:
         try:
@@ -449,7 +489,7 @@ def scrape_major_search_engines(query, num_results):
     return []
 
 def background_deep_search(task_id, query, is_detailed):
-    search_result = "[]" # 失敗した場合でも空のJSON配列を返す
+    search_result = "[]"
     try:
         search_query = query
         if is_anime_request(query):
@@ -470,7 +510,7 @@ def background_deep_search(task_id, query, is_detailed):
             session.commit()
 
 # ==============================================================================
-# Flask エンドポイント (文字化け対策済み & 完全版)
+# Flask エンドポイント
 # ==============================================================================
 @app.route('/health')
 def health_check():
@@ -490,7 +530,6 @@ def chat_lsl():
             ai_text = ""
             user_data = {'uuid': user_uuid, 'name': user_data_obj.user_name}
 
-            # 優先度1: 完了タスク
             completed_task = check_completed_tasks(user_uuid)
             if completed_task:
                 query = completed_task['query']
@@ -513,19 +552,15 @@ def chat_lsl():
                     psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
                     ai_text = f"分析終わったよ！あてぃしが見たあなたは…「{psych.analysis_summary}」って感じ！" if psych else "分析終わったけど、まだうまくまとめられないや…"
 
-            # 優先度2: 番号選択
             elif (selected_number := is_number_selection(message)):
                 user_context = get_user_context(session, user_uuid)
-                if user_context and user_context['type'] == 'hololive_news':
-                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, 'hololive')
+                news_type_map = {'hololive_news': 'hololive', 'specialized_news': 'specialized'}
+                news_type = news_type_map.get(user_context['type']) if user_context else None
+
+                if news_type:
+                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, news_type)
                     if news_detail:
-                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
-                    else:
-                        ai_text = "あれ、その番号のニュースが見つからないや…"
-                elif user_context and user_context['type'] == 'specialized_news':
-                    news_detail = get_cached_news_detail(session, user_uuid, selected_number, 'specialized')
-                    if news_detail:
-                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について教えて", history, news_detail.content, is_detailed=True)
+                        ai_text = generate_ai_response(user_data, f"{news_detail.title}について詳しく教えて", history, news_detail.content, is_detailed=True)
                     else:
                         ai_text = "あれ、その番号のニュースが見つからないや…"
                 elif user_context and user_context['type'] == 'web_search':
@@ -543,7 +578,15 @@ def chat_lsl():
                 else:
                     ai_text = "え、なんの番号だっけ？何かを調べてから番号で教えてね！"
             
-            # 優先度3: 機能的リクエスト
+            elif (what_is_term := is_what_is_request(message)):
+                wikipedia_text = search_wikipedia(what_is_term)
+                if wikipedia_text:
+                    system_prompt = f"あなたは「もちこ」というギャルAIです。以下の【参考情報】を元に、「{what_is_term}とは？」という質問に対して、150文字程度で要約して答えてください。あなたの口調（一人称は「あてぃし」、語尾は「〜じゃん」「〜的な？」）を必ず守ってください。"
+                    ai_text = call_llama_advanced(message, history, system_prompt, 200)
+                else:
+                    # Wikipediaにない場合は通常のWeb検索にフォールバック
+                    start_background_task(user_uuid, 'search', {'query': message, 'is_detailed': True}); ai_text = f"おっけー、「{message}」について詳しく調べてみるね！ちょい待ってて！"
+
             elif is_hololive_news_request(message):
                 news_items = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if news_items:
@@ -576,11 +619,9 @@ def chat_lsl():
             elif should_search(message) or is_explicit_search_request(message):
                 start_background_task(user_uuid, 'search', {'query': message, 'is_detailed': is_detailed_request(message)}); ai_text = f"おっけー、「{message}」について調べてみるね！ちょい待ってて！"
             
-            # 優先度4: 通常会話
             if not ai_text:
                 ai_text = generate_ai_response(user_data, message, history)
             
-            # 自動性格分析
             if user_data_obj.interaction_count > 0 and user_data_obj.interaction_count % 50 == 0:
                 start_background_task(user_uuid, 'psych_analysis', {})
 
@@ -724,11 +765,15 @@ def _update_news_database(session, model, site_name, base_url, selectors):
 
 def update_news_task():
     logger.info("⏰ 定期的なニュース更新タスクを開始します...")
-    with Session() as session:
-        _update_news_database(session, HololiveNews, "Hololive", HOLOLIVE_NEWS_URL, ['article', '.post-item'])
-        for site, config in SPECIALIZED_SITES.items():
-            _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post', '.entry'])
-            time.sleep(2)
+    try:
+        with Session() as session:
+            _update_news_database(session, HololiveNews, "Hololive", HOLOLIVE_NEWS_URL, ['article', '.post-item'])
+            for site, config in SPECIALIZED_SITES.items():
+                _update_news_database(session, SpecializedNews, site, config['base_url'], ['article', '.post', '.entry'])
+                time.sleep(2)
+    except Exception as e:
+        logger.error(f"❌ ニュース更新タスク全体でエラーが発生: {e}")
+
 
 def cleanup_old_voice_files():
     try:
@@ -744,8 +789,8 @@ def cleanup_old_voice_files():
 
 def schedule_periodic_psych_analysis():
     logger.info("⏰ 定期的な性格分析タスクを開始します...")
-    with Session() as session:
-        try:
+    try:
+        with Session() as session:
             seven_days_ago = datetime.utcnow() - timedelta(days=7)
             active_users = session.query(UserMemory.user_uuid).filter(UserMemory.last_interaction > seven_days_ago).all()
             active_user_uuids = {u[0] for u in active_users}
@@ -763,12 +808,12 @@ def schedule_periodic_psych_analysis():
             for psych_user in users_to_analyze:
                 start_background_task(psych_user.user_uuid, 'psych_analysis', {})
                 time.sleep(2)
-        except Exception as e:
-            logger.error(f"❌ 定期性格分析スケジューラーでエラーが発生しました: {e}")
+    except Exception as e:
+        logger.error(f"❌ 定期性格分析スケジューラーでエラーが発生しました: {e}")
 
 
 def initialize_app():
-    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v16.8) の初期化を開始...\n" + "="*60)
+    logger.info("="*60 + "\n🔧 もちこAI 究極版 (v17.0) の初期化を開始...\n" + "="*60)
     
     initialize_groq_client()
     initialize_holomem_wiki()
