@@ -33,8 +33,6 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 import unicodedata
 from urllib.parse import quote_plus, urljoin
-import subprocess
-from functools import wraps
 from threading import Lock
 
 # --- サードパーティライブラリ ---
@@ -48,7 +46,6 @@ import schedule
 import signal
 from groq import Groq
 import google.generativeai as genai
-from cryptography.fernet import Fernet
 
 # ==============================================================================
 # 基本設定とロギング
@@ -60,7 +57,6 @@ logger = logging.getLogger(__name__)
 # 定数設定
 # ==============================================================================
 VOICE_DIR = '/tmp/voices'
-BACKUP_DIR = '/tmp/db_backups'
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 background_executor = ThreadPoolExecutor(max_workers=5)
 VOICEVOX_SPEAKER_ID = 20
