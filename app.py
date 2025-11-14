@@ -199,26 +199,7 @@ def get_db_session():
     finally:
         session.close()
 
-# ==============================================================================
-# データベースバックアップ機能（完全実装版）
-# ==============================================================================
-def export_database_to_json():
-    with get_db_session() as session:
-        backup_data = {'timestamp': datetime.utcnow().isoformat(), 'tables': {}}
-        tables_to_export = {
-            'user_memories': UserMemory, 'user_psychology': UserPsychology, 'holomem_wiki': HolomemWiki
-        }
-        stats = {}
-        for name, model in tables_to_export.items():
-            records = session.query(model).all()
-            backup_data['tables'][name] = [
-                {c.name: getattr(r, c.name).isoformat() if isinstance(getattr(r, c.name), datetime) else getattr(r, c.name) for c in r.__table__.columns}
-                for r in records
-            ]
-            stats[name] = len(records)
-        backup_data['statistics'] = stats
-        logger.info(f"✅ Database export complete: {stats}")
-        return backup_data
+
 
 def commit_encrypted_backup_to_github():
     if not fernet:
