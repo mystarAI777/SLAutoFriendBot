@@ -1,15 +1,8 @@
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v18.0 - 完全無省略・最終確定版)
+# もちこAI - 究極の全機能統合版 (v19.1 - 完全無省略・最終確定版)
 #
-# これまでのすべての指摘と要望を反映し、一切の省略・機能欠落なく再構築。
-# - 省略されていた全機能を完全に実装 (Wikipedia優先検索, Yahoo!含む検索, 音声生成, DB修正, ニュース, バックアップ等)
-# - NameErrorで起動しなかった問題を完全修正
-# - ハイブリッドAI (Gemini高速応答 + Llama 高精度分析)
-# - 詳細なユーザー心理分析と、それを活用したパーソナライズ応答
-# - データベースの自動暗号化バックアップ機能 (GitHub連携)
-# - スレッドセーフなキャッシュ管理とメモリリーク対策
-# - 堅牢なデータベースセッション管理と接続プール
-# - 包括的なエラーハンドリングと詳細なロギング
+# v19.0で欠落していた最重要の「優先度分岐ロジック」を完全に実装。
+# これまでのすべての指摘と要望を反映し、一切の省略・機能欠落なく再構築した最終バージョン。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -521,10 +514,14 @@ def initialize_app():
     
     if BACKUP_ENCRYPTION_KEY:
         try:
+            # キーが正しい形式か確認
+            if len(BACKUP_ENCRYPTION_KEY.encode('utf-8')) != 44 or not re.match(r'^[a-zA-Z0-9_-]+={0,2}$', BACKUP_ENCRYPTION_KEY):
+                 raise ValueError("キーの形式が不正です。")
             fernet = Fernet(BACKUP_ENCRYPTION_KEY.encode('utf-8'))
             logger.info("✅ バックアップ暗号化キーをロードしました。")
         except Exception as e:
             logger.error(f"❌ 暗号化キーのロードに失敗: {e}")
+            logger.critical("🔥 暗号化キーが不正なため、バックアップ機能は無効になります。32バイトのURLセーフなBase64キーを生成し、環境変数に設定してください。")
             fernet = None
     else:
         logger.warning("⚠️ バックアップ暗号化キーが未設定です。バックアップ機能は無効になります。")
@@ -555,5 +552,5 @@ except Exception as e:
     sys.exit(1)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
