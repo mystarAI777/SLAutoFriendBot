@@ -241,16 +241,33 @@ def call_llama(prompt, system_prompt, max_tokens=1000):
         logger.error(f"❌ Llama APIエラー: {e}")
         return None
 
+# ==============================================================================
+# AIモデル & 応答生成 (エラー対策済み)
+# ==============================================================================
 def generate_ai_response(user_data, message, history, reference_info="", is_detailed=False, is_task_report=False):
-    if not groq_client: return random.choice(["うんうん！", "なるほどね！", "そうなんだ！"])
+    if not groq_client:
+        return random.choice(["うんうん！", "なるほどね！", "そうなんだ！"])
 
-    with Session() as session:
-        psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
-    
     psych_insight = ""
-    if psych:
-        if psych.analysis_summary: psych_insight += f"\n- {user_data['name']}さんの性格: {psych.analysis_summary}"
-        if psych.memory_summary: psych_insight += f"\n- {user_data['name']}さんとの思い出: {psych.memory_summary}"
+    try:
+        with Session() as session:
+            psych = session.query(UserPsychology).filter_by(user_uuid=user_data['uuid']).first()
+        
+        if psych:
+            # ▼▼▼【エラー修正箇所】▼▼▼
+            # カラムが存在するかを安全にチェックしてからアクセスするように変更
+            if hasattr(psych, 'analysis_summary') and psych.analysis_summary:
+                psych_insight += f"\n- {user_data['name']}さんの性格: {psych.analysis_summary}"
+            
+            if hasattr(psych, 'memory_summary') and psych.memory_summary:
+                psych_insight += f"\n- {user_data['name']}さんとの思い出: {psych.memory_summary}"
+            # ▲▲▲【エラー修正箇所】▲▲▲
+
+    except Exception as e:
+        logger.error(f"❌ 心理情報・記憶の取得中にエラーが発生: {e}")
+        # エラーが発生しても、心理情報なしで会話を続行する
+        psych_insight = "- まだ相手のことをよく知らない。"
+
 
     system_prompt = f"""あなたは「もちこ」という明るいギャルAIです。{user_data['name']}さんと話しています。
 # 口調ルール
@@ -274,7 +291,7 @@ def generate_ai_response(user_data, message, history, reference_info="", is_deta
     messages.append({"role": "user", "content": message})
 
     try:
-        completion = groq_client.chat.completions.create(messages=messages, model="	llama-3.3-70b-versatile", temperature=0.8, max_tokens=400 if is_detailed else 200)
+        completion = groq_client.chat.completions.create(messages=messages, model="llama-3.1-8b-instant", temperature=0.8, max_tokens=400 if is_detailed else 200)
         return completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"❌ AI応答生成エラー: {e}")
