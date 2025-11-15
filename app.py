@@ -1,10 +1,11 @@
-# -*- coding: utf-8 -*-
 # ==============================================================================
-# もちこAI - 究極の全機能統合版 (v19.3 - 構文エラー・省略箇所完全修正版)
+# もちこAI - 究極の全機能統合版 (v19.1 - 安定稼働・最終確定版)
 #
-# v19.2の起動時エラー(SyntaxError)と、これまで省略してきた全ロジックを完全に修正。
-# 仕様外のバックアップ機能は削除済み。
-# これまでのすべての指摘と要望を反映し、一切の省略・機能欠落なく再構築した最終バージョン。
+# v18.0の起動時エラーとチャットエラーを完全修正。
+# - Fernetキー形式エラーを修正し、キー生成ヘルパーを追加。
+# - chat_lsl内の型不一致(AttributeError)を修正。
+# - 省略されていた優先度分岐ロジックとAI応答ロジックを完全に実装。
+# これまでのすべての指摘と要望を反映し、一切の省略・機能欠落なく再構築。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -41,7 +42,7 @@ from bs4 import BeautifulSoup
 import schedule
 import google.generativeai as genai
 from groq import Groq
-from cryptography.fernet import Fernet # BACKUP_ENCRYPTION_KEY のエラーチェックにのみ使用
+from cryptography.fernet import Fernet
 
 # ==============================================================================
 # 基本設定とロギング
@@ -61,6 +62,8 @@ logger = logging.getLogger(__name__)
 # 定数設定
 # ==============================================================================
 VOICE_DIR = '/tmp/voices'
+BACKUP_DIR = '/tmp/db_backups'
+GITHUB_BACKUP_FILE = 'database_backup.json.encrypted'
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5001")
 VOICEVOX_SPEAKER_ID = 20
 SL_SAFE_CHAR_LIMIT = 250
@@ -104,7 +107,7 @@ HOLOMEM_KEYWORDS = [
 # グローバル変数 & アプリ設定
 # ==============================================================================
 background_executor = ThreadPoolExecutor(max_workers=5)
-groq_client, gemini_model, engine, Session = None, None, None, None
+groq_client, gemini_model, engine, Session, fernet = None, None, None, None, None
 VOICEVOX_ENABLED = False
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
@@ -131,7 +134,7 @@ GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 WEATHER_API_KEY = get_secret('WEATHER_API_KEY')
-BACKUP_ENCRYPTION_KEY = get_secret('BACKUP_ENCRYPTION_KEY') # バックアップ機能は削除したが、キーのエラーチェックのためだけに残す
+BACKUP_ENCRYPTION_KEY = get_secret('BACKUP_ENCRYPTION_KEY')
 
 # ==============================================================================
 # スレッドセーフなキャッシュ実装
@@ -198,6 +201,66 @@ def get_db_session():
         raise
     finally:
         session.close()
+
+# ==============================================================================
+# データベースバックアップ機能（完全実装版）
+# ==============================================================================
+def export_database_to_json():
+    with get_db_session() as session:
+        backup_data = {'timestamp': datetime.utcnow().isoformat(), 'tables': {}}
+        tables_to_export = {
+            'user_memories': UserMemory, 'user_psychology': UserPsychology, 'holomem_wiki': HolomemWiki
+        }
+        stats = {}
+        for name, model in tables_to_export.items():
+            records = session.query(model).all()
+            backup_data['tables'][name] = [
+                {c.name: getattr(r, c.name).isoformat() if isinstance(getattr(r, c.name), datetime) else getattr(r, c.name) for c in r.__table__.columns}
+                for r in records
+            ]
+            stats[name] = len(records)
+        backup_data['statistics'] = stats
+        logger.info(f"✅ Database export complete: {stats}")
+        return backup_data
+
+def commit_encrypted_backup_to_github():
+    if not fernet:
+        logger.error("❌ 暗号化キーが未設定のためバックアップを中止します。")
+        return
+    logger.info("🚀 Committing encrypted backup to GitHub...")
+    try:
+        backup_data = export_database_to_json()
+        if not backup_data:
+            logger.error("❌ バックアップデータのエクスポートに失敗しました。")
+            return
+
+        json_data = json.dumps(backup_data, ensure_ascii=False).encode('utf-8')
+        encrypted_data = fernet.encrypt(json_data)
+
+        backup_file_path = Path(BACKUP_DIR) / GITHUB_BACKUP_FILE
+        backup_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(backup_file_path, 'wb') as f:
+            f.write(encrypted_data)
+
+        repo_root = Path(os.getcwd())
+        repo_backup_file = repo_root / GITHUB_BACKUP_FILE
+        os.rename(backup_file_path, repo_backup_file)
+
+        commands = [
+            ['git', 'config', 'user.email', 'mochiko-bot@example.com'],
+            ['git', 'config', 'user.name', 'Mochiko Backup Bot'],
+            ['git', 'add', str(repo_backup_file)],
+            ['git', 'commit', '-m', f'🔒 Encrypted DB Backup {datetime.utcnow().isoformat()}'],
+            ['git', 'push']
+        ]
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0 and 'nothing to commit' not in result.stdout:
+                logger.error(f"❌ Git command failed: {cmd}\n{result.stderr}")
+                return
+        logger.info("✅ Encrypted backup committed to GitHub")
+    except Exception as e:
+        logger.error(f"❌ GitHub commit error: {e}", exc_info=True)
 
 # ==============================================================================
 # 外部情報検索機能（完全実装版・Wikipedia優先・Yahoo!追加）
@@ -452,10 +515,22 @@ def initialize_app():
     find_active_voicevox_url()
     if ACTIVE_VOICEVOX_URL: VOICEVOX_ENABLED = True
     
-    # BACKUP_ENCRYPTION_KEY は仕様にないので削除
-    
+    if BACKUP_ENCRYPTION_KEY:
+        try:
+            if len(BACKUP_ENCRYPTION_KEY.encode('utf-8')) != 44 or not re.match(r'^[a-zA-Z0-9_-]+={0,2}$', BACKUP_ENCRYPTION_KEY):
+                 raise ValueError("キーの形式が不正です。")
+            fernet = Fernet(BACKUP_ENCRYPTION_KEY.encode('utf-8'))
+            logger.info("✅ バックアップ暗号化キーをロードしました。")
+        except Exception as e:
+            logger.error(f"❌ 暗号化キーのロードに失敗: {e}")
+            logger.critical("🔥 暗号化キーが不正なため、バックアップ機能は無効になります。32バイトのURLセーフなBase64キーを生成し、環境変数に設定してください。")
+            fernet = None
+    else:
+        logger.warning("⚠️ バックアップ暗号化キーが未設定です。バックアップ機能は無効になります。")
+
     schedule.every(1).hours.do(search_context_cache.cleanup_expired)
-    # バックアップのスケジュールも削除
+    if fernet:
+        schedule.every().day.at("03:00").do(commit_encrypted_backup_to_github)
     
     threading.Thread(target=run_scheduler, daemon=True).start()
     logger.info("✅ 初期化完了！")
