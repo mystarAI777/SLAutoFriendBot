@@ -1,9 +1,8 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v26.0 - Startup Fix Final)
+# もちこAI - 全機能統合版 (v26.1 - Import Fix)
 #
-# v25.0をベースに、Gunicornでの起動エラーを恒久的に解決。
-# アプリケーション変数'application'をグローバルスコープの先頭で定義し、
-# Webサーバーが常にアプリケーション本体を認識できるように構造を修正しました。
+# v26.0をベースに、起動時に発生していた'threading'のNameErrorを修正。
+# 必要な'threading'モジュールのインポートを追加しました。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -19,6 +18,7 @@ import uuid
 import hashlib
 import unicodedata
 import traceback
+import threading  # <-- 【重要】不足していたモジュールをここに追加
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, urljoin, urlparse
 from functools import wraps
@@ -104,12 +104,8 @@ groq_client, gemini_model, engine, Session = None, None, None, None
 VOICEVOX_ENABLED = False
 ACTIVE_VOICEVOX_URL = None
 
-# --- Gunicornのための重要な修正 ---
-# Flaskアプリケーションオブジェクトを最初に定義します
 app = Flask(__name__)
-# Gunicornが参照する'application'変数をここで定義します
 application = app
-# --------------------------------
 
 app.config['JSON_AS_ASCII'] = False
 CORS(app)
@@ -708,7 +704,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model, VOICEVOX_ENABLED
-    logger.info("=" * 60 + "\n🔧 もちこAI v25.0 (Multi-Engine) 初期化開始...\n" + "=" * 60)
+    logger.info("=" * 60 + "\n🔧 もちこAI v26.1 (Startup Fix Final) 初期化開始...\n" + "=" * 60)
     
     if DATABASE_URL.startswith('sqlite'): engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False}, pool_pre_ping=True)
     else: engine = create_engine(DATABASE_URL, poolclass=pool.QueuePool, pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=3600)
@@ -735,21 +731,19 @@ def initialize_app():
     threading.Thread(target=run_scheduler, daemon=True).start()
     logger.info("✅ スケジューラー起動")
     
-    logger.info("=" * 60 + "\n✅ もちこAI v25.0 初期化完了！\n" + "=" * 60)
+    logger.info("=" * 60 + "\n✅ もちこAI v26.1 初期化完了！\n" + "=" * 60)
 
 # ==============================================================================
 # メイン実行
 # ==============================================================================
-
 # グローバルスコープで初期化を実行
-# try...exceptで囲み、初期化の失敗を明確にログに記録します
 try:
     initialize_app()
 except Exception as e:
     logger.critical(f"🔥 致命的な初期化エラー: {e}", exc_info=True)
     sys.exit(1)
 
-# このブロックは 'python app.py' で直接実行した場合のみ動作します（ローカルテスト用）
+# このブロックは 'python app.py' で直接実行した場合のみ動作します
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
