@@ -304,7 +304,7 @@ def is_time_request(message):
     return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
-    return any(keyword in message for keyword in ['天気', 'てんき', '気温'])
+    return any(keyword in message for keyword in ['明日の天気', '天気予報'])
 
 def is_hololive_request(message):
     return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
