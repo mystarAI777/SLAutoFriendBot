@@ -1,8 +1,8 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v28.2 - Safety Handling)
+# もちこAI - 全機能統合版 (v28.3 - Final Polish)
 #
-# v28.1をベースに、Gemini APIの初期化時に発生するセーフティブロックエラーに対処。
-# response.textへの直接アクセスを避け、より安全な応答取得ロジックに修正しました。
+# v28.2をベースに、ログ出力の安全性向上など、
+# さらなる堅牢性を高めるための最終的な改善を適用しました。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -295,7 +295,7 @@ def get_japan_time():
     return f"今の日本の時間は、{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 
 def is_time_request(message):
-    return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
+    return any(keyword in message for keyword in ['今何時', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
     return any(keyword in message for keyword in ['今日の天気は？', '明日の天気', '天気予報'])
@@ -361,17 +361,14 @@ def get_conversation_history(session, user_uuid, limit=10):
     return [{'role': h.role, 'content': h.content} for h in reversed(history_records)]
 
 # ==============================================================================
-# AIモデル呼び出し関数 (v28.2: 安全な応答取得)
+# AIモデル呼び出し関数
 # ==============================================================================
 def _safe_get_gemini_text(response):
-    """Geminiの応答から安全にテキストを取得する"""
     try:
-        if response.candidates:
-            # 最初の候補の最初のパートのテキストを返す
+        if hasattr(response, 'candidates') and response.candidates:
             return response.candidates[0].content.parts[0].text
     except (IndexError, AttributeError):
-        # 応答がブロックされた場合など
-        logger.warning(f"⚠️ Gemini応答がブロックされたか、不正な形式です: {response.prompt_feedback}")
+        logger.warning(f"⚠️ Gemini応答がブロックされたか、不正な形式です: {getattr(response, 'prompt_feedback', 'N/A')}")
         return None
     except Exception as e:
         logger.error(f"❌ Gemini応答の解析中に予期せぬエラー: {e}")
@@ -385,14 +382,9 @@ def call_gemini(system_prompt, message, history):
         for h in history: full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
         full_prompt += f"\nユーザー: {message}\nもちこ:"
         response = gemini_model.generate_content(full_prompt, generation_config={"temperature": 0.8, "max_output_tokens": 300})
-        
-        # 安全なテキスト取得関数を使用
         text = _safe_get_gemini_text(response)
-        if text:
-            return text.strip()
-        else:
-            return None # 失敗した場合はNoneを返す
-            
+        if text: return text.strip()
+        return None
     except Exception as e:
         logger.error(f"❌ Gemini APIエラー: {e}", exc_info=True)
         raise AIModelException(e)
@@ -869,8 +861,7 @@ def initialize_app():
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
             gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            #【修正】より安全なテストプロンプトと応答取得方法に変更
-            test_response = gemini_model.generate_content("自己紹介してください", generation_config={"max_output_tokens": 20})
+            test_response = gemini_model.generate_content("自己紹介をしてください", generation_config={"max_output_tokens": 20})
             test_text = _safe_get_gemini_text(test_response)
             if test_text:
                 logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.5-flash, テスト応答: {test_text[:20]}...)")
@@ -917,4 +908,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)```
