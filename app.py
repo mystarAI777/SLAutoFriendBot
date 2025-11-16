@@ -339,9 +339,26 @@ def detect_db_correction_request(message):
 
 def is_holomem_name_only_request_safe(message: str):
     msg_stripped = sanitize_user_input(message.strip(), max_length=50)
-    if len(msg_stripped) > 20: return None
+    if len(msg_stripped) > 20:
+        return None
+    
+    # 部分一致も考慮
     for name in HOLOMEM_KEYWORDS:
-        if name == msg_stripped: return name
+        if name in msg_stripped or msg_stripped in name:
+            return name
+    
+    # 「みこち」→「さくらみこ」のような愛称マッピング
+    nickname_map = {
+        'みこち': 'さくらみこ',
+        'ぺこら': '兎田ぺこら',
+        'すいちゃん': '星街すいせい',
+        'マリン': '宝鐘マリン',
+        # ... 他の愛称も追加
+    }
+    
+    if msg_stripped in nickname_map:
+        return nickname_map[msg_stripped]
+    
     return None
 
 def get_or_create_user(session, user_uuid, user_name):
@@ -365,14 +382,26 @@ def get_conversation_history(session, user_uuid, limit=10):
 # ==============================================================================
 def _safe_get_gemini_text(response):
     try:
+        # 複数のアクセス方法を試す
+        if hasattr(response, 'text'):
+            return response.text
         if hasattr(response, 'candidates') and response.candidates:
-            return response.candidates[0].content.parts[0].text
-    except (IndexError, AttributeError):
-        logger.warning(f"⚠️ Gemini応答がブロックされたか、不正な形式です: {getattr(response, 'prompt_feedback', 'N/A')}")
-        return None
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content'):
+                if hasattr(candidate.content, 'parts'):
+                    return candidate.content.parts[0].text
+        
+        # ブロック理由を詳細ログ
+        if hasattr(response, 'prompt_feedback'):
+            logger.warning(f"⚠️ Gemini Prompt Feedback: {response.prompt_feedback}")
+        if hasattr(response, 'candidates') and response.candidates:
+            safety_ratings = getattr(response.candidates[0], 'safety_ratings', None)
+            if safety_ratings:
+                logger.warning(f"⚠️ Safety Ratings: {safety_ratings}")
+                
     except Exception as e:
-        logger.error(f"❌ Gemini応答の解析中に予期せぬエラー: {e}")
-        return None
+        logger.error(f"❌ Gemini応答解析エラー: {e}", exc_info=True)
+    
     return None
 
 def call_gemini(system_prompt, message, history):
@@ -660,6 +689,53 @@ def health_check():
     status_code = 200 if health_status['status'] == 'ok' else 503
     return create_json_response(health_status, status_code)
 
+@app.route('/debug/models', methods=['GET'])
+def debug_models():
+    """AIモデルとサービスの詳細状態を確認"""
+    debug_info = {
+        'timestamp': datetime.utcnow().isoformat(),
+        'models': {
+            'groq': {
+                'available': groq_client is not None,
+                'model_name': 'llama-3.1-8b-instant' if groq_client else None
+            },
+            'gemini': {
+                'available': gemini_model is not None,
+                'model_name': 'gemini-2.0-flash-exp' if gemini_model else None
+            }
+        },
+        'services': {
+            'voicevox': {
+                'enabled': global_state.voicevox_enabled,
+                'active_url': global_state.active_voicevox_url
+            },
+            'database': {
+                'ready': Session is not None,
+                'url_type': 'sqlite' if DATABASE_URL.startswith('sqlite') else 'postgres'
+            }
+        },
+        'api_keys': {
+            'groq': 'configured' if GROQ_API_KEY else 'missing',
+            'gemini': 'configured' if GEMINI_API_KEY else 'missing',
+            'weather': 'configured' if WEATHER_API_KEY else 'missing'
+        }
+    }
+    
+    # データベーステスト
+    if Session:
+        try:
+            with get_db_session() as session:
+                user_count = session.query(UserMemory).count()
+                conversation_count = session.query(ConversationHistory).count()
+                debug_info['database_stats'] = {
+                    'users': user_count,
+                    'conversations': conversation_count
+                }
+        except Exception as e:
+            debug_info['database_stats'] = {'error': str(e)}
+    
+    return create_json_response(debug_info)
+
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     try:
@@ -829,6 +905,56 @@ atexit.register(shutdown_handler)
 # ==============================================================================
 # 初期化とスケジューラー
 # ==============================================================================
+def initialize_gemini_safely():
+    """Gemini APIを安全に初期化する"""
+    try:
+        if not GEMINI_API_KEY:
+            logger.warning("⚠️ GEMINI_API_KEY未設定")
+            return None
+            
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # セーフティ設定を緩和
+        safety_settings = {
+            genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+            genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: genai.types.HarmBlockThreshold.BLOCK_NONE,
+            genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+            genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+        }
+        
+        model = genai.GenerativeModel(
+            'gemini-2.0-flash-exp',
+            safety_settings=safety_settings
+        )
+        
+        # シンプルなテスト
+        test_response = model.generate_content(
+            "こんにちは", 
+            generation_config={"max_output_tokens": 10}
+        )
+        
+        # 応答テキストの取得を試みる
+        test_text = None
+        if hasattr(test_response, 'text'):
+            test_text = test_response.text
+        elif hasattr(test_response, 'candidates') and test_response.candidates:
+            try:
+                test_text = test_response.candidates[0].content.parts[0].text
+            except (IndexError, AttributeError):
+                pass
+        
+        if test_text:
+            logger.info(f"✅ Gemini API初期化完了 (テスト応答: {test_text[:20]}...)")
+            return model
+        else:
+            logger.error("❌ Gemini APIテスト応答の取得に失敗")
+            if hasattr(test_response, 'prompt_feedback'):
+                logger.warning(f"   Prompt Feedback: {test_response.prompt_feedback}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Gemini API初期化エラー: {e}", exc_info=True)
+        return None
 def run_scheduler():
     while True:
         try: schedule.run_pending()
