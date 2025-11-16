@@ -412,7 +412,7 @@ def call_llama_advanced(system_prompt, message, history, max_tokens=800):
         messages = [{"role": "system", "content": system_prompt}]
         for h in history: messages.append({"role": h['role'], "content": h['content']})
         messages.append({"role": "user", "content": message})
-        response = groq_client.chat.completions.create(model="llama-3.1-8b-instant", messages=messages, temperature=0.8, max_tokens=max_tokens)
+        response = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, temperature=0.8, max_tokens=max_tokens)
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"❌ Llama APIエラー: {e}", exc_info=True)
@@ -902,7 +902,7 @@ def initialize_app():
     try:
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+            gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
             safety_settings = {
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -912,7 +912,7 @@ def initialize_app():
             test_response = gemini_model.generate_content("自己紹介をしてください", generation_config={"max_output_tokens": 20}, safety_settings=safety_settings)
             test_text = _safe_get_gemini_text(test_response)
             if test_text:
-                logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.5-flash, テスト応答: {test_text[:20]}...)")
+                logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.0-flash-exp, テスト応答: {test_text[:20]}...)")
             else:
                 logger.error("❌ Gemini APIテスト応答の取得に失敗。セーフティブロックの可能性あり。")
                 gemini_model = None
