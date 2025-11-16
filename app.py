@@ -1,9 +1,8 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v28.1 - Model Update)
+# もちこAI - 全機能統合版 (v28.2 - Safety Handling)
 #
-# v28.0をベースに、Gemini APIで利用するモデルを旧世代の'1.5-flash'から
-# 最新の安定版である'gemini-2.5-flash'に更新しました。
-# これにより、AIの応答性能と安定性が向上します。
+# v28.1をベースに、Gemini APIの初期化時に発生するセーフティブロックエラーに対処。
+# response.textへの直接アクセスを避け、より安全な応答取得ロジックに修正しました。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -299,7 +298,7 @@ def is_time_request(message):
     return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
-    return any(keyword in message for keyword in ['明日の天気', '天気予報'])
+    return any(keyword in message for keyword in ['今日の天気は？', '明日の天気', '天気予報'])
 
 def is_hololive_request(message):
     return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
@@ -362,8 +361,23 @@ def get_conversation_history(session, user_uuid, limit=10):
     return [{'role': h.role, 'content': h.content} for h in reversed(history_records)]
 
 # ==============================================================================
-# AIモデル呼び出し関数
+# AIモデル呼び出し関数 (v28.2: 安全な応答取得)
 # ==============================================================================
+def _safe_get_gemini_text(response):
+    """Geminiの応答から安全にテキストを取得する"""
+    try:
+        if response.candidates:
+            # 最初の候補の最初のパートのテキストを返す
+            return response.candidates[0].content.parts[0].text
+    except (IndexError, AttributeError):
+        # 応答がブロックされた場合など
+        logger.warning(f"⚠️ Gemini応答がブロックされたか、不正な形式です: {response.prompt_feedback}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Gemini応答の解析中に予期せぬエラー: {e}")
+        return None
+    return None
+
 def call_gemini(system_prompt, message, history):
     if not gemini_model: return None
     try:
@@ -371,7 +385,14 @@ def call_gemini(system_prompt, message, history):
         for h in history: full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
         full_prompt += f"\nユーザー: {message}\nもちこ:"
         response = gemini_model.generate_content(full_prompt, generation_config={"temperature": 0.8, "max_output_tokens": 300})
-        return response.text.strip()
+        
+        # 安全なテキスト取得関数を使用
+        text = _safe_get_gemini_text(response)
+        if text:
+            return text.strip()
+        else:
+            return None # 失敗した場合はNoneを返す
+            
     except Exception as e:
         logger.error(f"❌ Gemini APIエラー: {e}", exc_info=True)
         raise AIModelException(e)
@@ -824,7 +845,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("=" * 60 + "\n🔧 もちこAI v28.1 (Model Update) 初期化開始...\n" + "=" * 60)
+    logger.info("=" * 60 + "\n🔧 もちこAI v28.2 (Safety Handling) 初期化開始...\n" + "=" * 60)
     
     try:
         logger.info(f"📊 データベースURL: {DATABASE_URL[:20]}...")
@@ -847,9 +868,15 @@ def initialize_app():
     try:
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-2.5-flash') # <-- 最新安定版モデルに変更
-            test_response = gemini_model.generate_content("こんにちは", generation_config={"max_output_tokens": 10})
-            logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.5-flash, テスト応答: {test_response.text[:20]}...)")
+            gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+            #【修正】より安全なテストプロンプトと応答取得方法に変更
+            test_response = gemini_model.generate_content("自己紹介してください", generation_config={"max_output_tokens": 20})
+            test_text = _safe_get_gemini_text(test_response)
+            if test_text:
+                logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.5-flash, テスト応答: {test_text[:20]}...)")
+            else:
+                logger.error("❌ Gemini APIテスト応答の取得に失敗。セーフティブロックの可能性あり。")
+                gemini_model = None
         else: logger.warning("⚠️ GEMINI_API_KEY未設定")
     except Exception as e:
         logger.error(f"❌ Gemini API初期化エラー: {e}", exc_info=True); gemini_model = None
@@ -872,7 +899,7 @@ def initialize_app():
     except Exception as e: logger.error(f"❌ スケジューラー初期化エラー: {e}", exc_info=True)
     
     logger.info("=" * 60)
-    logger.info("✅ もちこAI v28.1 初期化完了！")
+    logger.info("✅ もちこAI v28.2 初期化完了！")
     logger.info(f"   - データベース: {'✅' if Session else '❌'}")
     logger.info(f"   - Groq API: {'✅' if groq_client else '❌'}")
     logger.info(f"   - Gemini API: {'✅' if gemini_model else '❌'}")
