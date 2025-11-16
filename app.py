@@ -1,10 +1,9 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v28.0 - Complete & Robust)
+# もちこAI - 全機能統合版 (v28.1 - Model Update)
 #
-# v27.1をベースに、以下の改善点を完全に実装しました:
-# 1. 堅牢な初期化処理 (一部機能が失敗してもサーバーは起動を継続)
-# 2. バックグラウンド会話継続機能（検索中も別の会話が可能）
-# 3. アニメ専門検索の強化（専門サイト失敗時に一般WEB検索へフォールバック）
+# v28.0をベースに、Gemini APIで利用するモデルを旧世代の'1.5-flash'から
+# 最新の安定版である'gemini-2.5-flash'に更新しました。
+# これにより、AIの応答性能と安定性が向上します。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -121,11 +120,7 @@ class GlobalState:
 
 global_state = GlobalState()
 background_executor = ThreadPoolExecutor(max_workers=5)
-
-groq_client = None
-gemini_model = None
-engine = None
-Session = None
+groq_client, gemini_model, engine, Session = None, None, None, None
 
 app = Flask(__name__)
 application = app
@@ -304,7 +299,7 @@ def is_time_request(message):
     return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
-    return any(keyword in message for keyword in ['明日の天気', '天気予報'])
+    return any(keyword in message for keyword in ['天気', 'てんき', '気温'])
 
 def is_hololive_request(message):
     return any(keyword in message for keyword in HOLOMEM_KEYWORDS)
@@ -829,7 +824,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("=" * 60 + "\n🔧 もちこAI v28.0 (Complete & Robust) 初期化開始...\n" + "=" * 60)
+    logger.info("=" * 60 + "\n🔧 もちこAI v28.1 (Model Update) 初期化開始...\n" + "=" * 60)
     
     try:
         logger.info(f"📊 データベースURL: {DATABASE_URL[:20]}...")
@@ -841,7 +836,6 @@ def initialize_app():
         logger.info("✅ データベース初期化完了")
     except Exception as e:
         logger.critical(f"🔥 データベース初期化失敗: {e}", exc_info=True)
-        logger.critical("⚠️ データベースなしで起動を試みます...")
     
     try:
         if GROQ_API_KEY:
@@ -853,9 +847,9 @@ def initialize_app():
     try:
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+            gemini_model = genai.GenerativeModel('gemini-2.5-flash') # <-- 最新安定版モデルに変更
             test_response = gemini_model.generate_content("こんにちは", generation_config={"max_output_tokens": 10})
-            logger.info(f"✅ Gemini API初期化完了 (テスト応答: {test_response.text[:20]}...)")
+            logger.info(f"✅ Gemini API初期化完了 (モデル: gemini-2.5-flash, テスト応答: {test_response.text[:20]}...)")
         else: logger.warning("⚠️ GEMINI_API_KEY未設定")
     except Exception as e:
         logger.error(f"❌ Gemini API初期化エラー: {e}", exc_info=True); gemini_model = None
@@ -878,7 +872,7 @@ def initialize_app():
     except Exception as e: logger.error(f"❌ スケジューラー初期化エラー: {e}", exc_info=True)
     
     logger.info("=" * 60)
-    logger.info("✅ もちこAI v28.0 初期化完了！")
+    logger.info("✅ もちこAI v28.1 初期化完了！")
     logger.info(f"   - データベース: {'✅' if Session else '❌'}")
     logger.info(f"   - Groq API: {'✅' if groq_client else '❌'}")
     logger.info(f"   - Gemini API: {'✅' if gemini_model else '❌'}")
@@ -892,7 +886,6 @@ try:
     initialize_app()
 except Exception as e:
     logger.critical(f"🔥 致命的な初期化エラー (グローバルスコープ): {e}", exc_info=True)
-    # サーバーを起動させないためにここで終了
     sys.exit(1)
 
 if __name__ == '__main__':
