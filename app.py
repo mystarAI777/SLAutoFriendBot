@@ -1,8 +1,8 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v28.3 - Final Polish)
+# もちこAI - 全機能統合版 (v28.3 - Syntax Fix)
 #
-# v28.2をベースに、ログ出力の安全性向上など、
-# さらなる堅牢性を高めるための最終的な改善を適用しました。
+# v28.2をベースに、最終行で発生していたSyntaxErrorを修正しました。
+# これにより、Gunicornでのアプリケーション起動が正常に行われます。
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -295,7 +295,7 @@ def get_japan_time():
     return f"今の日本の時間は、{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 
 def is_time_request(message):
-    return any(keyword in message for keyword in ['今何時', '時刻', '何時', 'なんじ'])
+    return any(keyword in message for keyword in ['今何時', '時間', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(message):
     return any(keyword in message for keyword in ['今日の天気は？', '明日の天気', '天気予報'])
@@ -837,7 +837,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("=" * 60 + "\n🔧 もちこAI v28.2 (Safety Handling) 初期化開始...\n" + "=" * 60)
+    logger.info("=" * 60 + "\n🔧 もちこAI v28.3 (Final Polish) 初期化開始...\n" + "=" * 60)
     
     try:
         logger.info(f"📊 データベースURL: {DATABASE_URL[:20]}...")
@@ -890,7 +890,7 @@ def initialize_app():
     except Exception as e: logger.error(f"❌ スケジューラー初期化エラー: {e}", exc_info=True)
     
     logger.info("=" * 60)
-    logger.info("✅ もちこAI v28.2 初期化完了！")
+    logger.info("✅ もちこAI v28.3 初期化完了！")
     logger.info(f"   - データベース: {'✅' if Session else '❌'}")
     logger.info(f"   - Groq API: {'✅' if groq_client else '❌'}")
     logger.info(f"   - Gemini API: {'✅' if gemini_model else '❌'}")
@@ -908,4 +908,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)```
+    app.run(host='0.0.0.0', port=port, debug=False)
