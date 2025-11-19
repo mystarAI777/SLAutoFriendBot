@@ -620,9 +620,13 @@ def health():
 # 初期化と起動
 # ==============================================================================
 def initialize_app():
+    """アプリケーション起動時に実行される初期化処理"""
+    logger.info("🚀 Initializing Application...")
+    
+    # 1. DB初期化
     GM.init_db()
     
-    # Voicevoxチェック
+    # 2. Voicevoxチェック
     urls = [GM.VOICEVOX_ENV_URL, 'http://127.0.0.1:50021', 'http://voicevox:50021']
     for url in urls:
         if url:
@@ -634,25 +638,34 @@ def initialize_app():
                     break
             except: pass
 
-    # スケジューラ
+    # 3. スケジューラ設定
     schedule.every(2).hours.do(HololiveManager.fetch_news)
     schedule.every(1).days.do(HololiveManager.update_wiki_db)
     
     def run_scheduler():
         while True:
-            schedule.run_pending()
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                logger.error(f"Scheduler Error: {e}")
             time.sleep(60)
     
+    # デーモンスレッドでスケジューラ開始
     threading.Thread(target=run_scheduler, daemon=True).start()
+    logger.info("✅ Initialization Complete.")
 
-# アプリ終了時の処理
+# アプリ終了時の処理（スレッドプールのクリーンアップ）
 atexit.register(lambda: GM.executor.shutdown(wait=False))
 
-# メイン実行
-if __name__ == '__main__':
+# 【重要】Gunicornでの起動時にも初期化が走るように、グローバルスコープで実行する
+try:
     initialize_app()
     # 初回データ取得を非同期でキック
     GM.executor.submit(HololiveManager.fetch_news)
-    
+except Exception as e:
+    logger.critical(f"🔥 Critical Initialization Error: {e}", exc_info=True)
+
+# ローカル開発用
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, use_reloader=False)
