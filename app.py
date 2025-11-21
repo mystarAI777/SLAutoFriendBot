@@ -1,10 +1,10 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v31.1 - Personality Restored Edition)
+# もちこAI - 全機能統合版 (v31.1 - Personality Restored & Syntax Fix)
 #
 # ベース: v31.0 (堅牢性、バグ修正、自動フォールバック、クラス構造)
-# 修正点: v29.0 (11.19版) のプロンプトエンジニアリングを移植
-#   - generate_ai_response: 詳細モードと通常モードのプロンプト分岐を復活
-#   - background_deep_search: 検索結果を構造化させるクエリ指定を復活
+# 修正点: 
+# 1. play_voice関数内の正規表現における構文エラー(SyntaxError)を修正
+# 2. v29.0 (11.19版) のプロンプトエンジニアリングを維持
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -588,7 +588,6 @@ def background_deep_search(task_id: str, query_data: Dict):
             
             with get_db_session() as session: history = get_conversation_history(session, user_data.uuid)
 
-            # === 修正: v29.0のクエリ構築ロジックを使用 ===
             enhanced_query = f"{query}について、上記の情報を元に、カテゴリー分けしたり、具体例を挙げたりして、わかりやすく詳しく教えて！"
             
             search_result_text = generate_ai_response_safe(
@@ -606,7 +605,7 @@ def background_deep_search(task_id: str, query_data: Dict):
         if task: task.result = search_result_text; task.status = 'completed'; task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# AI応答生成 (v29.0のプロンプト・性格設定を完全移植)
+# AI応答生成
 # ==============================================================================
 def generate_ai_response(
     user_data: UserData,
@@ -616,15 +615,10 @@ def generate_ai_response(
     is_detailed: bool = False,
     is_task_report: bool = False
 ) -> str:
-    """
-    AI応答を生成 (v29.0ベースの性格設定)
-    """
     with get_db_session() as session:
         personality_context = get_psychology_insight(session, user_data.uuid)
 
-    # === 修正: v29.0のプロンプト分岐ロジック ===
     if is_detailed and reference_info:
-        # 詳細モード (検索結果などがある場合)
         system_prompt = f"""あなたは「もちこ」というギャルAIです。ユーザーの「{user_data.name}」さんと話しています。
 
 # 口調ルール
@@ -643,7 +637,6 @@ def generate_ai_response(
 # 【参考情報】:
 {reference_info}"""
     else:
-        # 通常会話モード
         system_prompt = f"""あなたは「もちこ」というギャルAIです。ユーザーの「{user_data.name}」さんと話しています。
 
 # 口調ルール
@@ -661,11 +654,7 @@ def generate_ai_response(
             
         system_prompt += f"\n\n# 【参考情報】:\n{reference_info if reference_info else '特になし'}"
 
-    # AIモデル呼び出し (フォールバックロジックはv31.0を維持)
     response = None
-    
-    # 詳細モードや分析系の場合はLlama(Groq)を優先したい場合もあるが、
-    # 安定性重視でGemini -> Groqの順序は維持する
     if gemini_model:
         logger.debug("🚀 Gemini使用")
         response = call_gemini(system_prompt, message, history)
@@ -806,8 +795,8 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav
-            , filename): return Response("Invalid filename", 400)
+    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav$', filename):
+        return Response("Invalid filename", 400)
     return send_from_directory(VOICE_DIR, filename)
 
 # ==============================================================================
