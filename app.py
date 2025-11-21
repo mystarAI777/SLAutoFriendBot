@@ -1397,8 +1397,7 @@ def check_task_endpoint():
 def play_voice(filename: str):
     """音声ファイル再生"""
     # ファイル名のバリデーション（パストラバーサル対策）
-    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav
-            , filename):
+    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav$', filename):
         return Response("Invalid filename", status=400)
     
     filepath = os.path.join(VOICE_DIR, filename)
