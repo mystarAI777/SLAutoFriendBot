@@ -1,10 +1,12 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v31.1 - Personality Restored & Syntax Fix)
+# もちこAI - 全機能統合版 (v31.2 - Search Fix Edition)
 #
-# ベース: v31.0 (堅牢性、バグ修正、自動フォールバック、クラス構造)
-# 修正点: 
-# 1. play_voice関数内の正規表現における構文エラー(SyntaxError)を修正
-# 2. v29.0 (11.19版) のプロンプトエンジニアリングを維持
+# ベース: v31.1 (性格・プロンプト復元版)
+# 修正点:
+# 1. 検索機能(scrape_major_search_engines)の大幅強化
+#    - Google/Bingがブロックされる対策として、DuckDuckGo(HTML版)を優先検索に追加
+#    - 検索失敗時のログ出力を詳細化
+# 2. User-Agentリストの更新
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -70,7 +72,7 @@ SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
 SL_SAFE_CHAR_LIMIT = 250
 MIN_MESSAGES_FOR_ANALYSIS = 10
-SEARCH_TIMEOUT = 15
+SEARCH_TIMEOUT = 10  # タイムアウトを少し短めに
 VOICE_FILE_MAX_AGE_HOURS = 24
 
 # Groqで使用するモデルリスト（優先度順）
@@ -82,11 +84,13 @@ GROQ_MODELS = [
     "gemma2-9b-it"
 ]
 
+# より人間らしいUser-Agentリスト
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1'
 ]
 
 LOCATION_CODES = {
@@ -541,7 +545,7 @@ def get_weather_forecast(location: str) -> str:
         logger.error(f"天気エラー: {e}"); return "ごめん！天気情報がうまく取れなかったみたい…"
 
 # ==============================================================================
-# バックグラウンドタスク
+# バックグラウンドタスク (検索機能強化版)
 # ==============================================================================
 def background_db_correction(task_id: str, correction_data: Dict):
     result = f"「{correction_data['member_name']}」の情報修正、失敗しちゃった…。"
@@ -557,30 +561,85 @@ def background_db_correction(task_id: str, correction_data: Dict):
         if task: task.result = result; task.status = 'completed'; task.completed_at = datetime.utcnow()
 
 def scrape_major_search_engines(query: str, num_results=3) -> List[Dict]:
+    """
+    複数の検索エンジンから情報を取得する (v31.2強化版)
+    DuckDuckGo(HTML)を追加し、Google/Bingブロック時のフォールバックを強化
+    """
     engines = [
-        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&num={num_results+2}", 'sel': 'div.g', 't': 'h3', 's': 'div.VwiC3b'},
-        {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}", 'sel': 'li.b_algo', 't': 'h2', 's': 'p'}
+        # DuckDuckGo HTML (最もボットに優しい)
+        {
+            'name': 'DuckDuckGo',
+            'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+            'sel': '.result',
+            't': '.result__a',
+            's': '.result__snippet'
+        },
+        # Google (ブロックされやすいが精度が高い)
+        {
+            'name': 'Google',
+            'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&num={num_results+2}",
+            'sel': 'div.g',
+            't': 'h3',
+            's': 'div.VwiC3b'
+        },
+        # Bing (予備)
+        {
+            'name': 'Bing',
+            'url': f"https://www.bing.com/search?q={quote_plus(query)}",
+            'sel': 'li.b_algo',
+            't': 'h2',
+            's': 'p'
+        }
     ]
+
+    results = []
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
+
     for eng in engines:
         try:
-            res = requests.get(eng['url'], headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=SEARCH_TIMEOUT)
-            if res.status_code != 200: continue
+            # サーバーからのアクセスであることを隠すためヘッダーを強化
+            res = requests.get(
+                eng['url'],
+                headers=headers,
+                timeout=SEARCH_TIMEOUT
+            )
+            
+            if res.status_code != 200:
+                logger.warning(f"⚠️ {eng['name']} 検索エラー: Status {res.status_code}")
+                continue
+                
             soup = BeautifulSoup(res.content, 'html.parser')
-            results = []
+            current_results = []
+            
             for el in soup.select(eng['sel'])[:num_results]:
-                t, s = el.select_one(eng['t']), el.select_one(eng['s'])
-                if t and s: results.append({'title': clean_text(t.text), 'snippet': clean_text(s.text)})
-            if results: return results
-        except: continue
+                t_elem = el.select_one(eng['t'])
+                s_elem = el.select_one(eng['s'])
+                
+                if t_elem and s_elem:
+                    title = clean_text(t_elem.text)
+                    snippet = clean_text(s_elem.text)
+                    if title and snippet:
+                        current_results.append({'title': title, 'snippet': snippet})
+            
+            if current_results:
+                logger.info(f"✅ {eng['name']} 検索成功: {len(current_results)}件")
+                return current_results # 1つのエンジンで成功したら即リターン
+                
+        except Exception as e:
+            logger.error(f"❌ {eng['name']} 検索例外: {e}")
+            continue
+            
     return []
 
 def background_deep_search(task_id: str, query_data: Dict):
     query = query_data.get('query', '')
     user_data_dict = query_data.get('user_data', {})
-    search_result_text = f"「{query}」について調べたけど、良い情報が見つからなかったや…"
+    search_result_text = f"「{query}」について調べたけど、良い情報が見つからなかったや…ごめんね！"
 
     try:
+        # 検索実行
         results = scrape_major_search_engines(query, 5)
+        
         if results:
             formatted_info = "【検索結果】\n\n" + "\n\n".join([f"{i+1}. {r['title']}\n   {r['snippet']}" for i, r in enumerate(results)])
             
@@ -598,14 +657,17 @@ def background_deep_search(task_id: str, query_data: Dict):
                 is_detailed=True,
                 is_task_report=True
             )
-    except Exception as e: logger.error(f"検索タスクエラー: {e}")
+        else:
+            logger.warning(f"⚠️ 検索結果が0件でした: {query}")
+            
+    except Exception as e: logger.error(f"❌ 検索タスクエラー: {e}", exc_info=True)
 
     with get_db_session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task: task.result = search_result_text; task.status = 'completed'; task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# AI応答生成
+# AI応答生成 (v29.0のプロンプト・性格設定を完全移植)
 # ==============================================================================
 def generate_ai_response(
     user_data: UserData,
@@ -804,7 +866,7 @@ def play_voice(filename: str):
 # ==============================================================================
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化 (v31.1 - Personality Restored)")
+    logger.info("🔧 初期化 (v31.2 - Search Fix Edition)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
