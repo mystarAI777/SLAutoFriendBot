@@ -1,12 +1,13 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v31.2 - Search Fix Edition)
+# もちこAI - 全機能統合版 (v31.4 - Anti-Block & RSS Edition)
 #
-# ベース: v31.1 (性格・プロンプト復元版)
+# ベース: v31.3 (みこち応答統合版)
 # 修正点:
-# 1. 検索機能(scrape_major_search_engines)の大幅強化
-#    - Google/Bingがブロックされる対策として、DuckDuckGo(HTML版)を優先検索に追加
-#    - 検索失敗時のログ出力を詳細化
-# 2. User-Agentリストの更新
+# 1. GoogleニュースRSS取得機能の追加
+#    -> 「ニュース」系クエリは検索エンジンを通さずRSSを直接読む（ブロック回避）
+# 2. Wikipedia APIの実装
+#    -> 一般的な検索失敗時のバックアップとして公式APIを使用（ブロック回避）
+# 3. スクレイピング失敗時のログ強化
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -72,10 +73,9 @@ SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
 SL_SAFE_CHAR_LIMIT = 250
 MIN_MESSAGES_FOR_ANALYSIS = 10
-SEARCH_TIMEOUT = 10  # タイムアウトを少し短めに
+SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
 
-# Groqで使用するモデルリスト（優先度順）
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
@@ -84,7 +84,6 @@ GROQ_MODELS = [
     "gemma2-9b-it"
 ]
 
-# より人間らしいUser-Agentリスト
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -219,6 +218,14 @@ app = Flask(__name__)
 application = app
 app.config['JSON_AS_ASCII'] = False
 CORS(app)
+
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
+
 Base = declarative_base()
 
 # ==============================================================================
@@ -419,6 +426,15 @@ def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[D
     hist = session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
     return [{'role': h.role, 'content': h.content} for h in reversed(hist)]
 
+def get_sakuramiko_special_responses() -> Dict[str, str]:
+    return {
+        'にぇ': 'さくらみこちゃんの「にぇ」、まじかわいいよね!あの独特な口癖がエリートの証なんだって〜',
+        'エリート': 'みこちは自称エリートVTuber!でも実際は愛されポンコツキャラって感じで、それがまた魅力的なんだよね〜',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!「みこち建築」って呼ばれてるの知ってる?',
+        'FAQ': 'みこちのFAQ、実は本人が答えるんじゃなくてファンが質問するコーナーなんだよ〜面白いでしょ?',
+        'GTA': 'みこちのGTA配信、カオスで最高!警察に追われたり、変なことしたり、見てて飽きないんだよね〜'
+    }
+
 # ==============================================================================
 # ホロメン情報キャッシュ
 # ==============================================================================
@@ -545,8 +561,47 @@ def get_weather_forecast(location: str) -> str:
         logger.error(f"天気エラー: {e}"); return "ごめん！天気情報がうまく取れなかったみたい…"
 
 # ==============================================================================
-# バックグラウンドタスク (検索機能強化版)
+# バックグラウンドタスク (検索機能強化版 v31.4)
 # ==============================================================================
+def fetch_google_news_rss() -> List[Dict]:
+    """GoogleニュースRSSを直接取得してブロック回避"""
+    url = "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"
+    try:
+        res = requests.get(url, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        soup = BeautifulSoup(res.content, 'xml') # RSSはXML
+        items = []
+        for item in soup.find_all('item')[:5]:
+            title = clean_text(item.title.text) if item.title else ""
+            if title: items.append({'title': title, 'snippet': 'Google News RSS'})
+        return items
+    except Exception as e:
+        logger.error(f"RSS取得エラー: {e}")
+        return []
+
+def search_wikipedia_api(query: str) -> List[Dict]:
+    """Wikipedia APIで検索（ブロック回避）"""
+    url = "https://ja.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "format": "json",
+        "srlimit": 3
+    }
+    try:
+        res = requests.get(url, params=params, timeout=SEARCH_TIMEOUT)
+        data = res.json()
+        results = []
+        for item in data.get("query", {}).get("search", []):
+            title = item.get("title")
+            snippet = clean_text(item.get("snippet", ""))
+            results.append({'title': title, 'snippet': snippet})
+        return results
+    except Exception as e:
+        logger.error(f"Wiki APIエラー: {e}")
+        return []
+
 def background_db_correction(task_id: str, correction_data: Dict):
     result = f"「{correction_data['member_name']}」の情報修正、失敗しちゃった…。"
     with get_db_session() as session:
@@ -562,74 +617,48 @@ def background_db_correction(task_id: str, correction_data: Dict):
 
 def scrape_major_search_engines(query: str, num_results=3) -> List[Dict]:
     """
-    複数の検索エンジンから情報を取得する (v31.2強化版)
-    DuckDuckGo(HTML)を追加し、Google/Bingブロック時のフォールバックを強化
+    多層検索ロジック (v31.4)
+    1. 「ニュース」ならRSSを優先
+    2. スクレイピング（DuckDuckGo/Google/Bing）
+    3. 失敗ならWikipedia API
     """
-    engines = [
-        # DuckDuckGo HTML (最もボットに優しい)
-        {
-            'name': 'DuckDuckGo',
-            'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
-            'sel': '.result',
-            't': '.result__a',
-            's': '.result__snippet'
-        },
-        # Google (ブロックされやすいが精度が高い)
-        {
-            'name': 'Google',
-            'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&num={num_results+2}",
-            'sel': 'div.g',
-            't': 'h3',
-            's': 'div.VwiC3b'
-        },
-        # Bing (予備)
-        {
-            'name': 'Bing',
-            'url': f"https://www.bing.com/search?q={quote_plus(query)}",
-            'sel': 'li.b_algo',
-            't': 'h2',
-            's': 'p'
-        }
-    ]
+    # 1. ニュースRSS優先
+    if "ニュース" in query:
+        rss_results = fetch_google_news_rss()
+        if rss_results:
+            logger.info(f"✅ Google News RSS成功: {len(rss_results)}件")
+            return rss_results
 
-    results = []
+    # 2. スクレイピング
+    engines = [
+        {'name': 'DuckDuckGo', 'url': f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", 'sel': '.result', 't': '.result__a', 's': '.result__snippet'},
+        {'name': 'Google', 'url': f"https://www.google.com/search?q={quote_plus(query)}&hl=ja&num={num_results+2}", 'sel': 'div.g', 't': 'h3', 's': 'div.VwiC3b'},
+        {'name': 'Bing', 'url': f"https://www.bing.com/search?q={quote_plus(query)}", 'sel': 'li.b_algo', 't': 'h2', 's': 'p'}
+    ]
+    
     headers = {'User-Agent': random.choice(USER_AGENTS)}
 
     for eng in engines:
         try:
-            # サーバーからのアクセスであることを隠すためヘッダーを強化
-            res = requests.get(
-                eng['url'],
-                headers=headers,
-                timeout=SEARCH_TIMEOUT
-            )
-            
+            res = requests.get(eng['url'], headers=headers, timeout=SEARCH_TIMEOUT)
             if res.status_code != 200:
-                logger.warning(f"⚠️ {eng['name']} 検索エラー: Status {res.status_code}")
+                logger.warning(f"⚠️ {eng['name']} Status {res.status_code}")
                 continue
-                
             soup = BeautifulSoup(res.content, 'html.parser')
             current_results = []
-            
             for el in soup.select(eng['sel'])[:num_results]:
-                t_elem = el.select_one(eng['t'])
-                s_elem = el.select_one(eng['s'])
-                
-                if t_elem and s_elem:
-                    title = clean_text(t_elem.text)
-                    snippet = clean_text(s_elem.text)
-                    if title and snippet:
-                        current_results.append({'title': title, 'snippet': snippet})
-            
+                t, s = el.select_one(eng['t']), el.select_one(eng['s'])
+                if t and s:
+                    title, snippet = clean_text(t.text), clean_text(s.text)
+                    if title and snippet: current_results.append({'title': title, 'snippet': snippet})
             if current_results:
                 logger.info(f"✅ {eng['name']} 検索成功: {len(current_results)}件")
-                return current_results # 1つのエンジンで成功したら即リターン
-                
-        except Exception as e:
-            logger.error(f"❌ {eng['name']} 検索例外: {e}")
-            continue
-            
-    return []
+                return current_results
+        except Exception: continue
+
+    # 3. 最後の砦: Wikipedia API
+    logger.info("⚠️ スクレイピング全滅 -> Wikipedia API試行")
+    return search_wikipedia_api(query)
 
 def background_deep_search(task_id: str, query_data: Dict):
     query = query_data.get('query', '')
@@ -637,37 +666,24 @@ def background_deep_search(task_id: str, query_data: Dict):
     search_result_text = f"「{query}」について調べたけど、良い情報が見つからなかったや…ごめんね！"
 
     try:
-        # 検索実行
         results = scrape_major_search_engines(query, 5)
-        
         if results:
             formatted_info = "【検索結果】\n\n" + "\n\n".join([f"{i+1}. {r['title']}\n   {r['snippet']}" for i, r in enumerate(results)])
-            
             user_data = UserData(uuid=user_data_dict.get('uuid', ''), name=user_data_dict.get('name', 'Guest'), interaction_count=user_data_dict.get('interaction_count', 0))
-            
             with get_db_session() as session: history = get_conversation_history(session, user_data.uuid)
 
             enhanced_query = f"{query}について、上記の情報を元に、カテゴリー分けしたり、具体例を挙げたりして、わかりやすく詳しく教えて！"
-            
             search_result_text = generate_ai_response_safe(
-                user_data,
-                enhanced_query,
-                history,
-                reference_info=formatted_info,
-                is_detailed=True,
-                is_task_report=True
+                user_data, enhanced_query, history, reference_info=formatted_info, is_detailed=True, is_task_report=True
             )
-        else:
-            logger.warning(f"⚠️ 検索結果が0件でした: {query}")
-            
-    except Exception as e: logger.error(f"❌ 検索タスクエラー: {e}", exc_info=True)
+    except Exception as e: logger.error(f"検索タスクエラー: {e}")
 
     with get_db_session() as session:
         task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
         if task: task.result = search_result_text; task.status = 'completed'; task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# AI応答生成 (v29.0のプロンプト・性格設定を完全移植)
+# AI応答生成
 # ==============================================================================
 def generate_ai_response(
     user_data: UserData,
@@ -806,12 +822,22 @@ def chat_lsl():
             history = get_conversation_history(session, user_uuid)
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            correction = detect_db_correction_request(message)
-            if correction:
-                tid = f"db_fix_{user_uuid}_{int(time.time())}"
-                task = BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='db_correction', query=json.dumps(correction, ensure_ascii=False))
-                session.add(task); background_executor.submit(background_db_correction, tid, correction)
-                ai_text = f"まじ！？「{correction['member_name']}」の情報、直しとくね！"; is_task_started = True
+            # === さくらみこ専用応答 (復活) ===
+            if 'さくらみこ' in message or 'みこち' in message:
+                special_responses = get_sakuramiko_special_responses()
+                for keyword, response in special_responses.items():
+                    if keyword in message:
+                        ai_text = response
+                        break
+            # ================================
+
+            if not ai_text:
+                correction = detect_db_correction_request(message)
+                if correction:
+                    tid = f"db_fix_{user_uuid}_{int(time.time())}"
+                    task = BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='db_correction', query=json.dumps(correction, ensure_ascii=False))
+                    session.add(task); background_executor.submit(background_db_correction, tid, correction)
+                    ai_text = f"まじ！？「{correction['member_name']}」の情報、直しとくね！"; is_task_started = True
             
             if not ai_text:
                 if is_time_request(message): ai_text = get_japan_time()
@@ -866,7 +892,7 @@ def play_voice(filename: str):
 # ==============================================================================
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化 (v31.2 - Search Fix Edition)")
+    logger.info("🔧 初期化 (v31.4 - RSS Anti-Block)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
