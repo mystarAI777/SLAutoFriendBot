@@ -1,12 +1,10 @@
 # ==============================================================================
-# もちこAI - 全機能統合完全版 (v35.0)
+# もちこAI - 全機能統合完全版 (v35.1)
 #
-# ベース: v33.1.1 + v34.0.0
+# ベース: v35.0
 # 修正点:
-# 1. generate_ai_response_safe の引数エラーを修正 (検索結果が反映されないバグの解消)
-# 2. プロンプト修正: 検索結果がある場合は「ホロライブ縛り」を解除して報告させる
-# 3. DBモデル(NewsCache, SpecializedNews, UserPsychology)の完全実装
-# 4. 検索エンジンの総力戦ロジック(Google/Yahoo/Bing/DDG)を維持
+# 1. CRITICAL ERROR修正: 欠落していた process_holomem_in_chat 関数を復旧
+# 2. 検索結果報告時のプロンプト調整
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -445,7 +443,7 @@ def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[D
     return [{'role': h.role, 'content': h.content} for h in reversed(hist)]
 
 # ==============================================================================
-# 知識ベース管理クラス
+# 知識ベース
 # ==============================================================================
 class HololiveKnowledgeBase:
     def __init__(self):
@@ -466,23 +464,20 @@ class HololiveKnowledgeBase:
             except Exception as e: logger.error(f"Knowledge load failed: {e}")
             finally: session.close()
 
-    def refresh(self):
-        self.load_data()
+    def refresh(self): self.load_data()
 
     def normalize_query(self, text: str) -> str:
         normalized = text
         with self._lock:
             for nick, full in self.nickname_map.items():
-                if nick in text:
-                    normalized = normalized.replace(nick, f"{nick}（{full}）")
+                if nick in text: normalized = normalized.replace(nick, f"{nick}（{full}）")
         return normalized
 
     def get_context_info(self, text: str) -> str:
         context_parts = []
         with self._lock:
             for term, desc in self.glossary.items():
-                if term in text:
-                    context_parts.append(f"【用語解説: {term}】{desc}")
+                if term in text: context_parts.append(f"【用語解説: {term}】{desc}")
         return "\n".join(context_parts)
 
 knowledge_base = HololiveKnowledgeBase()
@@ -493,11 +488,9 @@ knowledge_base = HololiveKnowledgeBase()
 class HolomemKeywordManager:
     def __init__(self):
         self._lock = RLock()
-        self._keywords: Dict[str, List[str]] = {}
-        self._all_keywords: set = set()
-        self._last_loaded: Optional[datetime] = None
+        self._keywords = {}; self._all_keywords = set()
     
-    def load_from_db(self, force: bool = False) -> bool:
+    def load_from_db(self, force=False):
         with self._lock:
             try:
                 with get_db_session() as session:
@@ -513,11 +506,10 @@ class HolomemKeywordManager:
         with self._lock:
             normalized = knowledge_base.normalize_query(message)
             for keyword in self._all_keywords:
-                if keyword in normalized:
-                    return keyword
+                if keyword in normalized: return keyword
             return None
     
-    def get_member_count(self) -> int:
+    def get_member_count(self):
         with self._lock: return len(self._keywords)
 
 holomem_manager = HolomemKeywordManager()
@@ -525,15 +517,14 @@ holomem_manager = HolomemKeywordManager()
 # ==============================================================================
 # ホロメン情報キャッシュ & コンテキスト
 # ==============================================================================
-_holomem_cache: Dict[str, Dict] = {}
+_holomem_cache = {}
 _holomem_cache_lock = threading.Lock()
-_holomem_cache_ttl = timedelta(minutes=30)
-_holomem_cache_timestamps: Dict[str, datetime] = {}
+_holomem_cache_timestamps = {}
 
 def get_holomem_info_cached(member_name: str) -> Optional[Dict]:
     with _holomem_cache_lock:
         if member_name in _holomem_cache:
-            if (datetime.utcnow() - _holomem_cache_timestamps.get(member_name, datetime.min)) < _holomem_cache_ttl:
+            if (datetime.utcnow() - _holomem_cache_timestamps.get(member_name, datetime.min)) < timedelta(minutes=30):
                 return _holomem_cache[member_name]
     with get_db_session() as session:
         wiki = session.query(HolomemWiki).filter_by(member_name=member_name).first()
@@ -547,10 +538,8 @@ def get_holomem_info_cached(member_name: str) -> Optional[Dict]:
 
 def clear_holomem_cache(member_name: Optional[str] = None):
     with _holomem_cache_lock:
-        if member_name:
-            _holomem_cache.pop(member_name, None)
-        else:
-            _holomem_cache.clear()
+        if member_name: _holomem_cache.pop(member_name, None)
+        else: _holomem_cache.clear()
 
 def get_holomem_context(member_name: str) -> Optional[str]:
     info = get_holomem_info_cached(member_name)
@@ -631,7 +620,7 @@ def get_weather_forecast(location: str) -> str:
         return "天気情報がうまく取れなかったみたい…"
 
 # ==============================================================================
-# 検索機能
+# 検索機能 (マルチエンジン)
 # ==============================================================================
 def fetch_google_news_rss(query: str = "") -> List[Dict]:
     base_url = "https://news.google.com/rss"
@@ -798,14 +787,12 @@ def background_deep_search(task_id: str, query_data: Dict):
     result_text = f"「{query}」について調べたけど、見つからなかったや…ごめんね！"
     
     try:
-        # アニメ検索
         if is_anime_request(query):
             logger.info(f"🎬 Anime query detected: {query}")
             anime_result = search_anime_database(query, is_detailed=True)
             if anime_result:
                 reference_info = f"【アニメデータベース検索結果】\n{anime_result}"
         
-        # ホロメン検出
         if detected:
             logger.info(f"🎀 検索対象ホロメン: {detected}")
             ctx = get_holomem_context(detected)
@@ -813,20 +800,17 @@ def background_deep_search(task_id: str, query_data: Dict):
                 reference_info += f"\n{ctx}" if reference_info else ctx
             clean_query = f"{clean_query} ホロライブ VTuber"
         
-        # Web検索
         if not reference_info or len(reference_info) < 50:
             results = scrape_major_search_engines(clean_query, 5)
             if results:
                 web_info = "【Web検索結果】\n" + "\n".join([f"{i+1}. {r['title']}: {r['snippet']}" for i, r in enumerate(results)])
                 reference_info = f"{reference_info}\n{web_info}" if reference_info else web_info
         
-        # AI報告生成
         if reference_info:
             user_data = UserData(uuid=user_data_dict.get('uuid', ''), name=user_data_dict.get('name', 'Guest'), interaction_count=0)
             with get_db_session() as session:
                 history = get_conversation_history(session, user_data.uuid)
             
-            # ★ 修正箇所: キーワード引数で渡す
             result_text = generate_ai_response_safe(
                 user_data, query, history,
                 reference_info=reference_info,
@@ -867,6 +851,24 @@ def check_completed_tasks(user_uuid: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Check completed tasks error: {e}")
     return None
+
+# ==============================================================================
+# 復旧: 欠落していた関数
+# ==============================================================================
+def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dict]) -> Optional[str]:
+    """チャットでホロメン検出 → DB情報で応答"""
+    normalized = knowledge_base.normalize_query(message)
+    detected = holomem_manager.detect_in_message(normalized)
+    
+    if not detected: return None
+    
+    logger.info(f"🎀 ホロメン検出 (RAG): {detected}")
+    
+    if detected == 'さくらみこ':
+        for kw, resp in get_sakuramiko_special_responses().items():
+            if kw in message: return resp
+    
+    return generate_ai_response_safe(user_data, message, history)
 
 # ==============================================================================
 # 音声ファイル (VOICEVOX)
@@ -945,7 +947,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v35.0 - 完全統合版)")
+    logger.info("🔧 初期化開始 (v35.1 - CRITICAL FIX版)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1002,7 +1004,7 @@ def chat_lsl():
             history = get_conversation_history(session, user_uuid)
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            # 1. DB内ニュース検索 (ホロライブニュースの場合)
+            # 1. DB内ニュース検索
             if is_hololive_request(message) and any(kw in message for kw in ['ニュース', '最新', '情報']):
                 all_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if all_news:
@@ -1016,7 +1018,7 @@ def chat_lsl():
                     ai_text = "オッケー！ちょっとググってくるから待ってて！"
                     is_task_started = True
 
-            # 3. ホロメン応答 (DB知識)
+            # 3. ホロメン応答 (復旧した関数を使用)
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
@@ -1044,7 +1046,6 @@ def check_task_endpoint():
         user_uuid = data.get('uuid')
         completed_task = check_completed_tasks(user_uuid)
         if completed_task:
-            # タスク結果を会話履歴に保存し、レスポンスとして返す
             with get_db_session() as session:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=completed_task['result']))
             return create_json_response({'status': 'completed', 'response': f"{limit_text_for_sl(completed_task['result'])}|"})
