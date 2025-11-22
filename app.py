@@ -1,10 +1,9 @@
 # ==============================================================================
-# もちこAI - 全機能統合完全版 (v35.1)
+# もちこAI - 全機能統合完全版 (v35.2)
 #
-# ベース: v35.0
+# ベース: v35.1
 # 修正点:
-# 1. CRITICAL ERROR修正: 欠落していた process_holomem_in_chat 関数を復旧
-# 2. 検索結果報告時のプロンプト調整
+# 1. 致命的な欠落があった call_gemini 関数を復旧・実装
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -443,7 +442,7 @@ def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[D
     return [{'role': h.role, 'content': h.content} for h in reversed(hist)]
 
 # ==============================================================================
-# 知識ベース
+# 知識ベース管理クラス
 # ==============================================================================
 class HololiveKnowledgeBase:
     def __init__(self):
@@ -482,9 +481,6 @@ class HololiveKnowledgeBase:
 
 knowledge_base = HololiveKnowledgeBase()
 
-# ==============================================================================
-# ホロメンキーワード管理
-# ==============================================================================
 class HolomemKeywordManager:
     def __init__(self):
         self._lock = RLock()
@@ -517,9 +513,10 @@ holomem_manager = HolomemKeywordManager()
 # ==============================================================================
 # ホロメン情報キャッシュ & コンテキスト
 # ==============================================================================
-_holomem_cache = {}
+_holomem_cache: Dict[str, Dict] = {}
 _holomem_cache_lock = threading.Lock()
-_holomem_cache_timestamps = {}
+_holomem_cache_ttl = timedelta(minutes=30)
+_holomem_cache_timestamps: Dict[str, datetime] = {}
 
 def get_holomem_info_cached(member_name: str) -> Optional[Dict]:
     with _holomem_cache_lock:
@@ -708,7 +705,99 @@ def search_anime_database(query: str, is_detailed: bool = False) -> Optional[str
     except: return None
 
 # ==============================================================================
-# AI応答生成
+# AIモデル呼び出し
+# ==============================================================================
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# 【復活】 call_gemini 関数 (v35.1 で欠落していた部分)
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Optional[str]:
+    if not gemini_model: return None
+    try:
+        full_prompt = f"{system_prompt}\n\n【会話履歴】\n"
+        for h in history[-5:]:
+            full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
+        full_prompt += f"\nユーザー: {message}\nもちこ:"
+        
+        response = gemini_model.generate_content(
+            full_prompt, 
+            generation_config={"temperature": 0.8, "max_output_tokens": 400}
+        )
+        if hasattr(response, 'candidates') and response.candidates:
+            return response.candidates[0].content.parts[0].text.strip()
+    except Exception as e:
+        logger.warning(f"⚠️ Geminiエラー: {e}")
+    return None
+
+def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800) -> Optional[str]:
+    if not groq_client:
+        return None
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history[-5:]:
+        messages.append({"role": h['role'], "content": h['content']})
+    messages.append({"role": "user", "content": message})
+    for model in groq_model_manager.get_available_models():
+        try:
+            response = groq_client.chat.completions.create(model=model, messages=messages, temperature=0.6, max_tokens=max_tokens)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if "Rate limit" in str(e):
+                groq_model_manager.mark_limited(model, 5)
+    return None
+
+# ==============================================================================
+# フォールバック応答
+# ==============================================================================
+def generate_fallback_response(message: str, reference_info: str = "") -> str:
+    if reference_info:
+        return f"調べてきたよ！\n\n{reference_info[:500]}"
+    if is_time_request(message):
+        return get_japan_time()
+    if is_weather_request(message):
+        return get_weather_forecast(extract_location(message))
+    greetings = {
+        'こんにちは': ['やっほー！', 'こんにちは〜！元気？'],
+        'おはよう': ['おはよ〜！今日もいい天気だね！', 'おっはよ〜！'],
+        'こんばんは': ['こんばんは！今日どうだった？', 'ばんは〜！', 'こんもち～'],
+        'ありがとう': ['どういたしまして！', 'いえいえ〜！'],
+        'おやすみ': ['おやすみ〜！また明日ね！', 'いい夢見てね〜！'],
+        '疲れた': ['お疲れさま！ゆっくり休んでね！', '無理しないでね〜'],
+        '暇': ['暇なんだ〜！何か話そっか？', 'じゃあホロライブの話する？'],
+        '元気': ['元気だよ〜！あなたは？', 'まじ元気！ありがと！'],
+        '好き': ['うける！ありがと〜！', 'まじで？惚れてまうやん！'],
+        'かわいい': ['ありがと！照れるじゃん！', 'まじで？うれしー！', '当然じゃん！'],
+        'すごい': ['うける！', 'でしょ？まじうれしい！'],
+    }
+    for keyword, responses in greetings.items():
+        if keyword in message:
+            return random.choice(responses)
+    emotions = {
+        '眠': ['眠いんだ〜。早く寝たほうがいいよ！', '無理しないでね〜'],
+        '嬉': ['それは良かったね！まじ嬉しい！', 'やった〜！あてぃしも嬉しい！'],
+        '楽': ['楽しそう！何してるの？', 'いいね〜！まじ楽しそう！'],
+        '悲': ['大丈夫？何かあった？', '元気出してね…'],
+        '寂': ['寂しいの？話そうよ！', 'あてぃしがいるじゃん！'],
+        '怒': ['何があったの？聞くよ？', 'イライラするよね…わかる'],
+    }
+    for key, responses in emotions.items():
+        if key in message:
+            return random.choice(responses)
+    if '?' in message or '？' in message:
+        return random.choice([
+            "それ、気になるね！もっと教えて？",
+            "うーん、難しいけど考えてみるよ！",
+            "それについては、もうちょっと詳しく聞いてもいい？"
+        ])
+    return random.choice([
+        "うんうん、聞いてるよ！",
+        "なるほどね！",
+        "そうなんだ！面白いね！",
+        "まじで？もっと話して！",
+        "へぇ〜！それでそれで？",
+        "わかるわかる！",
+    ])
+
+# ==============================================================================
+# AI応答生成 (RAG & コンテキスト統合版)
 # ==============================================================================
 def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
     normalized_message = knowledge_base.normalize_query(message)
@@ -853,21 +942,16 @@ def check_completed_tasks(user_uuid: str) -> Optional[Dict]:
     return None
 
 # ==============================================================================
-# 復旧: 欠落していた関数
+# 復旧: 欠落していた関数 (v35.1で追加したもの)
 # ==============================================================================
 def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dict]) -> Optional[str]:
-    """チャットでホロメン検出 → DB情報で応答"""
     normalized = knowledge_base.normalize_query(message)
     detected = holomem_manager.detect_in_message(normalized)
-    
     if not detected: return None
-    
     logger.info(f"🎀 ホロメン検出 (RAG): {detected}")
-    
     if detected == 'さくらみこ':
         for kw, resp in get_sakuramiko_special_responses().items():
             if kw in message: return resp
-    
     return generate_ai_response_safe(user_data, message, history)
 
 # ==============================================================================
@@ -947,7 +1031,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v35.1 - CRITICAL FIX版)")
+    logger.info("🔧 初期化開始 (v35.2 - 完全復旧版)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1018,7 +1102,7 @@ def chat_lsl():
                     ai_text = "オッケー！ちょっとググってくるから待ってて！"
                     is_task_started = True
 
-            # 3. ホロメン応答 (復旧した関数を使用)
+            # 3. ホロメン応答
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
