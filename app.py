@@ -792,49 +792,38 @@ def chat_lsl():
         ai_text = ""
         is_task_started = False
         
-         with get_db_session() as session:
-        user_data = get_or_create_user(session, user_uuid, user_name)
-        history = get_conversation_history(session, user_uuid)
-        session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
-        
-        # ▼▼▼ 修正箇所ここから ▼▼▼
-        
-        # === 1. 検索リクエスト判定（最優先） ===
-        # ユーザーが「調べて」と言ったら、ホロメンを知っていても検索に回す
-        if is_explicit_search_request(message):
-            tid = f"search_{user_uuid}_{int(time.time())}"
-            qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
-            session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
-            background_executor.submit(background_deep_search, tid, qdata)
+        with get_db_session() as session:
+            user_data = get_or_create_user(session, user_uuid, user_name)
+            history = get_conversation_history(session, user_uuid)
+            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            # AIの一次応答
-            ai_text = "オッケー！ちょっとググってくるから待ってて！"
-            is_task_started = True
+            # === 1. 検索リクエスト判定（最優先） ===
+            # ユーザーが「調べて」と言ったら、ホロメンを知っていても検索に回す
+            if is_explicit_search_request(message):
+                tid = f"search_{user_uuid}_{int(time.time())}"
+                qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
+                session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
+                background_executor.submit(background_deep_search, tid, qdata)
+                
+                # AIの一次応答
+                ai_text = "オッケー！ちょっとググってくるから待ってて！"
+                is_task_started = True
 
-        # === 2. ホロメン検出処理（検索でない場合） ===
-        if not ai_text:
-            holomem_resp = process_holomem_in_chat(message, user_data, history)
-            if holomem_resp:
-                ai_text = holomem_resp
-                logger.info("🎀 ホロメン応答完了")
+            # === 2. ホロメン検出処理（検索でない場合） ===
+            if not ai_text:
+                holomem_resp = process_holomem_in_chat(message, user_data, history)
+                if holomem_resp:
+                    ai_text = holomem_resp
+                    logger.info("🎀 ホロメン応答完了")
             
-            # === 2. 時刻/天気 ===
+            # === 3. 時刻/天気（ホロメンでない場合） ===
             if not ai_text:
                 if is_time_request(message):
                     ai_text = get_japan_time()
                 elif is_weather_request(message):
                     ai_text = get_weather_forecast(extract_location(message))
             
-            # === 3. 検索リクエスト ===
-            if not ai_text and is_explicit_search_request(message):
-                tid = f"search_{user_uuid}_{int(time.time())}"
-                qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
-                session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
-                background_executor.submit(background_deep_search, tid, qdata)
-                ai_text = "オッケー！ちょっとググってくるから待ってて！"
-                is_task_started = True
-            
-            # === 4. 通常AI応答 ===
+            # === 4. 通常AI応答（どれにも当てはまらない場合） ===
             if not ai_text:
                 ai_text = generate_ai_response_safe(user_data, message, history)
             
@@ -872,7 +861,7 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav, filename):
+   if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav', filename):
         return Response("Invalid filename", 400)
     return send_from_directory(VOICE_DIR, filename)
 
