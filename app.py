@@ -792,17 +792,31 @@ def chat_lsl():
         ai_text = ""
         is_task_started = False
         
-        with get_db_session() as session:
-            user_data = get_or_create_user(session, user_uuid, user_name)
-            history = get_conversation_history(session, user_uuid)
-            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+         with get_db_session() as session:
+        user_data = get_or_create_user(session, user_uuid, user_name)
+        history = get_conversation_history(session, user_uuid)
+        session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+        
+        # ▼▼▼ 修正箇所ここから ▼▼▼
+        
+        # === 1. 検索リクエスト判定（最優先） ===
+        # ユーザーが「調べて」と言ったら、ホロメンを知っていても検索に回す
+        if is_explicit_search_request(message):
+            tid = f"search_{user_uuid}_{int(time.time())}"
+            qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
+            session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
+            background_executor.submit(background_deep_search, tid, qdata)
             
-            # === 1. ホロメン検出処理（最優先） ===
-            if not ai_text:
-                holomem_resp = process_holomem_in_chat(message, user_data, history)
-                if holomem_resp:
-                    ai_text = holomem_resp
-                    logger.info("🎀 ホロメン応答完了")
+            # AIの一次応答
+            ai_text = "オッケー！ちょっとググってくるから待ってて！"
+            is_task_started = True
+
+        # === 2. ホロメン検出処理（検索でない場合） ===
+        if not ai_text:
+            holomem_resp = process_holomem_in_chat(message, user_data, history)
+            if holomem_resp:
+                ai_text = holomem_resp
+                logger.info("🎀 ホロメン応答完了")
             
             # === 2. 時刻/天気 ===
             if not ai_text:
