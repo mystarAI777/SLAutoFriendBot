@@ -1,9 +1,9 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v32.1.1 - 構文エラー修正版)
+# もちこAI - 全機能統合版 (v32.1.2 - 構文エラー完全修正版)
 #
-# ベース: v32.1
+# ベース: v32.1.1
 # 修正点:
-# 1. scrape_hololive_wiki 関数内のURL文字列の閉じ忘れを修正
+# 1. 関数定義の欠落を修正 (initialize_knowledge_db)
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -336,7 +336,7 @@ def is_time_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今何時', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(msg: str) -> bool:
-    return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
+    return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報'])
 
 def is_explicit_search_request(msg: str) -> bool:
     return any(kw in msg for kw in ['調べて', '検索して', '探して', 'とは', 'って何', 'について', '教えて', 'おすすめ'])
@@ -475,7 +475,6 @@ def clear_holomem_cache(member_name: Optional[str] = None):
 # ホロメンスクレイピング & DB更新
 # ==============================================================================
 def scrape_hololive_wiki() -> List[Dict]:
-    # 修正箇所: URLの文字列を正しく閉じました
     url = "https://seesaawiki.jp/hololivetv/d/%a5%db%a5%ed%a5%e9%a5%a4%a5%d6"
     results = []
     try:
@@ -612,7 +611,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 {reference_info if reference_info else '（なし）'}
 """
     if is_task_report:
-        system_prompt += "\n\n# 指示:\n这是搜索结果的报告。请以“おまたせ！さっきの件だけど…”开头，通俗易懂地传达搜索结果。"
+        system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。「おまたせ！さっきの件だけど…」から始めて、検索結果を分かりやすく伝えてください。"
 
     response = call_gemini(system_prompt, normalized_message, history)
     if not response:
@@ -803,4 +802,229 @@ def cleanup_old_voice_files():
 # ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
-def initialize_knowl
+def initialize_knowledge_db():
+    with get_db_session() as session:
+        try:
+            if session.query(HolomemNickname).count() == 0:
+                logger.info("📥 Migrating nicknames to database...")
+                initial_nicknames = {
+                    'みこち': 'さくらみこ', 'すいちゃん': '星街すいせい', 'フブちゃん': '白上フブキ',
+                    'まつり': '夏色まつり', 'あくたん': '湊あくあ', 'スバル': '大空スバル',
+                    'おかゆ': '猫又おかゆ', 'おかゆん': '猫又おかゆ', 'ころさん': '戌神ころね',
+                    'ぺこちゃん': '兎田ぺこら', '団長': '白銀ノエル', '船長': '宝鐘マリン',
+                    'かなたん': '天音かなた', 'わため': '角巻わため', 'トワ様': '常闇トワ',
+                    'ルーナ': '姫森ルーナ', 'ラプ様': 'ラプラス・ダークネス', 'こよ': '博衣こより',
+                    'ござる': '風真いろは', 'カリ': '森カリオペ', 'ぐら': 'がうる・ぐら',
+                    'YAGOO': '谷郷元昭', 'そらちゃん': 'ときのそら', 'ちょこ先': '癒月ちょこ',
+                    'ルイ姉': '鷹嶺ルイ', '沙花叉': '沙花叉クロヱ', 'アメ': 'ワトソン・アメリア',
+                    'イナ': '一伊那尓栖', 'キアラ': '小鳥遊キアラ'
+                }
+                for nick, full in initial_nicknames.items():
+                    session.add(HolomemNickname(nickname=nick, fullname=full))
+                logger.info(f"✅ Nicknames initialized: {len(initial_nicknames)}")
+
+            if session.query(HololiveGlossary).count() == 0:
+                logger.info("📥 Migrating glossary to database...")
+                initial_glossary = {
+                    '生スバル': '大空スバルの行う雑談配信の枠名。通常夜に行われる。',
+                    'おはスバ': '大空スバルの「おはようスバル」という朝配信のこと。',
+                    'スバ友': '大空スバルのファンの愛称。',
+                    'エリート': 'さくらみこの自称。実際はポンコツな言動が多いことへの愛称。',
+                    '全ロス': 'マインクラフトなどでアイテムを全て失うこと。',
+                    'ASMR': '音フェチ配信のこと。',
+                    '野うさぎ': '兎田ぺこらのファンの愛称。',
+                    '35P': 'さくらみこのファンの愛称。「みこぴー」と読む。',
+                    '宝鐘海賊団': '宝鐘マリンのファンの総称。'
+                }
+                for term, desc in initial_glossary.items():
+                    session.add(HololiveGlossary(term=term, description=desc))
+                logger.info(f"✅ Glossary initialized: {len(initial_glossary)}")
+
+        except Exception as e:
+            logger.error(f"❌ Knowledge DB initialization failed: {e}")
+
+# ==============================================================================
+# Flask エンドポイント
+# ==============================================================================
+@app.route('/health', methods=['GET'])
+def health_check():
+    return create_json_response({'status': 'ok', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
+
+@app.route('/chat_lsl', methods=['POST'])
+def chat_lsl():
+    try:
+        data = request.json
+        if not data or 'uuid' not in data or 'message' not in data:
+            return Response("必須パラメータ不足|", 400)
+        
+        user_uuid = sanitize_user_input(data['uuid'])
+        user_name = sanitize_user_input(data.get('name', 'Guest'))
+        message = sanitize_user_input(data['message'])
+        generate_voice = data.get('voice', False)
+        
+        if not chat_rate_limiter.is_allowed(user_uuid):
+            return Response("メッセージ送りすぎ～！|", 429)
+
+        if message.strip() == "残トークン":
+            msg = f"🦁 Gemini: {'稼働中' if gemini_model else '停止中'}\n" + groq_model_manager.get_status_report()
+            msg += f"\n🎀 ホロメンDB: {holomem_manager.get_member_count()}名"
+            return Response(f"{msg}|", 200)
+
+        ai_text = ""
+        is_task_started = False
+        
+        with get_db_session() as session:
+            user_data = get_or_create_user(session, user_uuid, user_name)
+            history = get_conversation_history(session, user_uuid)
+            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            
+            if is_explicit_search_request(message):
+                tid = f"search_{user_uuid}_{int(time.time())}"
+                qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
+                session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
+                background_executor.submit(background_deep_search, tid, qdata)
+                ai_text = "オッケー！ちょっとググってくるから待ってて！"
+                is_task_started = True
+
+            if not ai_text:
+                holomem_resp = process_holomem_in_chat(message, user_data, history)
+                if holomem_resp:
+                    ai_text = holomem_resp
+                    logger.info("🎀 ホロメン応答完了")
+            
+            if not ai_text:
+                if is_time_request(message):
+                    ai_text = get_japan_time()
+                elif is_weather_request(message):
+                    ai_text = get_weather_forecast(extract_location(message))
+            
+            if not ai_text:
+                ai_text = generate_ai_response_safe(user_data, message, history)
+            
+            if not is_task_started:
+                session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+
+        res_text = limit_text_for_sl(ai_text)
+        v_url = ""
+        if generate_voice and global_state.voicevox_enabled and not is_task_started:
+            fname = generate_voice_file(res_text, user_uuid)
+            if fname: v_url = f"{SERVER_URL}/play/{fname}"
+            
+        return Response(f"{res_text}|{v_url}", mimetype='text/plain; charset=utf-8', status=200)
+    
+    except Exception as e:
+        logger.critical(f"🔥 エラー: {e}", exc_info=True)
+        return Response("システムエラー…|", 500)
+
+@app.route('/check_task', methods=['POST'])
+def check_task_endpoint():
+    try:
+        data = request.json
+        if not data or 'uuid' not in data:
+            return create_json_response({'error': 'uuid required'}, 400)
+        with get_db_session() as session:
+            task = session.query(BackgroundTask).filter(BackgroundTask.user_uuid == data['uuid'], BackgroundTask.status == 'completed').order_by(BackgroundTask.completed_at.desc()).first()
+            if task:
+                res = task.result or ""
+                session.delete(task)
+                session.add(ConversationHistory(user_uuid=data['uuid'], role='assistant', content=res))
+                return create_json_response({'status': 'completed', 'response': f"{limit_text_for_sl(res)}|"})
+        return create_json_response({'status': 'no_tasks'})
+    except:
+        return create_json_response({'error': 'internal error'}, 500)
+
+@app.route('/play/<filename>', methods=['GET'])
+def play_voice(filename: str):
+    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav', filename):
+        return Response("Invalid filename", 400)
+    return send_from_directory(VOICE_DIR, filename)
+
+# ==============================================================================
+# 管理用エンドポイント
+# ==============================================================================
+@app.route('/admin/holomem', methods=['GET'])
+def list_holomem():
+    with get_db_session() as session:
+        members = session.query(HolomemWiki).order_by(HolomemWiki.generation, HolomemWiki.member_name).all()
+        return create_json_response([{'id': m.id, 'name': m.member_name, 'generation': m.generation, 'status': m.status, 'description': m.description} for m in members])
+
+@app.route('/admin/holomem/<int:id>', methods=['PUT'])
+def update_holomem(id: int):
+    data = request.json
+    with get_db_session() as session:
+        member = session.query(HolomemWiki).get(id)
+        if member:
+            for key in ['description', 'generation', 'tags', 'status', 'mochiko_feeling', 'debut_date', 'graduation_date']:
+                if key in data:
+                    setattr(member, key, data[key])
+            clear_holomem_cache(member.member_name)
+            holomem_manager.load_from_db(force=True)
+            return create_json_response({'success': True})
+    return create_json_response({'error': 'not found'}, 404)
+
+@app.route('/admin/holomem/refresh', methods=['POST'])
+def refresh_holomem():
+    background_executor.submit(update_holomem_database)
+    return create_json_response({'message': 'DB更新タスク開始'})
+
+# ==============================================================================
+# 初期化
+# ==============================================================================
+def run_scheduler():
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+def initialize_app():
+    global engine, Session, groq_client, gemini_model
+    logger.info("🔧 初期化開始 (v32.1.2 - 構文エラー完全修正版)")
+    
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        
+        initialize_knowledge_db()
+        knowledge_base.load_data()
+        
+        logger.info("✅ DB初期化完了")
+    except Exception as e:
+        logger.critical(f"🔥 DB初期化失敗: {e}")
+    
+    try:
+        if GROQ_API_KEY:
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            logger.info("✅ Groq初期化完了")
+    except: pass
+    
+    try:
+        if GEMINI_API_KEY:
+            genai.configure(api_key=GEMINI_API_KEY)
+            gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            logger.info("✅ Gemini初期化完了")
+    except: pass
+    
+    if find_active_voicevox_url():
+        global_state.voicevox_enabled = True
+        logger.info("✅ VOICEVOX検出")
+    
+    logger.info("🎀 ホロメンシステム初期化...")
+    if holomem_manager.load_from_db():
+        logger.info(f"✅ ホロメン: {holomem_manager.get_member_count()}名ロード")
+    if holomem_manager.get_member_count() == 0:
+        logger.info("📡 DBが空のため初回収集実行")
+        background_executor.submit(update_holomem_database)
+    
+    schedule.every(6).hours.do(update_holomem_database)
+    schedule.every(1).hours.do(cleanup_old_voice_files)
+    schedule.every(6).hours.do(chat_rate_limiter.cleanup_old_entries)
+    
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    cleanup_old_voice_files()
+    
+    logger.info("🚀 初期化完了!")
+
+initialize_app()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
