@@ -1,10 +1,9 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v33.1 - 文脈判断検索実装版)
+# もちこAI - 全機能統合版 (v33.1.1 - 関数定義漏れ修正版)
 #
-# ベース: v33.0
+# ベース: v33.1
 # 修正点:
-# 1. is_explicit_search_request を改良
-#    - 単語が含まれていても、文脈（長さ・疑問形）によって検索か会話か判断する
+# 1. 欠落していた find_active_voicevox_url 関数を復旧
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -879,6 +878,37 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.completed_at = datetime.utcnow()
 
 # ==============================================================================
+# 音声ファイル (VOICEVOX)
+# ==============================================================================
+def find_active_voicevox_url() -> Optional[str]:
+    urls = [VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS
+    for url in set(u for u in urls if u):
+        try:
+            if requests.get(f"{url}/version", timeout=2).status_code == 200:
+                global_state.active_voicevox_url = url
+                return url
+        except: pass
+    return None
+
+def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
+    if not global_state.voicevox_enabled or not global_state.active_voicevox_url: return None
+    try:
+        url = global_state.active_voicevox_url
+        q = requests.post(f"{url}/audio_query", params={"text": text[:200], "speaker": VOICEVOX_SPEAKER_ID}, timeout=10).json()
+        w = requests.post(f"{url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=q, timeout=20).content
+        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.wav"
+        with open(os.path.join(VOICE_DIR, fname), 'wb') as f: f.write(w)
+        return fname
+    except: return None
+
+def cleanup_old_voice_files():
+    try:
+        cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
+        for f in glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")):
+            if os.path.getmtime(f) < cutoff: os.remove(f)
+    except: pass
+
+# ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
 def initialize_knowledge_db():
@@ -1059,7 +1089,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v33.1 - 文脈判断検索実装)")
+    logger.info("🔧 初期化開始 (v33.1.1 - 関数定義漏れ修正版)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
