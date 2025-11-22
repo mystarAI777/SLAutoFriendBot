@@ -816,14 +816,14 @@ def chat_lsl():
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
             
-            # === 3. 時刻/天気（ホロメンでない場合） ===
+            # === 3. 時刻/天気 ===
             if not ai_text:
                 if is_time_request(message):
                     ai_text = get_japan_time()
                 elif is_weather_request(message):
                     ai_text = get_weather_forecast(extract_location(message))
             
-            # === 4. 通常AI応答（どれにも当てはまらない場合） ===
+            # === 4. 通常AI応答 ===
             if not ai_text:
                 ai_text = generate_ai_response_safe(user_data, message, history)
             
@@ -861,7 +861,7 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-   if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav', filename):
+    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav', filename):
         return Response("Invalid filename", 400)
     return send_from_directory(VOICE_DIR, filename)
 
