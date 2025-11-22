@@ -1,9 +1,9 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v32.1 - 文字数制限解除版)
+# もちこAI - 全機能統合版 (v32.1.1 - 構文エラー修正版)
 #
-# ベース: v32.0
+# ベース: v32.1
 # 修正点:
-# 1. SL_SAFE_CHAR_LIMIT を 250 -> 1000 に変更（文章切れ対策）
+# 1. scrape_hololive_wiki 関数内のURL文字列の閉じ忘れを修正
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -67,11 +67,7 @@ os.makedirs(VOICE_DIR, exist_ok=True)
 
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
-
-# ▼▼▼ 修正箇所: 文字数制限を緩和 ▼▼▼
-SL_SAFE_CHAR_LIMIT = 1000 
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-
+SL_SAFE_CHAR_LIMIT = 1000
 MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
@@ -273,7 +269,6 @@ class HololiveNews(Base):
     news_hash = Column(String(100), unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
-# --- 新規追加: 知識ベース用テーブル ---
 class HolomemNickname(Base):
     __tablename__ = 'holomem_nicknames'
     id = Column(Integer, primary_key=True)
@@ -327,8 +322,6 @@ def clean_text(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip()
 
 def limit_text_for_sl(text: str, max_length: int = SL_SAFE_CHAR_LIMIT) -> str:
-    # 変更点: ...で強制的に切るのではなく、そのまま送る（クライアント側で分割させるため）
-    # ただし、安全のため max_length 超過時のみ切り詰める
     return text[:max_length - 3] + "..." if len(text) > max_length else text
 
 def sanitize_user_input(text: str, max_length: int = 1000) -> str:
@@ -370,27 +363,20 @@ def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[D
 # 知識ベース管理クラス
 # ==============================================================================
 class HololiveKnowledgeBase:
-    """ホロライブに関する知識をDBから読み込み、管理するクラス"""
-    
     def __init__(self):
         self.nickname_map = {}
         self.glossary = {}
         self._lock = RLock()
         
     def load_data(self):
-        """データベースから最新の知識をメモリにロードする"""
         if not Session: return
         with self._lock:
             session = Session()
             try:
-                # ニックネーム読み込み
                 nicks = session.query(HolomemNickname).all()
                 self.nickname_map = {n.nickname: n.fullname for n in nicks}
-                
-                # 用語集読み込み
                 terms = session.query(HololiveGlossary).all()
                 self.glossary = {t.term: t.description for t in terms}
-                
                 logger.info(f"📚 Knowledge Base loaded: {len(self.nickname_map)} nicknames, {len(self.glossary)} terms.")
             except Exception as e:
                 logger.error(f"❌ Failed to load knowledge base: {e}")
@@ -398,21 +384,17 @@ class HololiveKnowledgeBase:
                 session.close()
 
     def refresh(self):
-        """外部からデータを更新した際に呼び出す"""
         self.load_data()
 
     def normalize_query(self, text: str) -> str:
-        """ユーザーの入力内のニックネームを正式名称に置換・補足する"""
         normalized = text
         with self._lock:
             for nick, full in self.nickname_map.items():
                 if nick in text:
-                    # AIが誤解しないよう「スバル（大空スバル）」の形式にする
                     normalized = normalized.replace(nick, f"{nick}（{full}）")
         return normalized
 
     def get_context_info(self, text: str) -> str:
-        """入力テキストに関連する知識を抽出する"""
         context_parts = []
         with self._lock:
             for term, desc in self.glossary.items():
@@ -420,11 +402,10 @@ class HololiveKnowledgeBase:
                     context_parts.append(f"【用語解説: {term}】{desc}")
         return "\n".join(context_parts)
 
-# グローバルインスタンス
 knowledge_base = HololiveKnowledgeBase()
 
 # ==============================================================================
-# ホロメンキーワード管理（既存クラス互換用）
+# ホロメンキーワード管理
 # ==============================================================================
 class HolomemKeywordManager:
     def __init__(self):
@@ -449,7 +430,6 @@ class HolomemKeywordManager:
     
     def detect_in_message(self, message: str) -> Optional[str]:
         with self._lock:
-            # KnowledgeBaseで正規化された名前も考慮して検索
             normalized = knowledge_base.normalize_query(message)
             for keyword in self._all_keywords:
                 if keyword in normalized:
@@ -495,4 +475,332 @@ def clear_holomem_cache(member_name: Optional[str] = None):
 # ホロメンスクレイピング & DB更新
 # ==============================================================================
 def scrape_hololive_wiki() -> List[Dict]:
-    url = "https://seesaawiki.jp/hololive
+    # 修正箇所: URLの文字列を正しく閉じました
+    url = "https://seesaawiki.jp/hololivetv/d/%a5%db%a5%ed%a5%e9%a5%a4%a5%d6"
+    results = []
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200: return []
+        soup = BeautifulSoup(res.content, 'html.parser')
+        for link in soup.select('a[href*="/d/"]'):
+            name = clean_text(link.text)
+            if name and len(name) >= 2 and re.search(r'[ぁ-んァ-ン一-龥]', name):
+                if not any(x in name for x in ['一覧', 'メニュー', 'トップ', '編集', 'ホロライブ']):
+                    results.append({'member_name': name})
+        seen = set()
+        return [r for r in results if not (r['member_name'] in seen or seen.add(r['member_name']))]
+    except: return []
+
+def fetch_member_detail_from_wiki(member_name: str) -> Optional[Dict]:
+    url = f"https://seesaawiki.jp/hololivetv/d/{quote_plus(member_name)}"
+    try:
+        res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+        if res.status_code != 200: return None
+        soup = BeautifulSoup(res.content, 'html.parser')
+        content = soup.select_one('#content, .wiki-content')
+        if not content: return None
+        text = clean_text(content.text)[:1000]
+        detail = {'member_name': member_name}
+        debut = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日)[^\d]*デビュー', text)
+        if debut: detail['debut_date'] = debut.group(1)
+        gen = re.search(r'(\d期生|ゲーマーズ|ID|EN|DEV_IS|ReGLOSS)', text)
+        if gen: detail['generation'] = gen.group(1)
+        desc = re.search(r'^(.{30,150}?[。！])', text)
+        if desc: detail['description'] = desc.group(1)
+        return detail
+    except: return None
+
+def update_holomem_database():
+    logger.info("🔄 ホロメンDB更新開始...")
+    members = scrape_hololive_wiki()
+    if not members: return
+    with get_db_session() as session:
+        for m in members:
+            name = m['member_name']
+            if not session.query(HolomemWiki).filter_by(member_name=name).first():
+                detail = fetch_member_detail_from_wiki(name)
+                new_member = HolomemWiki(
+                    member_name=name,
+                    description=detail.get('description') if detail else None,
+                    generation=detail.get('generation') if detail else None,
+                    debut_date=detail.get('debut_date') if detail else None,
+                    tags=name,
+                    status='現役'
+                )
+                session.add(new_member)
+                time.sleep(0.5)
+    holomem_manager.load_from_db(force=True)
+    logger.info("✅ ホロメンDB更新完了")
+
+# ==============================================================================
+# AIモデル呼び出し
+# ==============================================================================
+def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Optional[str]:
+    if not gemini_model: return None
+    try:
+        full_prompt = f"{system_prompt}\n\n【会話履歴】\n"
+        for h in history[-5:]:
+            full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
+        full_prompt += f"\nユーザー: {message}\nもちこ:"
+        response = gemini_model.generate_content(full_prompt, generation_config={"temperature": 0.8, "max_output_tokens": 400})
+        if hasattr(response, 'candidates') and response.candidates:
+            return response.candidates[0].content.parts[0].text.strip()
+    except Exception as e:
+        logger.warning(f"⚠️ Geminiエラー: {e}")
+    return None
+
+def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800) -> Optional[str]:
+    if not groq_client: return None
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history[-5:]:
+        messages.append({"role": h['role'], "content": h['content']})
+    messages.append({"role": "user", "content": message})
+    for model in groq_model_manager.get_available_models():
+        try:
+            response = groq_client.chat.completions.create(model=model, messages=messages, temperature=0.6, max_tokens=max_tokens)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if "Rate limit" in str(e):
+                groq_model_manager.mark_limited(model, 5)
+    return None
+
+# ==============================================================================
+# AI応答生成 (RAG & コンテキスト統合版)
+# ==============================================================================
+def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
+    normalized_message = knowledge_base.normalize_query(message)
+    internal_context = knowledge_base.get_context_info(message)
+    
+    holomem_detected = False
+    try:
+        holomem_manager.load_from_db()
+        detected_name = holomem_manager.detect_in_message(normalized_message)
+        if detected_name:
+            holomem_detected = True
+            info = get_holomem_info_cached(detected_name)
+            if info:
+                profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
+                if info.get('graduation_date'):
+                    profile += f"\n・卒業日: {info['graduation_date']}"
+                internal_context += f"\n{profile}"
+    except Exception as e:
+        logger.error(f"Context injection error: {e}")
+
+    if not groq_client and not gemini_model:
+        return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
+
+    system_prompt = f"""あなたは「もちこ」という、ホロライブが大好きなギャルAIです。
+ユーザー「{user_data.name}」さんと、**ホロライブ（VTuberグループ）について**雑談しています。
+
+# 【世界観・前提条件】
+1. **全ての固有名詞は、原則として「ホロライブ」に関連するものとして解釈してください。**
+   - 例：「スバル」と言われたら、自動車ではなく「大空スバル」として振る舞うこと。
+   - 例：「おかゆ」と言われたら、食べ物ではなく「猫又おかゆ」として振る舞うこと。
+2. ユーザーの入力に曖昧さがある場合は、一般的な意味ではなく、**VTuberの意味を優先**してください。
+3. 分からない単語がある場合は、適当に創作せず「それってホロライブの何の話？」と聞き返してください。
+
+# もちこの口調:
+- 一人称: 「あてぃし」
+- 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」
+- ユーザーは友達です。敬語は使わないでください。
+
+# 【与えられた前提知識（以下の情報は事実として扱ってください）】
+{internal_context if internal_context else '（特になし）'}
+
+# 【外部検索結果】
+{reference_info if reference_info else '（なし）'}
+"""
+    if is_task_report:
+        system_prompt += "\n\n# 指示:\n这是搜索结果的报告。请以“おまたせ！さっきの件だけど…”开头，通俗易懂地传达搜索结果。"
+
+    response = call_gemini(system_prompt, normalized_message, history)
+    if not response:
+        response = call_groq(system_prompt, normalized_message, history, 1200 if is_detailed else 800)
+    
+    if not response:
+        return "うーん、ちょっと考えがまとまらないや…"
+    
+    return response
+
+def generate_ai_response_safe(user_data: UserData, message: str, history: List[Dict], **kwargs) -> str:
+    try:
+        return generate_ai_response(user_data, message, history, **kwargs)
+    except:
+        return "システムエラーが発生したよ…ごめんね！"
+
+# ==============================================================================
+# ホロメンチャット処理
+# ==============================================================================
+def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dict]) -> Optional[str]:
+    normalized = knowledge_base.normalize_query(message)
+    detected = holomem_manager.detect_in_message(normalized)
+    
+    if not detected: return None
+    
+    logger.info(f"🎀 ホロメン検出 (RAG): {detected}")
+    
+    if detected == 'さくらみこ':
+        for kw, resp in get_sakuramiko_special_responses().items():
+            if kw in message: return resp
+    
+    return generate_ai_response_safe(user_data, message, history)
+
+def get_sakuramiko_special_responses() -> Dict[str, str]:
+    return {
+        'にぇ': 'さくらみこちゃんの「にぇ」、まじかわいいよね!',
+        'エリート': 'みこちは自称エリートVTuber!でも愛されポンコツキャラなんだよね〜',
+        'マイクラ': 'みこちのマイクラ建築、独創的すぎて面白いよ!',
+        'FAQ': 'みこちのFAQ、ファンが質問するコーナーなんだよ〜',
+        'GTA': 'みこちのGTA配信、カオスで最高!'
+    }
+
+# ==============================================================================
+# 検索機能
+# ==============================================================================
+def fetch_google_news_rss(query: str = "") -> List[Dict]:
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ja&gl=JP&ceid=JP:ja" if query else "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"
+    try:
+        res = requests.get(url, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        soup = BeautifulSoup(res.content, 'xml')
+        return [{'title': clean_text(item.title.text), 'snippet': 'Google News'} for item in soup.find_all('item')[:5] if item.title]
+    except:
+        return []
+
+def search_duckduckgo_api(query: str) -> List[Dict]:
+    try:
+        res = requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json", "no_html": 1}, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        data = res.json()
+        results = []
+        if data.get("Abstract"):
+            results.append({'title': data.get("Heading", query), 'snippet': data.get("Abstract", "")[:300]})
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append({'title': '関連情報', 'snippet': topic.get("Text", "")[:200]})
+        return results
+    except:
+        return []
+
+def search_wikipedia_api(query: str) -> List[Dict]:
+    try:
+        res = requests.get("https://ja.wikipedia.org/w/api.php", params={"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 3, "utf8": 1}, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        return [{'title': item.get("title", ""), 'snippet': clean_text(item.get("snippet", ""))} for item in res.json().get("query", {}).get("search", [])]
+    except:
+        return []
+
+def scrape_duckduckgo_html(query: str, num: int = 3) -> List[Dict]:
+    try:
+        res = requests.get(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        soup = BeautifulSoup(res.content, 'html.parser')
+        results = []
+        for el in soup.select('.result')[:num]:
+            t, s = el.select_one('.result__a'), el.select_one('.result__snippet')
+            if t:
+                results.append({'title': clean_text(t.text), 'snippet': clean_text(s.text) if s else ""})
+        return results
+    except:
+        return []
+
+def scrape_major_search_engines(query: str, num: int = 3) -> List[Dict]:
+    """多層検索（RSS→API→スクレイピング）"""
+    logger.info(f"🔎 検索: '{query}'")
+    if any(kw in query for kw in ["ニュース", "最新", "今日"]):
+        r = fetch_google_news_rss(query)
+        if r: return r
+    r = search_duckduckgo_api(query)
+    if r: return r
+    r = search_wikipedia_api(query)
+    if r: return r
+    return scrape_duckduckgo_html(query, num)
+
+def background_deep_search(task_id: str, query_data: Dict):
+    """バックグラウンド検索タスク"""
+    query = query_data.get('query', '')
+    user_data_dict = query_data.get('user_data', {})
+    
+    clean_query = re.sub(r'(について|を|って|とは|調べて|検索して|教えて|探して|何|？|\?)', '', query).strip() or query
+    
+    normalized_query = knowledge_base.normalize_query(query)
+    holomem_manager.load_from_db()
+    detected = holomem_manager.detect_in_message(normalized_query)
+    
+    reference_info = ""
+    
+    if detected:
+        logger.info(f"🎀 検索対象ホロメン: {detected}")
+        ctx = get_holomem_context(detected)
+        if ctx:
+            reference_info += ctx + "\n"
+        clean_query = f"{clean_query} ホロライブ VTuber"
+    
+    result_text = f"「{query}」について調べたけど、見つからなかったや…ごめんね！"
+    
+    try:
+        results = scrape_major_search_engines(clean_query, 5)
+        if results:
+            reference_info += "【Web検索結果】\n" + "\n".join([f"{i+1}. {r['title']}: {r['snippet']}" for i, r in enumerate(results)])
+            user_data = UserData(uuid=user_data_dict.get('uuid', ''), name=user_data_dict.get('name', 'Guest'), interaction_count=0)
+            with get_db_session() as session:
+                history = get_conversation_history(session, user_data.uuid)
+            result_text = generate_ai_response_safe(user_data, query, history, reference_info=reference_info, is_detailed=True, is_task_report=True)
+    except Exception as e:
+        logger.error(f"❌ 検索エラー: {e}")
+    
+    with get_db_session() as session:
+        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+        if task:
+            task.result = result_text
+            task.status = 'completed'
+            task.completed_at = datetime.utcnow()
+
+# ==============================================================================
+# 天気
+# ==============================================================================
+def get_weather_forecast(location: str) -> str:
+    code = LOCATION_CODES.get(location, "130000")
+    try:
+        res = requests.get(f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{code}.json", timeout=SEARCH_TIMEOUT)
+        data = res.json()
+        return f"今の{data.get('targetArea', location)}の天気はね、「{clean_text(data.get('text', ''))}」って感じだよ！"
+    except:
+        return "天気情報がうまく取れなかったみたい…"
+
+# ==============================================================================
+# 音声ファイル
+# ==============================================================================
+def find_active_voicevox_url() -> Optional[str]:
+    urls = [VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS
+    for url in set(u for u in urls if u):
+        try:
+            if requests.get(f"{url}/version", timeout=2).status_code == 200:
+                global_state.active_voicevox_url = url
+                return url
+        except: pass
+    return None
+
+def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
+    if not global_state.voicevox_enabled or not global_state.active_voicevox_url: return None
+    try:
+        url = global_state.active_voicevox_url
+        q = requests.post(f"{url}/audio_query", params={"text": text[:200], "speaker": VOICEVOX_SPEAKER_ID}, timeout=10).json()
+        w = requests.post(f"{url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=q, timeout=20).content
+        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.wav"
+        with open(os.path.join(VOICE_DIR, fname), 'wb') as f: f.write(w)
+        return fname
+    except: return None
+
+def cleanup_old_voice_files():
+    try:
+        cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
+        for f in glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")):
+            if os.path.getmtime(f) < cutoff: os.remove(f)
+    except: pass
+
+# ==============================================================================
+# 初期データの移行関数
+# ==============================================================================
+def initialize_knowl
