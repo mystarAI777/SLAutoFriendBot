@@ -1,9 +1,10 @@
 # ==============================================================================
-# もちこAI - 全機能統合版 (v32.1.2 - 構文エラー完全修正版)
+# もちこAI - 全機能統合版 (v33.1 - 文脈判断検索実装版)
 #
-# ベース: v32.1.1
+# ベース: v33.0
 # 修正点:
-# 1. 関数定義の欠落を修正 (initialize_knowledge_db)
+# 1. is_explicit_search_request を改良
+#    - 単語が含まれていても、文脈（長さ・疑問形）によって検索か会話か判断する
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -67,7 +68,7 @@ os.makedirs(VOICE_DIR, exist_ok=True)
 
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
-SL_SAFE_CHAR_LIMIT = 1000
+SL_SAFE_CHAR_LIMIT = 600 # SLの受信限界考慮
 MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
@@ -336,10 +337,39 @@ def is_time_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今何時', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(msg: str) -> bool:
-    return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報'])
+    return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
 
 def is_explicit_search_request(msg: str) -> bool:
-    return any(kw in msg for kw in ['調べて', '検索して', '探して', 'とは', 'って何', 'について', '教えて', 'おすすめ'])
+    """
+    メッセージが検索要求かどうかを、単語と文脈から判定する
+    """
+    msg = msg.strip()
+    
+    # 1. 明確な「検索命令」動詞がある場合（最優先）
+    strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい']
+    if any(kw in msg for kw in strong_triggers):
+        return True
+
+    # 2. 「ニュース」「情報」などの名詞系トリガーの判定
+    noun_triggers = ['ニュース', 'news', 'NEWS', '情報', '日程', 'スケジュール', '天気', '予報']
+    
+    if any(kw in msg for kw in noun_triggers):
+        # (A) 文が短い場合（20文字未満）は、コマンド的な要求とみなして検索する
+        if len(msg) < 20:
+            return True
+            
+        # (B) 文末が「？」で終わる場合は、質問とみなして検索する
+        if msg.endswith('?') or msg.endswith('？'):
+            return True
+            
+        # (C) それ以外（長文で、疑問形でもない）は、ただの「会話」とみなして検索しない
+        return False
+            
+    # 3. 「おすすめ」は会話のネタ振りの可能性もあるが、検索したほうが無難
+    if 'おすすめ' in msg or 'オススメ' in msg:
+        return True
+
+    return False
 
 def extract_location(msg: str) -> str:
     for loc in LOCATION_CODES.keys():
@@ -568,15 +598,15 @@ def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens:
 # AI応答生成 (RAG & コンテキスト統合版)
 # ==============================================================================
 def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
+    """AI応答生成（RAG・コンテキスト重視版）"""
+    
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
     
-    holomem_detected = False
     try:
         holomem_manager.load_from_db()
         detected_name = holomem_manager.detect_in_message(normalized_message)
         if detected_name:
-            holomem_detected = True
             info = get_holomem_info_cached(detected_name)
             if info:
                 profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
@@ -599,6 +629,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 2. ユーザーの入力に曖昧さがある場合は、一般的な意味ではなく、**VTuberの意味を優先**してください。
 3. 分からない単語がある場合は、適当に創作せず「それってホロライブの何の話？」と聞き返してください。
 
+# 【禁止事項 (Hallucination Prevention)】
+- **知らない情報を無理やり捏造しないこと。**
+- **特に「〇〇のアニメに出ている」といった出演情報は、事実でない限り絶対に言わないこと。**
+- 検索結果（【外部検索結果】）にない情報は、「調べてみたけど分からなかった」と正直に伝えること。
+
 # もちこの口調:
 - 一人称: 「あてぃし」
 - 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」
@@ -611,7 +646,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 {reference_info if reference_info else '（なし）'}
 """
     if is_task_report:
-        system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。「おまたせ！さっきの件だけど…」から始めて、検索結果を分かりやすく伝えてください。"
+        system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。ユーザーへの報告として、【外部検索結果】の内容を分かりやすく要約して伝えてください。文字数は600文字以内に収めてください。"
 
     response = call_gemini(system_prompt, normalized_message, history)
     if not response:
@@ -620,6 +655,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
     
+    # 報告時は必ず「おまたせ」で始めるよう強制結合
+    if is_task_report:
+        response = response.replace("おまたせ！さっきの件だけど…", "").strip()
+        response = f"おまたせ！さっきの件だけど…\n{response}"
+
     return response
 
 def generate_ai_response_safe(user_data: UserData, message: str, history: List[Dict], **kwargs) -> str:
@@ -655,66 +695,149 @@ def get_sakuramiko_special_responses() -> Dict[str, str]:
     }
 
 # ==============================================================================
-# 検索機能
+# 検索機能 (マルチエンジン)
 # ==============================================================================
 def fetch_google_news_rss(query: str = "") -> List[Dict]:
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ja&gl=JP&ceid=JP:ja" if query else "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"
-    try:
-        res = requests.get(url, timeout=SEARCH_TIMEOUT)
-        if res.status_code != 200: return []
-        soup = BeautifulSoup(res.content, 'xml')
-        return [{'title': clean_text(item.title.text), 'snippet': 'Google News'} for item in soup.find_all('item')[:5] if item.title]
-    except:
-        return []
+    """Google News RSSを取得（トップニュース対応版）"""
+    base_url = "https://news.google.com/rss"
+    if query:
+        # 「ニュース」単体ならトップニュース、それ以外は検索
+        clean_query = query.replace("ニュース", "").replace("news", "").strip()
+        if clean_query:
+            url = f"{base_url}/search?q={quote_plus(clean_query)}&hl=ja&gl=JP&ceid=JP:ja"
+        else:
+            url = f"{base_url}?hl=ja&gl=JP&ceid=JP:ja"
+    else:
+        url = f"{base_url}?hl=ja&gl=JP&ceid=JP:ja"
 
-def search_duckduckgo_api(query: str) -> List[Dict]:
     try:
-        res = requests.get("https://api.duckduckgo.com/", params={"q": query, "format": "json", "no_html": 1}, timeout=SEARCH_TIMEOUT)
-        if res.status_code != 200: return []
-        data = res.json()
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'application/rss+xml, application/xml, text/xml'
+        }
+        res = requests.get(url, headers=headers, timeout=SEARCH_TIMEOUT)
+        
+        if res.status_code != 200:
+            return []
+            
+        soup = BeautifulSoup(res.content, 'xml')
+        items = soup.find_all('item')[:5]
         results = []
-        if data.get("Abstract"):
-            results.append({'title': data.get("Heading", query), 'snippet': data.get("Abstract", "")[:300]})
-        for topic in data.get("RelatedTopics", [])[:3]:
-            if isinstance(topic, dict) and topic.get("Text"):
-                results.append({'title': '関連情報', 'snippet': topic.get("Text", "")[:200]})
+        for item in items:
+            title = clean_text(item.title.text)
+            pub_date = item.pubDate.text if item.pubDate else ""
+            if title:
+                results.append({'title': title, 'snippet': f"(Google News {pub_date})"})
         return results
     except:
         return []
 
-def search_wikipedia_api(query: str) -> List[Dict]:
+def scrape_yahoo_search(query: str, num: int = 3) -> List[Dict]:
+    """Yahoo! Japan 検索"""
     try:
-        res = requests.get("https://ja.wikipedia.org/w/api.php", params={"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 3, "utf8": 1}, timeout=SEARCH_TIMEOUT)
+        url = "https://search.yahoo.co.jp/search"
+        params = {'p': query, 'ei': 'UTF-8'}
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, params=params, headers=headers, timeout=SEARCH_TIMEOUT)
         if res.status_code != 200: return []
-        return [{'title': item.get("title", ""), 'snippet': clean_text(item.get("snippet", ""))} for item in res.json().get("query", {}).get("search", [])]
-    except:
-        return []
+        
+        soup = BeautifulSoup(res.content, 'html.parser')
+        results = []
+        entries = soup.select('.sw-CardBase')
+        if not entries:
+            entries = soup.select('.Algo')
+            
+        for entry in entries[:num]:
+            title_elem = entry.find('h3')
+            desc_elem = entry.select_one('.sw-Card__summary') or entry.select_one('.Algo-summary')
+            
+            if title_elem:
+                title = clean_text(title_elem.text)
+                desc = clean_text(desc_elem.text) if desc_elem else ""
+                if title:
+                    results.append({'title': title, 'snippet': desc})
+        return results
+    except: return []
 
-def scrape_duckduckgo_html(query: str, num: int = 3) -> List[Dict]:
+def scrape_bing_search(query: str, num: int = 3) -> List[Dict]:
+    """Bing 検索"""
     try:
-        res = requests.get(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}", headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=SEARCH_TIMEOUT)
+        url = "https://www.bing.com/search"
+        params = {'q': query}
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, params=params, headers=headers, timeout=SEARCH_TIMEOUT)
+        if res.status_code != 200: return []
+        
+        soup = BeautifulSoup(res.content, 'html.parser')
+        results = []
+        entries = soup.select('li.b_algo')
+        
+        for entry in entries[:num]:
+            title_elem = entry.select_one('h2 a')
+            desc_elem = entry.select_one('.b_caption p') or entry.select_one('.b_snippet')
+            
+            if title_elem:
+                title = clean_text(title_elem.text)
+                desc = clean_text(desc_elem.text) if desc_elem else ""
+                if title:
+                    results.append({'title': title, 'snippet': desc})
+        return results
+    except: return []
+
+def scrape_duckduckgo_lite(query: str, num: int = 3) -> List[Dict]:
+    """DuckDuckGo Lite (HTML版)"""
+    try:
+        url = "https://lite.duckduckgo.com/lite/"
+        data = {'q': query}
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Referer': 'https://lite.duckduckgo.com/',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        res = requests.post(url, data=data, headers=headers, timeout=SEARCH_TIMEOUT)
         if res.status_code != 200: return []
         soup = BeautifulSoup(res.content, 'html.parser')
         results = []
-        for el in soup.select('.result')[:num]:
-            t, s = el.select_one('.result__a'), el.select_one('.result__snippet')
-            if t:
-                results.append({'title': clean_text(t.text), 'snippet': clean_text(s.text) if s else ""})
+        links = soup.select('.result-link a')
+        snippets = soup.select('.result-snippet')
+        for i in range(min(len(links), len(snippets), num)):
+            title = clean_text(links[i].text)
+            snippet = clean_text(snippets[i].text)
+            if title and snippet:
+                results.append({'title': title, 'snippet': snippet})
         return results
-    except:
-        return []
+    except: return []
 
 def scrape_major_search_engines(query: str, num: int = 3) -> List[Dict]:
-    """多層検索（RSS→API→スクレイピング）"""
-    logger.info(f"🔎 検索: '{query}'")
-    if any(kw in query for kw in ["ニュース", "最新", "今日"]):
+    """多層検索（総力戦）"""
+    logger.info(f"🔎 検索開始: '{query}'")
+    
+    # 1. ニュース系キーワードならGoogleニュースRSS (最強)
+    if any(kw in query for kw in ["ニュース", "最新", "今日", "事件", "問題", "不祥事", "情報"]):
         r = fetch_google_news_rss(query)
-        if r: return r
-    r = search_duckduckgo_api(query)
-    if r: return r
-    r = search_wikipedia_api(query)
-    if r: return r
-    return scrape_duckduckgo_html(query, num)
+        if r: 
+            logger.info(f"✅ Google News ヒット: {len(r)}件")
+            return r
+    
+    # 2. Yahoo! Japan (日本の話題に強い)
+    r = scrape_yahoo_search(query, num)
+    if r: 
+        logger.info(f"✅ Yahoo Search ヒット: {len(r)}件")
+        return r
+
+    # 3. Bing (構造がシンプルで取得しやすい)
+    r = scrape_bing_search(query, num)
+    if r: 
+        logger.info(f"✅ Bing Search ヒット: {len(r)}件")
+        return r
+
+    # 4. DuckDuckGo Lite (最後の砦)
+    r = scrape_duckduckgo_lite(query, num)
+    if r: 
+        logger.info(f"✅ DDG Lite ヒット: {len(r)}件")
+        return r
+    
+    return []
 
 def background_deep_search(task_id: str, query_data: Dict):
     """バックグラウンド検索タスク"""
@@ -728,7 +851,6 @@ def background_deep_search(task_id: str, query_data: Dict):
     detected = holomem_manager.detect_in_message(normalized_query)
     
     reference_info = ""
-    
     if detected:
         logger.info(f"🎀 検索対象ホロメン: {detected}")
         ctx = get_holomem_context(detected)
@@ -757,49 +879,6 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# 天気
-# ==============================================================================
-def get_weather_forecast(location: str) -> str:
-    code = LOCATION_CODES.get(location, "130000")
-    try:
-        res = requests.get(f"https://www.jma.go.jp/bosai/forecast/data/overview_forecast/{code}.json", timeout=SEARCH_TIMEOUT)
-        data = res.json()
-        return f"今の{data.get('targetArea', location)}の天気はね、「{clean_text(data.get('text', ''))}」って感じだよ！"
-    except:
-        return "天気情報がうまく取れなかったみたい…"
-
-# ==============================================================================
-# 音声ファイル
-# ==============================================================================
-def find_active_voicevox_url() -> Optional[str]:
-    urls = [VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS
-    for url in set(u for u in urls if u):
-        try:
-            if requests.get(f"{url}/version", timeout=2).status_code == 200:
-                global_state.active_voicevox_url = url
-                return url
-        except: pass
-    return None
-
-def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    if not global_state.voicevox_enabled or not global_state.active_voicevox_url: return None
-    try:
-        url = global_state.active_voicevox_url
-        q = requests.post(f"{url}/audio_query", params={"text": text[:200], "speaker": VOICEVOX_SPEAKER_ID}, timeout=10).json()
-        w = requests.post(f"{url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=q, timeout=20).content
-        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.wav"
-        with open(os.path.join(VOICE_DIR, fname), 'wb') as f: f.write(w)
-        return fname
-    except: return None
-
-def cleanup_old_voice_files():
-    try:
-        cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
-        for f in glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")):
-            if os.path.getmtime(f) < cutoff: os.remove(f)
-    except: pass
-
-# ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
 def initialize_knowledge_db():
@@ -817,7 +896,8 @@ def initialize_knowledge_db():
                     'ござる': '風真いろは', 'カリ': '森カリオペ', 'ぐら': 'がうる・ぐら',
                     'YAGOO': '谷郷元昭', 'そらちゃん': 'ときのそら', 'ちょこ先': '癒月ちょこ',
                     'ルイ姉': '鷹嶺ルイ', '沙花叉': '沙花叉クロヱ', 'アメ': 'ワトソン・アメリア',
-                    'イナ': '一伊那尓栖', 'キアラ': '小鳥遊キアラ'
+                    'イナ': '一伊那尓栖', 'キアラ': '小鳥遊キアラ',
+                    'ココ会長': '桐生ココ'
                 }
                 for nick, full in initial_nicknames.items():
                     session.add(HolomemNickname(nickname=nick, fullname=full))
@@ -834,7 +914,9 @@ def initialize_knowledge_db():
                     'ASMR': '音フェチ配信のこと。',
                     '野うさぎ': '兎田ぺこらのファンの愛称。',
                     '35P': 'さくらみこのファンの愛称。「みこぴー」と読む。',
-                    '宝鐘海賊団': '宝鐘マリンのファンの総称。'
+                    '宝鐘海賊団': '宝鐘マリンのファンの総称。',
+                    'kson': '元ホロライブの桐生ココの「中の人」と言われている個人勢VTuber。総長。',
+                    'VShojo': 'アメリカ発のVTuberエージェンシー。ksonなどが所属していた。'
                 }
                 for term, desc in initial_glossary.items():
                     session.add(HololiveGlossary(term=term, description=desc))
@@ -977,7 +1059,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v32.1.2 - 構文エラー完全修正版)")
+    logger.info("🔧 初期化開始 (v33.1 - 文脈判断検索実装)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
