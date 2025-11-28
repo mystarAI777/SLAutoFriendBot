@@ -1,14 +1,10 @@
 # ==============================================================================
-# もちこAI - 全機能統合完全版 (v35.0 - Corrected & Hardened)
+# もちこAI - 全機能統合完全版 (v35.1 - Bugfix Edition)
 #
 # 修正内容:
-# 1. Flaskアプリ初期化の欠落を修正
-# 2. scoped_sessionの適切なライフサイクル管理 (remove()使用)
-# 3. DBトランザクション範囲の最適化 (LLM生成中のロック回避)
-# 4. 認証のタイミング攻撃対策 (secrets.compare_digest)
-# 5. requests.Sessionのスレッドセーフ化 (threading.local)
-# 6. バックグラウンドタスクのエラーハンドリング強化
-# 7. グレースフルシャットダウンの確実な実装
+# 1. Gunicorn互換性の修正 (application = app の追加)
+# 2. ThreadPoolExecutor.shutdown() の引数エラー修正 (timeout削除)
+# 3. その他 v35.0 の機能は維持
 # ==============================================================================
 
 import sys
@@ -65,7 +61,7 @@ class Config:
         self.VOICEVOX_SPEAKER_ID = 20
         self.SL_SAFE_CHAR_LIMIT = 600
         self.SEARCH_TIMEOUT = 10
-        self.VOICE_TIMEOUT = 30  # タイムアウト延長
+        self.VOICE_TIMEOUT = 30
         self.LOG_FILE = '/tmp/mochiko.log'
 
     def _get_secret(self, name: str, default: Optional[str] = None) -> Optional[str]:
@@ -118,10 +114,13 @@ logger = logging.getLogger(__name__)
 logger.addFilter(SensitiveFilter())
 
 # ==============================================================================
-# Flask アプリ初期化 (ここが欠落していた箇所)
+# Flask アプリ初期化
 # ==============================================================================
 app = Flask(__name__)
-# CORS設定の厳格化
+# Gunicorn用にapplicationエイリアスを作成 (修正点1)
+application = app
+
+# CORS設定
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://secondlife.com", "*"]}})
 
 # ==============================================================================
@@ -185,11 +184,10 @@ class HololiveGlossary(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # ==============================================================================
-# Database Service (修正済み: remove()使用)
+# Database Service
 # ==============================================================================
 class DatabaseService:
     def __init__(self, db_url):
-        # 接続切れ対策のためのプール設定
         self.engine = create_engine(
             db_url, 
             pool_pre_ping=True, 
@@ -201,10 +199,6 @@ class DatabaseService:
 
     @contextmanager
     def get_session(self):
-        """
-        scoped_session用のコンテキストマネージャ
-        finallyブロックでremove()を呼び出し、スレッドローカルストレージをクリーンアップする
-        """
         session = self.Session()
         try:
             yield session
@@ -213,7 +207,7 @@ class DatabaseService:
             session.rollback()
             raise
         finally:
-            self.Session.remove()  # 重要: close()ではなくremove()を使用
+            self.Session.remove()
 
     def teardown(self):
         self.Session.remove()
@@ -222,7 +216,7 @@ class DatabaseService:
 db_service = DatabaseService(config.DATABASE_URL)
 
 # ==============================================================================
-# 検索 & ナレッジサービス (修正済み: Thread-safe requests)
+# 検索 & ナレッジサービス
 # ==============================================================================
 class SearchService:
     def __init__(self):
@@ -233,7 +227,6 @@ class SearchService:
 
     @property
     def session(self):
-        """スレッドローカルなRequestsセッションを取得"""
         if not hasattr(self._local, 'session'):
             self._local.session = requests.Session()
             self._local.session.headers.update({
@@ -360,7 +353,7 @@ class LLMService:
 llm_service = LLMService()
 
 # ==============================================================================
-# Voicevox Service (修正済み: タイムアウト延長)
+# Voicevox Service
 # ==============================================================================
 class VoiceService:
     def __init__(self):
@@ -382,7 +375,6 @@ class VoiceService:
         if not self.active_url: return None
         try:
             params = {"text": text[:200], "speaker": config.VOICEVOX_SPEAKER_ID}
-            # タイムアウトを延長
             q = requests.post(f"{self.active_url}/audio_query", params=params, timeout=10).json()
             wav = requests.post(f"{self.active_url}/synthesis", params={"speaker": config.VOICEVOX_SPEAKER_ID}, json=q, timeout=config.VOICE_TIMEOUT).content
             
@@ -397,7 +389,7 @@ class VoiceService:
 voice_service = VoiceService()
 
 # ==============================================================================
-# バックグラウンドタスク管理 (修正済み: エラーハンドリング強化)
+# バックグラウンドタスク管理 (修正済み: 引数エラー修正)
 # ==============================================================================
 bg_executor = ThreadPoolExecutor(max_workers=5)
 
@@ -428,7 +420,6 @@ def require_admin(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         provided = request.headers.get('X-Admin-Key', '')
-        # タイミング攻撃対策
         if not secrets.compare_digest(provided, config.ADMIN_KEY):
             logger.warning(f"Unauthorized admin access attempt from {request.remote_addr}")
             return jsonify({'error': 'Unauthorized'}), 401
@@ -479,7 +470,6 @@ def chat_lsl():
         if "調べて" in message or "検索" in message:
             task_id = str(uuid.uuid4())
             
-            # タスク登録のために一時的にDB接続
             with db_service.get_session() as session:
                 task = BackgroundTask(task_id=task_id, user_uuid=user_uuid, task_type='search', query=message)
                 session.add(task)
@@ -524,7 +514,7 @@ def check_task():
             
             if task:
                 resp = task.result or "情報が見つかりませんでした"
-                session.delete(task) # 取得したら削除
+                session.delete(task)
                 return jsonify({'status': 'completed', 'response': f"{resp[:config.SL_SAFE_CHAR_LIMIT]}|"})
         
         return jsonify({'status': 'no_tasks'})
@@ -534,7 +524,6 @@ def check_task():
 
 @app.route('/play/<filename>')
 def play_file(filename):
-    # ディレクトリトラバーサル対策は send_from_directory が行うが、念のためファイル名チェック
     if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav$', filename):
         abort(400)
     return send_from_directory(config.VOICE_DIR, filename)
@@ -553,7 +542,6 @@ def initialize_system():
     search_service.load_knowledge()
     voice_service.check_urls()
     
-    # 定期実行タスク
     schedule.every(1).hours.do(voice_service.check_urls)
     
     def run_schedule():
@@ -566,11 +554,11 @@ def initialize_system():
 
 def cleanup_system():
     logger.info("🛑 System Shutting down...")
-    bg_executor.shutdown(wait=True, timeout=10) # タイムアウト付きで待機
+    # 修正点2: timeout引数を削除
+    bg_executor.shutdown(wait=True) 
     db_service.teardown()
     logger.info("👋 Cleanup complete.")
 
-# シグナルハンドラ (グレースフルシャットダウン)
 def signal_handler(signum, frame):
     logger.info(f"Received signal {signum}, shutting down...")
     cleanup_system()
