@@ -1,11 +1,11 @@
 # ==============================================================================
-# もちこAI - v33.1.1 ベース + DB自動収集・参照機能強化版
+# もちこAI - v33.1.1 + パーソナライズ機能完全版
 #
-# ベース: v33.1.1 (ユーザー提供の安定版)
+# ベース: v33.1.1 (全機能保持)
 # 追加機能:
-# 1. ホロライブニュースの定期取得とDB保存
-# 2. ホロメン情報（現役・卒業）のDB保存
-# 3. AI回答生成時に上記DB情報を強制的に参照させるロジック
+# 1. ユーザーの好みトピック分析と話題提案
+# 2. 心理分析結果をAI応答に反映
+# 3. 会話回数に応じた関係性の深化（友達認定システム）
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -69,10 +69,15 @@ os.makedirs(VOICE_DIR, exist_ok=True)
 
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
-SL_SAFE_CHAR_LIMIT = 600 # SLの受信限界考慮
+SL_SAFE_CHAR_LIMIT = 600
 MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
+
+# ★ 新規追加: パーソナライズ設定
+FRIEND_THRESHOLD = 5  # この回数以上で友達認定
+ANALYSIS_INTERVAL = 5  # この回数ごとに心理分析を実行
+TOPIC_SUGGESTION_INTERVAL = 10  # この回数ごとに話題を提案
 
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -106,6 +111,9 @@ class UserData:
     uuid: str
     name: str
     interaction_count: int
+    is_friend: bool = False  # ★ 追加
+    favorite_topics: List[str] = field(default_factory=list)  # ★ 追加
+    psychology: Optional[Dict] = None  # ★ 追加
 
 # ==============================================================================
 # グローバル状態管理
@@ -215,6 +223,7 @@ class UserMemory(Base):
     user_uuid = Column(String(255), unique=True, nullable=False, index=True)
     user_name = Column(String(255), nullable=False)
     interaction_count = Column(Integer, default=0)
+    is_friend = Column(Boolean, default=False)  # ★ 新規追加
     last_interaction = Column(DateTime, default=datetime.utcnow)
 
 class ConversationHistory(Base):
@@ -341,35 +350,16 @@ def is_weather_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
 
 def is_explicit_search_request(msg: str) -> bool:
-    """
-    メッセージが検索要求かどうかを、単語と文脈から判定する
-    """
     msg = msg.strip()
-    
-    # 1. 明確な「検索命令」動詞がある場合（最優先）
     strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい']
     if any(kw in msg for kw in strong_triggers):
         return True
-
-    # 2. 「ニュース」「情報」などの名詞系トリガーの判定
     noun_triggers = ['ニュース', 'news', 'NEWS', '情報', '日程', 'スケジュール', '天気', '予報']
-    
     if any(kw in msg for kw in noun_triggers):
-        # (A) 文が短い場合（20文字未満）は、コマンド的な要求とみなして検索する
-        if len(msg) < 20:
-            return True
-            
-        # (B) 文末が「？」で終わる場合は、質問とみなして検索する
-        if msg.endswith('?') or msg.endswith('？'):
-            return True
-            
-        # (C) それ以外（長文で、疑問形でもない）は、ただの「会話」とみなして検索しない
+        if len(msg) < 20: return True
+        if msg.endswith('?') or msg.endswith('？'): return True
         return False
-            
-    # 3. 「おすすめ」は会話のネタ振りの可能性もあるが、検索したほうが無難
-    if 'おすすめ' in msg or 'オススメ' in msg:
-        return True
-
+    if 'おすすめ' in msg or 'オススメ' in msg: return True
     return False
 
 def extract_location(msg: str) -> str:
@@ -377,14 +367,55 @@ def extract_location(msg: str) -> str:
         if loc in msg: return loc
     return "東京"
 
+def get_weather_forecast(location: str = "東京") -> str:
+    """天気予報を取得"""
+    try:
+        location_code = LOCATION_CODES.get(location, LOCATION_CODES["東京"])
+        url = f"https://weather.tsukumijima.net/api/forecast/city/{location_code}"
+        res = requests.get(url, timeout=5)
+        if res.status_code != 200: return f"{location}の天気情報が取得できなかったよ…"
+        data = res.json()
+        today = data['forecasts'][0]
+        return f"{location}の今日の天気は「{today['telop']}」だよ！{today['detail']['weather'] if today.get('detail') else ''}"
+    except:
+        return f"{location}の天気情報が取得できなかったよ…"
+
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if user:
-        user.interaction_count += 1; user.last_interaction = datetime.utcnow()
+        user.interaction_count += 1
+        user.last_interaction = datetime.utcnow()
         if user.user_name != user_name: user.user_name = user_name
+        
+        # ★ 友達認定チェック（新機能）
+        if user.interaction_count >= FRIEND_THRESHOLD and not user.is_friend:
+            user.is_friend = True
+            logger.info(f"🎉 {user_name}さんが友達に認定されました！")
     else:
-        user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1); session.add(user)
-    return UserData(uuid=user.user_uuid, name=user.user_name, interaction_count=user.interaction_count)
+        user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
+        session.add(user)
+    
+    # ★ 心理データ取得（新機能）
+    psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+    fav_topics = []
+    psych_data = None
+    if psych:
+        if psych.favorite_topics:
+            fav_topics = [t.strip() for t in psych.favorite_topics.split(',') if t.strip()]
+        psych_data = {
+            'openness': psych.openness,
+            'extraversion': psych.extraversion,
+            'confidence': psych.analysis_confidence
+        }
+    
+    return UserData(
+        uuid=user.user_uuid,
+        name=user.user_name,
+        interaction_count=user.interaction_count,
+        is_friend=user.is_friend,
+        favorite_topics=fav_topics,
+        psychology=psych_data
+    )
 
 def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[Dict]:
     hist = session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
@@ -502,8 +533,28 @@ def clear_holomem_cache(member_name: Optional[str] = None):
         else:
             _holomem_cache.clear()
 
+def get_holomem_context(member_name: str) -> str:
+    """ホロメン情報をコンテキスト用テキストとして取得"""
+    info = get_holomem_info_cached(member_name)
+    if not info:
+        return ""
+    
+    context = f"【{info['member_name']}の情報】\n"
+    if info.get('description'):
+        context += f"- {info['description']}\n"
+    if info.get('generation'):
+        context += f"- 所属: {info['generation']}\n"
+    if info.get('debut_date'):
+        context += f"- デビュー: {info['debut_date']}\n"
+    if info.get('status'):
+        context += f"- 状態: {info['status']}\n"
+        if info['status'] == '卒業' and info.get('graduation_date'):
+            context += f"- 卒業日: {info['graduation_date']}\n"
+    
+    return context
+
 # ==============================================================================
-# ホロメンスクレイピング & DB更新 (強化版)
+# ホロメンスクレイピング & DB更新
 # ==============================================================================
 def scrape_hololive_wiki() -> List[Dict]:
     """Seesaa Wikiからホロメン情報を取得"""
@@ -540,7 +591,6 @@ def fetch_member_detail_from_wiki(member_name: str) -> Optional[Dict]:
         desc = re.search(r'^(.{30,150}?[。！])', text)
         if desc: detail['description'] = desc.group(1)
         
-        # 卒業・契約解除の判定
         if "卒業" in text or "契約解除" in text:
             detail['status'] = '卒業'
             grad = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日)[^\d]*(卒業|契約解除)', text)
@@ -556,7 +606,6 @@ def update_holomem_database():
     logger.info("🔄 ホロメンDB更新開始...")
     members = scrape_hololive_wiki()
     
-    # 重要な卒業生の手動追加（スクレイピング漏れ対策）
     graduated_members = [
         {'member_name': '桐生ココ', 'status': '卒業', 'graduation_date': '2021年7月1日'},
         {'member_name': '潤羽るしあ', 'status': '卒業', 'graduation_date': '2022年2月24日'},
@@ -572,7 +621,6 @@ def update_holomem_database():
             name = m['member_name']
             existing = session.query(HolomemWiki).filter_by(member_name=name).first()
             
-            # 新規または更新
             detail = fetch_member_detail_from_wiki(name)
             if detail:
                 status = m.get('status', detail.get('status', '現役'))
@@ -599,7 +647,7 @@ def update_holomem_database():
     logger.info("✅ ホロメンDB更新完了")
 
 # ==============================================================================
-# ホロライブニュース収集 (新規追加)
+# ホロライブニュース収集
 # ==============================================================================
 def fetch_hololive_news():
     logger.info("📰 ニュースDB更新開始...")
@@ -609,11 +657,10 @@ def fetch_hololive_news():
         if res.status_code != 200: return
         soup = BeautifulSoup(res.content, 'html.parser')
         
-        # ニュース記事の抽出（サイト構造に合わせて調整）
         articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
         
         with get_db_session() as session:
-            for art in articles[:10]: # 最新10件
+            for art in articles[:10]:
                 a_tag = art.find('a')
                 if not a_tag: continue
                 
@@ -622,17 +669,192 @@ def fetch_hololive_news():
                 title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
                 
                 if title and link:
-                    # 重複チェック
                     if not session.query(HololiveNews).filter_by(url=link).first():
                         session.add(HololiveNews(
                             title=title,
-                            content=title, # 簡易的にタイトルを入れる
+                            content=title,
                             url=link,
                             created_at=datetime.utcnow()
                         ))
         logger.info("✅ ニュースDB更新完了")
     except Exception as e:
         logger.error(f"News fetch failed: {e}")
+
+# ==============================================================================
+# ★ 新機能: トピック分析
+# ==============================================================================
+def analyze_user_topics(session, user_uuid: str) -> List[str]:
+    """会話履歴からユーザーの興味トピックを分析"""
+    try:
+        recent_messages = session.query(ConversationHistory).filter(
+            ConversationHistory.user_uuid == user_uuid,
+            ConversationHistory.role == 'user'
+        ).order_by(ConversationHistory.timestamp.desc()).limit(20).all()
+        
+        if len(recent_messages) < 5:
+            return []
+        
+        all_text = ' '.join([msg.content for msg in recent_messages])
+        keywords = []
+        
+        holomem_keywords = ['ホロライブ', 'VTuber', 'みこち', 'すいちゃん', 'ぺこら', '配信', 'ライブ']
+        for kw in holomem_keywords:
+            if kw in all_text:
+                keywords.append('ホロライブ')
+                break
+        
+        game_keywords = ['ゲーム', 'マイクラ', 'Minecraft', 'ポケモン', 'ゼルダ', 'プレイ', 'Steam']
+        for kw in game_keywords:
+            if kw in all_text:
+                keywords.append('ゲーム')
+                break
+        
+        anime_keywords = ['アニメ', '漫画', 'マンガ', '声優', '推し', 'キャラ']
+        for kw in anime_keywords:
+            if kw in all_text:
+                keywords.append('アニメ・漫画')
+                break
+        
+        music_keywords = ['音楽', '曲', '歌', 'ライブ', 'コンサート', 'アーティスト']
+        for kw in music_keywords:
+            if kw in all_text:
+                keywords.append('音楽')
+                break
+        
+        tech_keywords = ['プログラミング', 'Python', 'AI', '開発', 'コード', 'アプリ']
+        for kw in tech_keywords:
+            if kw in all_text:
+                keywords.append('技術・プログラミング')
+                break
+        
+        return list(set(keywords))
+    
+    except Exception as e:
+        logger.error(f"トピック分析エラー: {e}")
+        return []
+
+# ==============================================================================
+# ★ 新機能: 心理分析
+# ==============================================================================
+def analyze_user_psychology(session, user_uuid: str, user_name: str):
+    """会話履歴からユーザーの性格を分析"""
+    try:
+        recent_messages = session.query(ConversationHistory).filter(
+            ConversationHistory.user_uuid == user_uuid,
+            ConversationHistory.role == 'user'
+        ).order_by(ConversationHistory.timestamp.desc()).limit(15).all()
+        
+        if len(recent_messages) < MIN_MESSAGES_FOR_ANALYSIS:
+            return
+        
+        messages_text = '\n'.join([f"ユーザー: {msg.content}" for msg in reversed(recent_messages)])
+        
+        analysis_prompt = f"""以下のユーザーの発言から性格を分析してください。
+
+【分析対象の発言】
+{messages_text}
+
+【分析項目】
+1. 開放性（Openness）: 新しいことへの興味 (0-100)
+2. 外向性（Extraversion）: 社交的かどうか (0-100)
+3. 好きそうなトピック: 3つまで
+
+【出力形式】（JSON形式で出力）
+{{
+  "openness": 70,
+  "extraversion": 60,
+  "topics": ["ホロライブ", "ゲーム", "技術"]
+}}
+"""
+        
+        result = None
+        if gemini_model:
+            try:
+                response = gemini_model.generate_content(analysis_prompt)
+                if hasattr(response, 'candidates') and response.candidates:
+                    text = response.candidates[0].content.parts[0].text.strip()
+                    json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+            except Exception as e:
+                logger.warning(f"Gemini分析エラー: {e}")
+        
+        if not result and groq_client:
+            try:
+                models = groq_model_manager.get_available_models()
+                if models:
+                    response = groq_client.chat.completions.create(
+                        model=models[0],
+                        messages=[{"role": "user", "content": analysis_prompt}],
+                        temperature=0.3,
+                        max_tokens=300
+                    )
+                    text = response.choices[0].message.content.strip()
+                    json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+            except Exception as e:
+                logger.warning(f"Groq分析エラー: {e}")
+        
+        if result:
+            psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+            if not psych:
+                psych = UserPsychology(user_uuid=user_uuid, user_name=user_name)
+                session.add(psych)
+            
+            psych.openness = result.get('openness', 50)
+            psych.extraversion = result.get('extraversion', 50)
+            psych.favorite_topics = ','.join(result.get('topics', []))
+            psych.analysis_confidence = min(100, psych.analysis_confidence + 20)
+            psych.last_analyzed = datetime.utcnow()
+            
+            logger.info(f"📊 {user_name}さんの心理分析完了: 開放性={psych.openness}, 外向性={psych.extraversion}")
+    
+    except Exception as e:
+        logger.error(f"心理分析エラー: {e}")
+
+# ==============================================================================
+# ★ 新機能: 話題提案
+# ==============================================================================
+def suggest_topic(user_data: UserData) -> Optional[str]:
+    """ユーザーの好みに基づいて話題を提案"""
+    if not user_data.favorite_topics:
+        return None
+    
+    topic = random.choice(user_data.favorite_topics)
+    
+    suggestions = {
+        'ホロライブ': [
+            "そういえば、最近のホロライブの配信で気になったことある？",
+            "好きなホロメンの最近の活動、チェックしてる？",
+            "ホロライブの新しいグッズとか出てないかな？"
+        ],
+        'ゲーム': [
+            "最近何かゲームやってる？面白いのあった？",
+            "新作ゲームで気になってるのある？",
+            "あたしもゲーム好きなんだ！最近ハマってるゲームある？"
+        ],
+        'アニメ・漫画': [
+            "今期のアニメで面白いのある？",
+            "最近読んだ漫画で良かったのある？",
+            "推しキャラとかいる？"
+        ],
+        '音楽': [
+            "最近聴いてる曲ある？",
+            "好きなアーティストの新曲とか出てる？",
+            "ライブとか行く予定ある？"
+        ],
+        '技術・プログラミング': [
+            "最近何か作ってる？プログラミングとか。",
+            "新しい技術で気になってるのある？",
+            "AIとか使ってみたりしてる？"
+        ]
+    }
+    
+    if topic in suggestions:
+        return random.choice(suggestions[topic])
+    
+    return None
 
 # ==============================================================================
 # AIモデル呼び出し
@@ -667,15 +889,15 @@ def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens:
     return None
 
 # ==============================================================================
-# AI応答生成 (DB参照機能強化)
+# ★ 改良版: AI応答生成（パーソナライズ機能統合）
 # ==============================================================================
 def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
-    """AI応答生成（RAG・コンテキスト重視版）"""
+    """AI応答生成（RAG・コンテキスト・パーソナライズ統合版）"""
     
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
     
-    # 1. ホロメン情報の注入
+    # 1. ホロメン情報の注入（既存機能）
     try:
         holomem_manager.load_from_db()
         detected_name = holomem_manager.detect_in_message(normalized_message)
@@ -689,7 +911,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Context injection error: {e}")
 
-    # 2. ニュース情報の注入 (ここを追加)
+    # 2. ニュース情報の注入（既存機能）
     try:
         if "ニュース" in message or "情報" in message or "ホロライブ" in message:
             with get_db_session() as session:
@@ -703,8 +925,43 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
+    # ★ 3. 関係性に基づくコンテキスト（新機能）
+    relationship_context = ""
+    if user_data.is_friend:
+        relationship_context = f"【重要】{user_data.name}さんは、あなたの大切な友達です。親しみを込めて話してください。"
+    elif user_data.interaction_count >= 3:
+        relationship_context = f"【重要】{user_data.name}さんとは{user_data.interaction_count}回目の会話です。少しずつ打ち解けてきています。"
+    
+    # ★ 4. 心理分析に基づくトーン調整（新機能）
+    personality_context = ""
+    if user_data.psychology:
+        openness = user_data.psychology['openness']
+        extraversion = user_data.psychology['extraversion']
+        
+        if openness > 70:
+            personality_context += "このユーザーは新しいことに興味津々なタイプ。最新情報や珍しい話題を交えると喜ばれます。"
+        elif openness < 30:
+            personality_context += "このユーザーは慎重で安定志向。確実な情報を分かりやすく伝えましょう。"
+        
+        if extraversion > 70:
+            personality_context += "社交的で明るいタイプ。テンション高めに、感嘆詞を多めに使うと良いです。"
+        elif extraversion < 30:
+            personality_context += "内向的で落ち着いたタイプ。丁寧で優しいトーンを心がけましょう。"
+    
+    # ★ 5. 好みトピックの情報（新機能）
+    topics_context = ""
+    if user_data.favorite_topics:
+        topics_context = f"このユーザーは【{', '.join(user_data.favorite_topics)}】に興味があります。"
+
     system_prompt = f"""あなたは「もちこ」という、ホロライブが大好きなギャルAIです。
 ユーザー「{user_data.name}」さんと、**ホロライブ（VTuberグループ）について**雑談しています。
+
+# 【ユーザーとの関係性】
+{relationship_context}
+
+# 【ユーザーの性格・好み】
+{personality_context}
+{topics_context}
 
 # 【世界観・前提条件】
 1. **全ての固有名詞は、原則として「ホロライブ」に関連するものとして解釈してください。**
@@ -939,7 +1196,14 @@ def background_deep_search(task_id: str, query_data: Dict):
         results = scrape_major_search_engines(clean_query, 5)
         if results:
             reference_info += "【Web検索結果】\n" + "\n".join([f"{i+1}. {r['title']}: {r['snippet']}" for i, r in enumerate(results)])
-            user_data = UserData(uuid=user_data_dict.get('uuid', ''), name=user_data_dict.get('name', 'Guest'), interaction_count=0)
+            user_data = UserData(
+                uuid=user_data_dict.get('uuid', ''),
+                name=user_data_dict.get('name', 'Guest'),
+                interaction_count=user_data_dict.get('interaction_count', 0),
+                is_friend=user_data_dict.get('is_friend', False),
+                favorite_topics=user_data_dict.get('favorite_topics', []),
+                psychology=user_data_dict.get('psychology')
+            )
             with get_db_session() as session:
                 history = get_conversation_history(session, user_data.uuid)
             result_text = generate_ai_response_safe(user_data, query, history, reference_info=reference_info, is_detailed=True, is_task_report=True)
@@ -1036,7 +1300,7 @@ def initialize_knowledge_db():
 # ==============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
-    return create_json_response({'status': 'ok', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
+    return create_json_response({'status': 'ok', 'version': 'v33.1.1+personalized', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
@@ -1064,28 +1328,61 @@ def chat_lsl():
         with get_db_session() as session:
             user_data = get_or_create_user(session, user_uuid, user_name)
             history = get_conversation_history(session, user_uuid)
+            
+            # ★ 新機能: 定期的に心理分析を実行
+            if user_data.interaction_count % ANALYSIS_INTERVAL == 0 and user_data.interaction_count >= MIN_MESSAGES_FOR_ANALYSIS:
+                background_executor.submit(analyze_user_psychology, Session(), user_uuid, user_name)
+            
+            # ★ 新機能: 定期的にトピック分析を実行
+            if user_data.interaction_count % ANALYSIS_INTERVAL == 0:
+                topics = analyze_user_topics(session, user_uuid)
+                if topics:
+                    psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+                    if psych:
+                        psych.favorite_topics = ','.join(topics)
+            
+            # ★ 新機能: 話題提案（一定間隔で）
+            if user_data.interaction_count > 0 and user_data.interaction_count % TOPIC_SUGGESTION_INTERVAL == 0:
+                suggestion = suggest_topic(user_data)
+                if suggestion:
+                    ai_text = suggestion
+            
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            if is_explicit_search_request(message):
+            # 既存機能: 検索要求の判定
+            if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
-                qdata = {'query': message, 'user_data': {'uuid': user_data.uuid, 'name': user_data.name}}
+                qdata = {
+                    'query': message,
+                    'user_data': {
+                        'uuid': user_data.uuid,
+                        'name': user_data.name,
+                        'interaction_count': user_data.interaction_count,
+                        'is_friend': user_data.is_friend,
+                        'favorite_topics': user_data.favorite_topics,
+                        'psychology': user_data.psychology
+                    }
+                }
                 session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
                 background_executor.submit(background_deep_search, tid, qdata)
                 ai_text = "オッケー！ちょっとググってくるから待ってて！"
                 is_task_started = True
 
+            # 既存機能: ホロメン応答
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
             
+            # 既存機能: 時刻・天気
             if not ai_text:
                 if is_time_request(message):
                     ai_text = get_japan_time()
                 elif is_weather_request(message):
                     ai_text = get_weather_forecast(extract_location(message))
             
+            # 通常のAI応答
             if not ai_text:
                 ai_text = generate_ai_response_safe(user_data, message, history)
             
@@ -1155,6 +1452,40 @@ def refresh_holomem():
     background_executor.submit(update_holomem_database)
     return create_json_response({'message': 'DB更新タスク開始'})
 
+# ★ 新規追加: パーソナライズ管理エンドポイント
+@app.route('/admin/psychology/<user_uuid>', methods=['GET'])
+def get_user_psychology(user_uuid: str):
+    """ユーザーの心理分析データを取得"""
+    with get_db_session() as session:
+        psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        
+        if not psych or not user:
+            return create_json_response({'error': 'User not found'}, 404)
+        
+        return create_json_response({
+            'user_name': user.user_name,
+            'interaction_count': user.interaction_count,
+            'is_friend': user.is_friend,
+            'openness': psych.openness,
+            'extraversion': psych.extraversion,
+            'favorite_topics': psych.favorite_topics.split(',') if psych.favorite_topics else [],
+            'analysis_confidence': psych.analysis_confidence,
+            'last_analyzed': psych.last_analyzed.isoformat() if psych.last_analyzed else None
+        })
+
+@app.route('/admin/friends', methods=['GET'])
+def list_friends():
+    """友達リストを取得"""
+    with get_db_session() as session:
+        friends = session.query(UserMemory).filter_by(is_friend=True).order_by(UserMemory.last_interaction.desc()).all()
+        return create_json_response([{
+            'uuid': f.user_uuid,
+            'name': f.user_name,
+            'interaction_count': f.interaction_count,
+            'last_interaction': f.last_interaction.isoformat()
+        } for f in friends])
+
 # ==============================================================================
 # 初期化
 # ==============================================================================
@@ -1165,7 +1496,7 @@ def run_scheduler():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v33.1.1 ベース改)")
+    logger.info("🔧 初期化開始 (v33.1.1 + パーソナライズ完全版)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1206,9 +1537,9 @@ def initialize_app():
     # ニュース初回収集
     background_executor.submit(fetch_hololive_news)
 
-    # スケジュール設定
+    # スケジュール設定（全て保持）
     schedule.every(6).hours.do(update_holomem_database)
-    schedule.every(30).minutes.do(fetch_hololive_news) # 30分ごとにニュース更新
+    schedule.every(30).minutes.do(fetch_hololive_news)
     schedule.every(1).hours.do(cleanup_old_voice_files)
     schedule.every(6).hours.do(chat_rate_limiter.cleanup_old_entries)
     
