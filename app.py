@@ -1,11 +1,16 @@
+--- START OF FILE mochiko-ai-personalized.py ---
+
 # ==============================================================================
-# もちこAI - v33.1.1 + パーソナライズ機能完全版
+# もちこAI - v33.1.1 + パーソナライズ機能完全版 (DB自動修正パッチ適用済み)
 #
 # ベース: v33.1.1 (全機能保持)
 # 追加機能:
 # 1. ユーザーの好みトピック分析と話題提案
 # 2. 心理分析結果をAI応答に反映
 # 3. 会話回数に応じた関係性の深化（友達認定システム）
+#
+# 修正履歴:
+# - DBスキーマ不整合(is_friendカラム欠損)を自動修復する機能を追加
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -381,6 +386,8 @@ def get_weather_forecast(location: str = "東京") -> str:
         return f"{location}の天気情報が取得できなかったよ…"
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
+    # ユーザー取得または作成
+    # NOTE: ここでスキーマエラーが出る場合は、initialize_appでのマイグレーションが失敗している可能性がある
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if user:
         user.interaction_count += 1
@@ -388,9 +395,15 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
         if user.user_name != user_name: user.user_name = user_name
         
         # ★ 友達認定チェック（新機能）
-        if user.interaction_count >= FRIEND_THRESHOLD and not user.is_friend:
-            user.is_friend = True
-            logger.info(f"🎉 {user_name}さんが友達に認定されました！")
+        # NOTE: DBにis_friendカラムがないとここでエラーになるが、自動修復機能により回避されるはず
+        if hasattr(user, 'is_friend'):
+            if user.interaction_count >= FRIEND_THRESHOLD and not user.is_friend:
+                user.is_friend = True
+                logger.info(f"🎉 {user_name}さんが友達に認定されました！")
+        else:
+            # 万が一カラムがなくても動作するようにフォールバック
+            logger.warning("is_friend column missing on model access")
+            user.is_friend = False 
     else:
         user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
         session.add(user)
@@ -412,7 +425,7 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
         uuid=user.user_uuid,
         name=user.user_name,
         interaction_count=user.interaction_count,
-        is_friend=user.is_friend,
+        is_friend=getattr(user, 'is_friend', False),
         favorite_topics=fav_topics,
         psychology=psych_data
     )
@@ -1452,7 +1465,6 @@ def refresh_holomem():
     background_executor.submit(update_holomem_database)
     return create_json_response({'message': 'DB更新タスク開始'})
 
-# ★ 新規追加: パーソナライズ管理エンドポイント
 @app.route('/admin/psychology/<user_uuid>', methods=['GET'])
 def get_user_psychology(user_uuid: str):
     """ユーザーの心理分析データを取得"""
@@ -1466,7 +1478,7 @@ def get_user_psychology(user_uuid: str):
         return create_json_response({
             'user_name': user.user_name,
             'interaction_count': user.interaction_count,
-            'is_friend': user.is_friend,
+            'is_friend': getattr(user, 'is_friend', False),
             'openness': psych.openness,
             'extraversion': psych.extraversion,
             'favorite_topics': psych.favorite_topics.split(',') if psych.favorite_topics else [],
@@ -1494,6 +1506,32 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(60)
 
+def check_and_migrate_db():
+    """DBスキーマの自動修復機能 (簡易マイグレーション)"""
+    logger.info("⚙️ Checking DB schema...")
+    try:
+        with engine.connect() as conn:
+            # 既存テーブル 'user_memories' に 'is_friend' カラムがあるか確認
+            # シンプルにSELECTして失敗したらカラムがないと判断する（DBエンジンに依存しない方法）
+            try:
+                # トランザクションブロックを開始（PostgreSQLでのエラー後のロールバックのため）
+                trans = conn.begin()
+                conn.execute(text("SELECT is_friend FROM user_memories LIMIT 1"))
+                trans.commit()
+            except Exception:
+                # カラムが存在しない場合
+                if 'trans' in locals(): trans.rollback()
+                logger.info("🔄 DB Migration: 'is_friend' column missing. Adding it now...")
+                
+                # ALTER TABLE実行
+                # PostgreSQLではトランザクションが必要
+                with conn.begin() as trans2:
+                    conn.execute(text("ALTER TABLE user_memories ADD COLUMN is_friend BOOLEAN DEFAULT FALSE"))
+                logger.info("✅ Column 'is_friend' added successfully.")
+            
+    except Exception as e:
+        logger.error(f"⚠️ Migration check failed: {e}")
+
 def initialize_app():
     global engine, Session, groq_client, gemini_model
     logger.info("🔧 初期化開始 (v33.1.1 + パーソナライズ完全版)")
@@ -1501,6 +1539,10 @@ def initialize_app():
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
         Base.metadata.create_all(engine)
+        
+        # ★ ここでマイグレーションを実行
+        check_and_migrate_db()
+        
         Session = sessionmaker(bind=engine)
         
         initialize_knowledge_db()
