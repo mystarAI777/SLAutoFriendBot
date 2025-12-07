@@ -1237,21 +1237,16 @@ def find_active_voicevox_url() -> Optional[str]:
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成 (MP3形式) - 完全ブラウザ偽装版"""
+    """tts.quest APIを使用して音声を生成 (ハイブリッド版)"""
     try:
         # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
         
-        # ★★★ 修正1: 共通ヘッダー（常にブラウザとして振る舞う） ★★★
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-
         # パラメータ設定
         params = {
             "text": text,
             "speaker": 20,           # もち子さん
-            "key": "",
+            "key": "",               # 無料版は空欄
             "speedScale": 1.1,
             "pitchScale": 0.15,
             "intonationScale": 1.4
@@ -1259,9 +1254,10 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
         
         logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
         
-        # 1. 音声生成のリクエスト (★ここにも headers を追加！)
-        # タイムアウトも60秒にしておく
-        res = requests.get(api_url, params=params, headers=headers, timeout=60)
+        # 1. 音声生成のリクエスト
+        # ★修正: ここはヘッダー(User-Agent)を付けずに、素直にPythonとしてアクセスします
+        # 以前これでURL取得までは成功していたためです
+        res = requests.get(api_url, params=params, timeout=60)
         
         try:
             data = res.json()
@@ -1280,8 +1276,8 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
                 for _ in range(20): 
                     time.sleep(1)
                     try:
-                        # ★ここにも headers を追加！
-                        status_res = requests.get(status_url, headers=headers, timeout=10)
+                        # 状態確認も素直にアクセス
+                        status_res = requests.get(status_url, timeout=10)
                         status_data = status_res.json()
                         if status_data.get("isFinished", False):
                             download_url = status_data.get("mp3DownloadUrl", "")
@@ -1292,8 +1288,13 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
         if not download_url:
             logger.error(f"❌ 音声生成APIエラー: URL取得失敗 (API応答: {data})")
             return None
+
+        # ★★★ 3. ダウンロード時のみブラウザのふりをする ★★★
+        # ダウンロードサーバーはチェックが厳しいのでここで偽装します
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         
-        # 3. 音声ファイルのダウンロード (★ここにも headers を追加！)
         voice_res = requests.get(download_url, headers=headers, timeout=60)
         
         # エラーチェック
