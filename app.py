@@ -1237,36 +1237,36 @@ def find_active_voicevox_url() -> Optional[str]:
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    # ★ 修正: tts.quest APIを使用して音声を生成 (MP3形式)
+    """tts.quest APIを使用して音声を生成 (MP3形式) - User-Agent対策版"""
     try:
         # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
         
-        # パラメータ設定（もちこ用：喜び設定）
+        # パラメータ設定
         params = {
             "text": text,
             "speaker": 20,           # もち子さん
-            "key": "",               # 無料版は空欄でOK
-            "speedScale": 1.1,       # 話速: 少し早く（ウキウキ感）
-            "pitchScale": 0.15,      # 音高: 少し高く（明るさ）
-            "intonationScale": 1.4   # 抑揚: 大きく（感情豊か）
+            "key": "",
+            "speedScale": 1.1,
+            "pitchScale": 0.15,
+            "intonationScale": 1.4
         }
         
         logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
         
-        # リクエスト送信
+        # 1. 音声生成のリクエスト
         res = requests.get(api_url, params=params, timeout=30)
         data = res.json()
         
-        # ダウンロードURLの取得
+        # 2. ダウンロードURLの取得
         download_url = ""
         if data.get("success", False):
             if "mp3DownloadUrl" in data and data["mp3DownloadUrl"]:
                 download_url = data["mp3DownloadUrl"]
             elif "audioStatusUrl" in data:
-                # 生成待ちが必要な場合
+                # 待ち時間がある場合
                 status_url = data["audioStatusUrl"]
-                for _ in range(10): # 最大10秒待機
+                for _ in range(10): 
                     time.sleep(1)
                     status_res = requests.get(status_url)
                     status_data = status_res.json()
@@ -1278,17 +1278,28 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             logger.error("❌ 音声生成APIエラー: URL取得失敗")
             return None
 
-        # 音声ファイルをダウンロードして保存
-        voice_res = requests.get(download_url, timeout=30)
+        # ★★★ ここが重要！偽装ヘッダーを追加 ★★★
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         
-        # ファイル名を生成（MP3形式）
+        # 3. 音声ファイルのダウンロード（ヘッダー付きで）
+        voice_res = requests.get(download_url, headers=headers, timeout=30)
+        
+        # エラーチェック（中身がJSONテキストなら失敗とみなす）
+        content_type = voice_res.headers.get('Content-Type', '')
+        if 'application/json' in content_type or len(voice_res.content) < 100:
+            logger.error(f"❌ 音声ダウンロード拒否: {voice_res.text}")
+            return None
+            
+        # ファイル保存
         fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3"
         save_path = os.path.join(VOICE_DIR, fname)
         
         with open(save_path, 'wb') as f:
             f.write(voice_res.content)
             
-        logger.info(f"✅ 音声保存完了: {fname}")
+        logger.info(f"✅ 音声保存完了: {fname} (サイズ: {len(voice_res.content)} bytes)")
         return fname
 
     except Exception as e:
