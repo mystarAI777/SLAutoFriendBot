@@ -1237,11 +1237,16 @@ def find_active_voicevox_url() -> Optional[str]:
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成 (MP3形式) - User-Agent対策版"""
+    """tts.quest APIを使用して音声を生成 (MP3形式) - 完全ブラウザ偽装版"""
     try:
         # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
         
+        # ★★★ 修正1: 共通ヘッダー（常にブラウザとして振る舞う） ★★★
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+
         # パラメータ設定
         params = {
             "text": text,
@@ -1254,9 +1259,15 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
         
         logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
         
-        # 1. 音声生成のリクエスト
-        res = requests.get(api_url, params=params, timeout=30)
-        data = res.json()
+        # 1. 音声生成のリクエスト (★ここにも headers を追加！)
+        # タイムアウトも60秒にしておく
+        res = requests.get(api_url, params=params, headers=headers, timeout=60)
+        
+        try:
+            data = res.json()
+        except:
+            logger.error(f"❌ API応答がJSONではありません: {res.text[:100]}")
+            return None
         
         # 2. ダウンロードURLの取得
         download_url = ""
@@ -1266,30 +1277,29 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             elif "audioStatusUrl" in data:
                 # 待ち時間がある場合
                 status_url = data["audioStatusUrl"]
-                for _ in range(10): 
+                for _ in range(20): 
                     time.sleep(1)
-                    status_res = requests.get(status_url)
-                    status_data = status_res.json()
-                    if status_data.get("isFinished", False):
-                        download_url = status_data.get("mp3DownloadUrl", "")
-                        break
+                    try:
+                        # ★ここにも headers を追加！
+                        status_res = requests.get(status_url, headers=headers, timeout=10)
+                        status_data = status_res.json()
+                        if status_data.get("isFinished", False):
+                            download_url = status_data.get("mp3DownloadUrl", "")
+                            break
+                    except:
+                        continue
         
         if not download_url:
-            logger.error("❌ 音声生成APIエラー: URL取得失敗")
+            logger.error(f"❌ 音声生成APIエラー: URL取得失敗 (API応答: {data})")
             return None
-
-        # ★★★ ここが重要！偽装ヘッダーを追加 ★★★
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
         
-        # 3. 音声ファイルのダウンロード（ヘッダー付きで）
-        voice_res = requests.get(download_url, headers=headers, timeout=30)
+        # 3. 音声ファイルのダウンロード (★ここにも headers を追加！)
+        voice_res = requests.get(download_url, headers=headers, timeout=60)
         
-        # エラーチェック（中身がJSONテキストなら失敗とみなす）
+        # エラーチェック
         content_type = voice_res.headers.get('Content-Type', '')
         if 'application/json' in content_type or len(voice_res.content) < 100:
-            logger.error(f"❌ 音声ダウンロード拒否: {voice_res.text}")
+            logger.error(f"❌ 音声ダウンロード拒否または失敗: {voice_res.text}")
             return None
             
         # ファイル保存
