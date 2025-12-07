@@ -1229,36 +1229,94 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# 音声ファイル (VOICEVOX)
+# 音声ファイル (VOICEVOX - tts.quest API版)
 # ==============================================================================
 def find_active_voicevox_url() -> Optional[str]:
-    urls = [VOICEVOX_URL_FROM_ENV] + VOICEVOX_URLS
-    for url in set(u for u in urls if u):
-        try:
-            if requests.get(f"{url}/version", timeout=2).status_code == 200:
-                global_state.active_voicevox_url = url
-                return url
-        except: pass
-    return None
+    # tts.questを使うので、この関数はダミーとしてTrueを返すようにします
+    global_state.voicevox_enabled = True
+    return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    if not global_state.voicevox_enabled or not global_state.active_voicevox_url: return None
+    """tts.quest APIを使用して音声を生成"""
     try:
-        url = global_state.active_voicevox_url
-        q = requests.post(f"{url}/audio_query", params={"text": text[:200], "speaker": VOICEVOX_SPEAKER_ID}, timeout=10).json()
-        w = requests.post(f"{url}/synthesis", params={"speaker": VOICEVOX_SPEAKER_ID}, json=q, timeout=20).content
-        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.wav"
-        with open(os.path.join(VOICE_DIR, fname), 'wb') as f: f.write(w)
-        return fname
-    except: return None
+        # APIのエンドポイント
+        api_url = "https://api.tts.quest/v3/voicevox/synthesis"
+        
+        # パラメータ設定（もちこ用：喜び設定）
+        params = {
+            "text": text,
+            "speaker": 20,           # もち子さん
+            "key": "",               # 無料版は空欄でOK
+            "speedScale": 1.1,       # 話速: 少し早く（ウキウキ感）
+            "pitchScale": 0.15,      # 音高: 少し高く（明るさ）
+            "intonationScale": 1.4   # 抑揚: 大きく（感情豊か）
+        }
+        
+        logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
+        
+        # リクエスト送信
+        res = requests.get(api_url, params=params, timeout=30)
+        data = res.json()
+        
+        # ダウンロードURLの取得
+        download_url = ""
+        if data.get("success", False):
+            if "mp3DownloadUrl" in data and data["mp3DownloadUrl"]:
+                download_url = data["mp3DownloadUrl"]
+            elif "audioStatusUrl" in data:
+                # 生成待ちが必要な場合
+                status_url = data["audioStatusUrl"]
+                for _ in range(10): # 最大10秒待機
+                    time.sleep(1)
+                    status_res = requests.get(status_url)
+                    status_data = status_res.json()
+                    if status_data.get("isFinished", False):
+                        download_url = status_data.get("mp3DownloadUrl", "")
+                        break
+        
+        if not download_url:
+            logger.error("❌ 音声生成APIエラー: URL取得失敗")
+            return None
 
+        # 音声ファイルをダウンロードして保存
+        voice_res = requests.get(download_url, timeout=30)
+        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3" # MP3になります
+        save_path = os.path.join(VOICE_DIR, fname)
+        
+        with open(save_path, 'wb') as f:
+            f.write(voice_res.content)
+            
+        logger.info(f"✅ 音声保存完了: {fname}")
+        return fname
+
+    except Exception as e:
+        logger.error(f"❌ 音声生成エラー: {e}")
+        return None
+        
 def cleanup_old_voice_files():
     try:
+        # 設定時間より古いファイルを対象にする
         cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
-        for f in glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")):
-            if os.path.getmtime(f) < cutoff: os.remove(f)
-    except: pass
-
+        
+        # WAVとMP3の両方をリストアップ
+        files = glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")) + \
+                glob.glob(os.path.join(VOICE_DIR, "voice_*.mp3"))
+        
+        deleted_count = 0
+        for f in files:
+            try:
+                if os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+                    deleted_count += 1
+            except Exception:
+                pass
+        
+        if deleted_count > 0:
+            logger.info(f"🧹 古い音声ファイルを削除しました: {deleted_count}個")
+            
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        
 # ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
@@ -1431,8 +1489,10 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-    if not re.match(r'^voice_[a-zA-Z0-9_]+\.wav', filename):
+    # .wav または .mp3 を許可する正規表現に変更
+    if not re.match(r'^voice_[a-zA-Z0-9_]+\.(wav|mp3)$', filename):
         return Response("Invalid filename", 400)
+    
     return send_from_directory(VOICE_DIR, filename)
 
 # ==============================================================================
