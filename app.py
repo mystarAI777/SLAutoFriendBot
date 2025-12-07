@@ -1590,6 +1590,40 @@ def check_and_migrate_db():
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
+# ==============================================================================
+# DBシーケンス修復用関数 (追加)
+# ==============================================================================
+def fix_postgres_sequences():
+    """PostgreSQLのID連番ズレを修正する"""
+    # SQLiteの場合は不要なのでスキップ
+    if 'sqlite' in str(DATABASE_URL):
+        return
+
+    logger.info("🔧 DBの連番ズレを修正中...")
+    # IDを持つテーブル一覧
+    tables = ['user_memories', 'conversation_history', 'user_psychology', 
+              'background_tasks', 'holomem_wiki', 'hololive_news', 
+              'holomem_nicknames', 'hololive_glossary']
+    
+    try:
+        with engine.connect() as conn:
+            # トランザクション開始
+            with conn.begin():
+                for table in tables:
+                    try:
+                        # 現在の最大IDに合わせてシーケンスを再設定するSQL
+                        sql = text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), COALESCE((SELECT MAX(id) + 1 FROM {table}), 1), false);")
+                        conn.execute(sql)
+                        logger.info(f"  ✅ {table}: シーケンス修正完了")
+                    except Exception as e:
+                        # テーブルが存在しない、またはシーケンスがない場合は無視
+                        logger.debug(f"  ⚠️ {table}スキップ: {e}")
+    except Exception as e:
+        logger.error(f"❌ シーケンス修正エラー: {e}")
+
+# ==============================================================================
+# 初期化 (修正版)
+# ==============================================================================
 def initialize_app():
     global engine, Session, groq_client, gemini_model
     logger.info("🔧 初期化開始 (v33.1.1 + パーソナライズ完全版)")
@@ -1598,8 +1632,11 @@ def initialize_app():
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
         Base.metadata.create_all(engine)
         
-        # ★ ここでマイグレーションを実行
+        # ★ マイグレーション実行
         check_and_migrate_db()
+        
+        # ★★★ ここに追加: 連番ズレの修正 ★★★
+        fix_postgres_sequences()
         
         Session = sessionmaker(bind=engine)
         
@@ -1610,6 +1647,7 @@ def initialize_app():
     except Exception as e:
         logger.critical(f"🔥 DB初期化失敗: {e}")
     
+    # ... (以下のAPI初期化などはそのまま) ...
     try:
         if GROQ_API_KEY:
             groq_client = Groq(api_key=GROQ_API_KEY)
@@ -1623,6 +1661,7 @@ def initialize_app():
             logger.info("✅ Gemini初期化完了")
     except: pass
     
+    # ★前回修正したVOICEVOX部分（tts.questを使うように変更済みならそのまま）
     if find_active_voicevox_url():
         global_state.voicevox_enabled = True
         logger.info("✅ VOICEVOX検出")
@@ -1637,7 +1676,7 @@ def initialize_app():
     # ニュース初回収集
     background_executor.submit(fetch_hololive_news)
 
-    # スケジュール設定（全て保持）
+    # スケジュール設定
     schedule.every(6).hours.do(update_holomem_database)
     schedule.every(30).minutes.do(fetch_hololive_news)
     schedule.every(1).hours.do(cleanup_old_voice_files)
