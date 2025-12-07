@@ -1237,16 +1237,13 @@ def find_active_voicevox_url() -> Optional[str]:
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成 (ハイブリッド版)"""
+    """tts.quest APIを使用して音声を生成 (リトライ機能付き)"""
     try:
-        # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
-        
-        # パラメータ設定
         params = {
             "text": text,
             "speaker": 20,           # もち子さん
-            "key": "",               # 無料版は空欄
+            "key": "",
             "speedScale": 1.1,
             "pitchScale": 0.15,
             "intonationScale": 1.4
@@ -1254,64 +1251,71 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
         
         logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
         
-        # 1. 音声生成のリクエスト
-        # ★修正: ここはヘッダー(User-Agent)を付けずに、素直にPythonとしてアクセスします
-        # 以前これでURL取得までは成功していたためです
+        # 1. 生成リクエスト
+        # ヘッダーなし（Python標準）でアクセス
         res = requests.get(api_url, params=params, timeout=60)
-        
         try:
             data = res.json()
         except:
-            logger.error(f"❌ API応答がJSONではありません: {res.text[:100]}")
+            logger.error(f"❌ API応答が不正: {res.text[:100]}")
             return None
         
-        # 2. ダウンロードURLの取得
+        # 2. URL取得
         download_url = ""
         if data.get("success", False):
             if "mp3DownloadUrl" in data and data["mp3DownloadUrl"]:
                 download_url = data["mp3DownloadUrl"]
             elif "audioStatusUrl" in data:
-                # 待ち時間がある場合
                 status_url = data["audioStatusUrl"]
                 for _ in range(20): 
                     time.sleep(1)
                     try:
-                        # 状態確認も素直にアクセス
                         status_res = requests.get(status_url, timeout=10)
                         status_data = status_res.json()
                         if status_data.get("isFinished", False):
                             download_url = status_data.get("mp3DownloadUrl", "")
                             break
-                    except:
-                        continue
+                    except: continue
         
         if not download_url:
-            logger.error(f"❌ 音声生成APIエラー: URL取得失敗 (API応答: {data})")
+            logger.error(f"❌ URL取得失敗: {data}")
             return None
 
-        # ★★★ 3. ダウンロード時のみブラウザのふりをする ★★★
-        # ダウンロードサーバーはチェックが厳しいのでここで偽装します
+        # 3. ダウンロード（リトライ処理を追加）
+        # ファイルがサーバーに反映されるまで数秒かかることがあるため、最大3回挑戦します
+        max_retries = 3
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        
-        voice_res = requests.get(download_url, headers=headers, timeout=60)
-        
-        # エラーチェック
-        content_type = voice_res.headers.get('Content-Type', '')
-        if 'application/json' in content_type or len(voice_res.content) < 100:
-            logger.error(f"❌ 音声ダウンロード拒否または失敗: {voice_res.text}")
-            return None
+
+        for attempt in range(max_retries):
+            # 1回目は2秒、2回目は4秒待つ...と待機時間を増やす
+            wait_time = (attempt + 1) * 2
+            time.sleep(wait_time)
             
-        # ファイル保存
-        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3"
-        save_path = os.path.join(VOICE_DIR, fname)
+            try:
+                voice_res = requests.get(download_url, headers=headers, timeout=60)
+                
+                # 成功チェック: JSONエラーではなく、かつサイズが十分あるか
+                content_type = voice_res.headers.get('Content-Type', '')
+                if 'application/json' not in content_type and len(voice_res.content) > 1000:
+                    # 成功！
+                    fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3"
+                    save_path = os.path.join(VOICE_DIR, fname)
+                    with open(save_path, 'wb') as f:
+                        f.write(voice_res.content)
+                    
+                    logger.info(f"✅ 音声保存完了: {fname} (サイズ: {len(voice_res.content)} bytes)")
+                    return fname
+                
+                # 失敗した場合ログを出して次へ
+                logger.warning(f"⚠️ ダウンロード試行 {attempt+1}/{max_retries} 失敗: {voice_res.text[:50]}...")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ 通信エラー {attempt+1}/{max_retries}: {e}")
         
-        with open(save_path, 'wb') as f:
-            f.write(voice_res.content)
-            
-        logger.info(f"✅ 音声保存完了: {fname} (サイズ: {len(voice_res.content)} bytes)")
-        return fname
+        logger.error("❌ 音声ダウンロード最終失敗")
+        return None
 
     except Exception as e:
         logger.error(f"❌ 音声生成エラー: {e}")
