@@ -1232,12 +1232,12 @@ def background_deep_search(task_id: str, query_data: Dict):
 # 音声ファイル (VOICEVOX - tts.quest API版)
 # ==============================================================================
 def find_active_voicevox_url() -> Optional[str]:
-    # tts.questを使うので、この関数はダミーとしてTrueを返すようにします
+    # ★ 修正: tts.questを使うので、外部API利用としてTrueを返します
     global_state.voicevox_enabled = True
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成"""
+    # ★ 修正: tts.quest APIを使用して音声を生成 (MP3形式)
     try:
         # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
@@ -1280,7 +1280,9 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
 
         # 音声ファイルをダウンロードして保存
         voice_res = requests.get(download_url, timeout=30)
-        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3" # MP3になります
+        
+        # ファイル名を生成（MP3形式）
+        fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3"
         save_path = os.path.join(VOICE_DIR, fname)
         
         with open(save_path, 'wb') as f:
@@ -1292,31 +1294,18 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"❌ 音声生成エラー: {e}")
         return None
-        
+
 def cleanup_old_voice_files():
+    # ★ 修正: WAVとMP3の両方を対象にする
     try:
-        # 設定時間より古いファイルを対象にする
         cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
-        
-        # WAVとMP3の両方をリストアップ
         files = glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")) + \
                 glob.glob(os.path.join(VOICE_DIR, "voice_*.mp3"))
         
-        deleted_count = 0
         for f in files:
-            try:
-                if os.path.getmtime(f) < cutoff:
-                    os.remove(f)
-                    deleted_count += 1
-            except Exception:
-                pass
-        
-        if deleted_count > 0:
-            logger.info(f"🧹 古い音声ファイルを削除しました: {deleted_count}個")
-            
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        
+            if os.path.getmtime(f) < cutoff: os.remove(f)
+    except: pass
+
 # ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
@@ -1460,6 +1449,7 @@ def chat_lsl():
 
         res_text = limit_text_for_sl(ai_text)
         v_url = ""
+        # ★ 修正: ファイル生成関数がMP3名を返すようになったため、ここも変更なしで動作しますが、コメントだけ更新します
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
             fname = generate_voice_file(res_text, user_uuid)
             if fname: v_url = f"{SERVER_URL}/play/{fname}"
@@ -1489,10 +1479,9 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-    # .wav または .mp3 を許可する正規表現に変更
-    if not re.match(r'^voice_[a-zA-Z0-9_]+\.(wav|mp3)$', filename):
+    # ★ 修正: ハイフン (-) を許可し、拡張子に .mp3 を追加
+    if not re.match(r'^voice_[a-zA-Z0-9_-]+\.(wav|mp3)$', filename):
         return Response("Invalid filename", 400)
-    
     return send_from_directory(VOICE_DIR, filename)
 
 # ==============================================================================
@@ -1590,40 +1579,30 @@ def check_and_migrate_db():
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
-# ==============================================================================
-# DBシーケンス修復用関数 (追加)
-# ==============================================================================
+# ★ 追加: DB連番修復用関数
 def fix_postgres_sequences():
     """PostgreSQLのID連番ズレを修正する"""
-    # SQLiteの場合は不要なのでスキップ
     if 'sqlite' in str(DATABASE_URL):
         return
 
     logger.info("🔧 DBの連番ズレを修正中...")
-    # IDを持つテーブル一覧
     tables = ['user_memories', 'conversation_history', 'user_psychology', 
               'background_tasks', 'holomem_wiki', 'hololive_news', 
               'holomem_nicknames', 'hololive_glossary']
     
     try:
         with engine.connect() as conn:
-            # トランザクション開始
             with conn.begin():
                 for table in tables:
                     try:
-                        # 現在の最大IDに合わせてシーケンスを再設定するSQL
                         sql = text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), COALESCE((SELECT MAX(id) + 1 FROM {table}), 1), false);")
                         conn.execute(sql)
                         logger.info(f"  ✅ {table}: シーケンス修正完了")
                     except Exception as e:
-                        # テーブルが存在しない、またはシーケンスがない場合は無視
                         logger.debug(f"  ⚠️ {table}スキップ: {e}")
     except Exception as e:
         logger.error(f"❌ シーケンス修正エラー: {e}")
 
-# ==============================================================================
-# 初期化 (修正版)
-# ==============================================================================
 def initialize_app():
     global engine, Session, groq_client, gemini_model
     logger.info("🔧 初期化開始 (v33.1.1 + パーソナライズ完全版)")
@@ -1635,7 +1614,7 @@ def initialize_app():
         # ★ マイグレーション実行
         check_and_migrate_db()
         
-        # ★★★ ここに追加: 連番ズレの修正 ★★★
+        # ★ 追加: 連番修復呼び出し
         fix_postgres_sequences()
         
         Session = sessionmaker(bind=engine)
@@ -1647,7 +1626,6 @@ def initialize_app():
     except Exception as e:
         logger.critical(f"🔥 DB初期化失敗: {e}")
     
-    # ... (以下のAPI初期化などはそのまま) ...
     try:
         if GROQ_API_KEY:
             groq_client = Groq(api_key=GROQ_API_KEY)
@@ -1661,10 +1639,10 @@ def initialize_app():
             logger.info("✅ Gemini初期化完了")
     except: pass
     
-    # ★前回修正したVOICEVOX部分（tts.questを使うように変更済みならそのまま）
+    # ★ 修正: VOICEVOX初期化（tts.questを使うように変更）
     if find_active_voicevox_url():
         global_state.voicevox_enabled = True
-        logger.info("✅ VOICEVOX検出")
+        logger.info("✅ VOICEVOX (tts.quest) 検出")
     
     logger.info("🎀 ホロメンシステム初期化...")
     if holomem_manager.load_from_db():
@@ -1676,7 +1654,7 @@ def initialize_app():
     # ニュース初回収集
     background_executor.submit(fetch_hololive_news)
 
-    # スケジュール設定
+    # スケジュール設定（全て保持）
     schedule.every(6).hours.do(update_holomem_database)
     schedule.every(30).minutes.do(fetch_hololive_news)
     schedule.every(1).hours.do(cleanup_old_voice_files)
