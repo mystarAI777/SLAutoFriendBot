@@ -1244,8 +1244,8 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             "text": text,
             "speaker": 20,           # もち子さん
             "key": "",
-            "speedScale": 1.1,
-            "pitchScale": 0.15,
+            "speedScale": 1.4,
+            "pitchScale": 0.18,
             "intonationScale": 1.4
         }
         
