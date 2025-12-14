@@ -1,14 +1,15 @@
 # ==============================================================================
-# もちこAI - v33.1.1 + パーソナライズ機能完全版 (DB自動修正パッチ適用済み)
+# もちこAI - v33.2.0 + パーソナライズ機能 + SNSリアルタイム情報連携
 #
 # ベース: v33.1.1 (全機能保持)
 # 追加機能:
-# 1. ユーザーの好みトピック分析と話題提案
-# 2. 心理分析結果をAI応答に反映
-# 3. 会話回数に応じた関係性の深化（友達認定システム）
+# 1. ユーザーの好みトピック分析と話題提案 (v33.1.1)
+# 2. 心理分析結果をAI応答に反映 (v33.1.1)
+# 3. 会話回数に応じた関係性の深化（友達認定システム） (v33.1.1)
+# 4. Yahoo!リアルタイム検索によるホロメンSNS情報収集・会話反映 (v33.2.0 NEW)
 #
 # 修正履歴:
-# - DBスキーマ不整合(is_friendカラム欠損)を自動修復する機能を追加
+# - DBスキーマ自動修復機能の強化 (recent_activityカラム対応)
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -77,7 +78,7 @@ MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
 
-# ★ 新規追加: パーソナライズ設定
+# ★ パーソナライズ設定
 FRIEND_THRESHOLD = 5  # この回数以上で友達認定
 ANALYSIS_INTERVAL = 5  # この回数ごとに心理分析を実行
 TOPIC_SUGGESTION_INTERVAL = 10  # この回数ごとに話題を提案
@@ -114,9 +115,9 @@ class UserData:
     uuid: str
     name: str
     interaction_count: int
-    is_friend: bool = False  # ★ 追加
-    favorite_topics: List[str] = field(default_factory=list)  # ★ 追加
-    psychology: Optional[Dict] = None  # ★ 追加
+    is_friend: bool = False
+    favorite_topics: List[str] = field(default_factory=list)
+    psychology: Optional[Dict] = None
 
 # ==============================================================================
 # グローバル状態管理
@@ -226,7 +227,7 @@ class UserMemory(Base):
     user_uuid = Column(String(255), unique=True, nullable=False, index=True)
     user_name = Column(String(255), nullable=False)
     interaction_count = Column(Integer, default=0)
-    is_friend = Column(Boolean, default=False)  # ★ 新規追加
+    is_friend = Column(Boolean, default=False)
     last_interaction = Column(DateTime, default=datetime.utcnow)
 
 class ConversationHistory(Base):
@@ -273,6 +274,8 @@ class HolomemWiki(Base):
     graduation_reason = Column(Text, nullable=True)
     mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # ★ 新規追加: 最新のXでの話題などを保存するカラム
+    recent_activity = Column(Text, nullable=True)
 
 class HololiveNews(Base):
     __tablename__ = 'hololive_news'
@@ -385,28 +388,25 @@ def get_weather_forecast(location: str = "東京") -> str:
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
     # ユーザー取得または作成
-    # NOTE: ここでスキーマエラーが出る場合は、initialize_appでのマイグレーションが失敗している可能性がある
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if user:
         user.interaction_count += 1
         user.last_interaction = datetime.utcnow()
         if user.user_name != user_name: user.user_name = user_name
         
-        # ★ 友達認定チェック（新機能）
-        # NOTE: DBにis_friendカラムがないとここでエラーになるが、自動修復機能により回避されるはず
+        # 友達認定チェック
         if hasattr(user, 'is_friend'):
             if user.interaction_count >= FRIEND_THRESHOLD and not user.is_friend:
                 user.is_friend = True
                 logger.info(f"🎉 {user_name}さんが友達に認定されました！")
         else:
-            # 万が一カラムがなくても動作するようにフォールバック
             logger.warning("is_friend column missing on model access")
             user.is_friend = False 
     else:
         user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
         session.add(user)
     
-    # ★ 心理データ取得（新機能）
+    # 心理データ取得
     psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
     fav_topics = []
     psych_data = None
@@ -515,7 +515,7 @@ class HolomemKeywordManager:
 holomem_manager = HolomemKeywordManager()
 
 # ==============================================================================
-# ホロメン情報キャッシュ
+# ホロメン情報キャッシュ & リアルタイム情報収集
 # ==============================================================================
 _holomem_cache: Dict[str, Dict] = {}
 _holomem_cache_lock = threading.Lock()
@@ -530,7 +530,8 @@ def get_holomem_info_cached(member_name: str) -> Optional[Dict]:
     with get_db_session() as session:
         wiki = session.query(HolomemWiki).filter_by(member_name=member_name).first()
         if wiki:
-            data = {k: getattr(wiki, k) for k in ['member_name', 'description', 'generation', 'debut_date', 'tags', 'status', 'graduation_date', 'mochiko_feeling']}
+            # ★ 修正: recent_activityを追加
+            data = {k: getattr(wiki, k) for k in ['member_name', 'description', 'generation', 'debut_date', 'tags', 'status', 'graduation_date', 'mochiko_feeling', 'recent_activity']}
             with _holomem_cache_lock:
                 _holomem_cache[member_name] = data
                 _holomem_cache_timestamps[member_name] = datetime.utcnow()
@@ -545,7 +546,7 @@ def clear_holomem_cache(member_name: Optional[str] = None):
             _holomem_cache.clear()
 
 def get_holomem_context(member_name: str) -> str:
-    """ホロメン情報をコンテキスト用テキストとして取得"""
+    """ホロメン情報をコンテキスト用テキストとして取得（SNS情報含む）"""
     info = get_holomem_info_cached(member_name)
     if not info:
         return ""
@@ -562,7 +563,64 @@ def get_holomem_context(member_name: str) -> str:
         if info['status'] == '卒業' and info.get('graduation_date'):
             context += f"- 卒業日: {info['graduation_date']}\n"
     
+    # ★ 追加: Xの最新情報がある場合はコンテキストに追加
+    if info.get('recent_activity'):
+         context += f"\n【{info['member_name']}に関する直近のX(Twitter)の様子・話題】\n{info['recent_activity']}\n"
+    
     return context
+
+# ==============================================================================
+# ★ 追加機能: Yahoo!リアルタイム検索連携
+# ==============================================================================
+def scrape_yahoo_realtime_for_member(member_name: str) -> str:
+    """指定したメンバーのリアルタイム検索結果をテキストで返す"""
+    try:
+        # 検索クエリ: 名前を含み、RTを除く
+        query = f"{member_name} -RT"
+        url = "https://search.yahoo.co.jp/realtime/search"
+        params = {'p': query, 'ei': 'UTF-8', 'm': 'latency'} # m=latencyで新着順
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        if res.status_code != 200: return ""
+        
+        soup = BeautifulSoup(res.content, 'html.parser')
+        texts = []
+        # 最新の5件程度を取得
+        for item in soup.select('.cnt.cf')[:5]:
+            txt = item.select_one('.kw')
+            tim = item.select_one('.tim')
+            if txt:
+                clean_txt = clean_text(txt.text)
+                time_txt = clean_text(tim.text) if tim else ""
+                texts.append(f"・({time_txt}) {clean_txt}")
+        
+        return "\n".join(texts)
+    except Exception as e:
+        logger.error(f"Realtime search failed for {member_name}: {e}")
+        return ""
+
+def update_holomem_social_activities():
+    """全ホロメンの最新状況をYahooから収集してDB更新（少しずつ行う）"""
+    logger.info("🐦 ホロメンSNS状況更新タスク開始")
+    with get_db_session() as session:
+        # 更新が古い順、またはランダムに5人選んで更新（全アクセスによるBAN防止）
+        members = session.query(HolomemWiki).order_by(HolomemWiki.last_updated.asc()).limit(5).all()
+        
+        for m in members:
+            logger.info(f"🔎 {m.member_name} の最新状況を収集中...")
+            activities = scrape_yahoo_realtime_for_member(m.member_name)
+            
+            if activities:
+                # DBに保存
+                m.recent_activity = activities
+                m.last_updated = datetime.utcnow()
+                # キャッシュクリア
+                clear_holomem_cache(m.member_name)
+            
+            time.sleep(3) # アクセス間隔を空ける
+            
+    logger.info("✅ SNS状況更新完了")
 
 # ==============================================================================
 # ホロメンスクレイピング & DB更新
@@ -692,7 +750,7 @@ def fetch_hololive_news():
         logger.error(f"News fetch failed: {e}")
 
 # ==============================================================================
-# ★ 新機能: トピック分析
+# トピック分析
 # ==============================================================================
 def analyze_user_topics(session, user_uuid: str) -> List[str]:
     """会話履歴からユーザーの興味トピックを分析"""
@@ -745,7 +803,7 @@ def analyze_user_topics(session, user_uuid: str) -> List[str]:
         return []
 
 # ==============================================================================
-# ★ 新機能: 心理分析
+# 心理分析
 # ==============================================================================
 def analyze_user_psychology(session, user_uuid: str, user_name: str):
     """会話履歴からユーザーの性格を分析"""
@@ -825,7 +883,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
         logger.error(f"心理分析エラー: {e}")
 
 # ==============================================================================
-# ★ 新機能: 話題提案
+# 話題提案
 # ==============================================================================
 def suggest_topic(user_data: UserData) -> Optional[str]:
     """ユーザーの好みに基づいて話題を提案"""
@@ -900,7 +958,7 @@ def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens:
     return None
 
 # ==============================================================================
-# ★ 改良版: AI応答生成（パーソナライズ機能統合）
+# AI応答生成（パーソナライズ機能統合）
 # ==============================================================================
 def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
     """AI応答生成（RAG・コンテキスト・パーソナライズ統合版）"""
@@ -908,7 +966,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
     
-    # 1. ホロメン情報の注入（既存機能）
+    # 1. ホロメン情報の注入（SNS情報含む）
     try:
         holomem_manager.load_from_db()
         detected_name = holomem_manager.detect_in_message(normalized_message)
@@ -918,11 +976,13 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                 profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
                 if info.get('graduation_date'):
                     profile += f"\n・卒業日: {info['graduation_date']}"
+                if info.get('recent_activity'):
+                    profile += f"\n・直近のX(Twitter)の様子: {info['recent_activity']}"
                 internal_context += f"\n{profile}"
     except Exception as e:
         logger.error(f"Context injection error: {e}")
 
-    # 2. ニュース情報の注入（既存機能）
+    # 2. ニュース情報の注入
     try:
         if "ニュース" in message or "情報" in message or "ホロライブ" in message:
             with get_db_session() as session:
@@ -936,14 +996,14 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
-    # ★ 3. 関係性に基づくコンテキスト（新機能）
+    # 3. 関係性に基づくコンテキスト
     relationship_context = ""
     if user_data.is_friend:
         relationship_context = f"【重要】{user_data.name}さんは、あなたの大切な友達です。親しみを込めて話してください。"
     elif user_data.interaction_count >= 3:
         relationship_context = f"【重要】{user_data.name}さんとは{user_data.interaction_count}回目の会話です。少しずつ打ち解けてきています。"
     
-    # ★ 4. 心理分析に基づくトーン調整（新機能）
+    # 4. 心理分析に基づくトーン調整
     personality_context = ""
     if user_data.psychology:
         openness = user_data.psychology['openness']
@@ -959,7 +1019,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
         elif extraversion < 30:
             personality_context += "内向的で落ち着いたタイプ。丁寧で優しいトーンを心がけましょう。"
     
-    # ★ 5. 好みトピックの情報（新機能）
+    # 5. 好みトピックの情報
     topics_context = ""
     if user_data.favorite_topics:
         topics_context = f"このユーザーは【{', '.join(user_data.favorite_topics)}】に興味があります。"
@@ -978,6 +1038,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 1. **全ての固有名詞は、原則として「ホロライブ」に関連するものとして解釈してください。**
 2. ユーザーの入力に曖昧さがある場合は、一般的な意味ではなく、**VTuberの意味を優先**してください。
 3. **【ホロライブ最新ニュース】や【人物データ】の情報があれば、それを事実として回答に使ってください。**
+4. 人物データに「直近のX(Twitter)の様子」がある場合、それは「今起きていること」や「最近の話題」として積極的に会話に取り入れてください。
 
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
@@ -1229,30 +1290,35 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# 音声ファイル (VOICEVOX - tts.quest API版)
+# 修正版: generate_voice_file
+# 変更点: tts.quest用にパラメータ名を最適化 (speedScale -> speed 等)
 # ==============================================================================
-def find_active_voicevox_url() -> Optional[str]:
-    # ★ 修正: tts.questを使うので、外部API利用としてTrueを返します
-    global_state.voicevox_enabled = True
-    return "https://api.tts.quest"
-
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成 (リトライ機能付き)"""
+    """tts.quest APIを使用して音声を生成 (パラメータ修正版)"""
     try:
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
+        
+        # ★ 修正: パラメータキーを tts.quest V3 仕様に合わせて調整
+        # 本家(speedScale) と 短縮形(speed) の両方を送ることで確実性を高める
         params = {
             "text": text,
             "speaker": 20,           # もち子さん
             "key": "",
-            "speedScale": 1.4,
-            "pitchScale": 0.18,
+            
+            # tts.quest V3用 (短縮形)
+            "speed": 1.2,           # 1.0が標準。1.2〜1.4くらいが早口ギャルっぽい
+            "pitch": 0.05,          # 声の高さ (0.0が標準)
+            "intonation": 1.4,      # 抑揚 (1.0が標準)
+            
+            # 本家VOICEVOX用 (念のため残す)
+            "speedScale": 1.2,
+            "pitchScale": 0.05,
             "intonationScale": 1.4
         }
         
-        logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}...")
+        logger.info(f"🎙️ 音声生成リクエスト: {text[:20]}... (速度: {params['speed']})")
         
         # 1. 生成リクエスト
-        # ヘッダーなし（Python標準）でアクセス
         res = requests.get(api_url, params=params, timeout=60)
         try:
             data = res.json()
@@ -1281,25 +1347,21 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             logger.error(f"❌ URL取得失敗: {data}")
             return None
 
-        # 3. ダウンロード（リトライ処理を追加）
-        # ファイルがサーバーに反映されるまで数秒かかることがあるため、最大3回挑戦します
+        # 3. ダウンロード（リトライ処理付き）
         max_retries = 3
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
 
         for attempt in range(max_retries):
-            # 1回目は2秒、2回目は4秒待つ...と待機時間を増やす
             wait_time = (attempt + 1) * 2
             time.sleep(wait_time)
             
             try:
                 voice_res = requests.get(download_url, headers=headers, timeout=60)
                 
-                # 成功チェック: JSONエラーではなく、かつサイズが十分あるか
                 content_type = voice_res.headers.get('Content-Type', '')
                 if 'application/json' not in content_type and len(voice_res.content) > 1000:
-                    # 成功！
                     fname = f"voice_{user_uuid[:8]}_{int(time.time())}.mp3"
                     save_path = os.path.join(VOICE_DIR, fname)
                     with open(save_path, 'wb') as f:
@@ -1308,8 +1370,7 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
                     logger.info(f"✅ 音声保存完了: {fname} (サイズ: {len(voice_res.content)} bytes)")
                     return fname
                 
-                # 失敗した場合ログを出して次へ
-                logger.warning(f"⚠️ ダウンロード試行 {attempt+1}/{max_retries} 失敗: {voice_res.text[:50]}...")
+                logger.warning(f"⚠️ ダウンロード試行 {attempt+1}/{max_retries} 失敗")
                 
             except Exception as e:
                 logger.warning(f"⚠️ 通信エラー {attempt+1}/{max_retries}: {e}")
@@ -1322,7 +1383,6 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
         return None
 
 def cleanup_old_voice_files():
-    # ★ 修正: WAVとMP3の両方を対象にする
     try:
         cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
         files = glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")) + \
@@ -1384,7 +1444,7 @@ def initialize_knowledge_db():
 # ==============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
-    return create_json_response({'status': 'ok', 'version': 'v33.1.1+personalized', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
+    return create_json_response({'status': 'ok', 'version': 'v33.2.0+sns_realtime', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
 
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
@@ -1413,11 +1473,11 @@ def chat_lsl():
             user_data = get_or_create_user(session, user_uuid, user_name)
             history = get_conversation_history(session, user_uuid)
             
-            # ★ 新機能: 定期的に心理分析を実行
+            # 定期的に心理分析を実行
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0 and user_data.interaction_count >= MIN_MESSAGES_FOR_ANALYSIS:
                 background_executor.submit(analyze_user_psychology, Session(), user_uuid, user_name)
             
-            # ★ 新機能: 定期的にトピック分析を実行
+            # 定期的にトピック分析を実行
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0:
                 topics = analyze_user_topics(session, user_uuid)
                 if topics:
@@ -1425,7 +1485,7 @@ def chat_lsl():
                     if psych:
                         psych.favorite_topics = ','.join(topics)
             
-            # ★ 新機能: 話題提案（一定間隔で）
+            # 話題提案（一定間隔で）
             if user_data.interaction_count > 0 and user_data.interaction_count % TOPIC_SUGGESTION_INTERVAL == 0:
                 suggestion = suggest_topic(user_data)
                 if suggestion:
@@ -1433,7 +1493,7 @@ def chat_lsl():
             
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            # 既存機能: 検索要求の判定
+            # 検索要求の判定
             if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
                 qdata = {
@@ -1452,14 +1512,14 @@ def chat_lsl():
                 ai_text = "オッケー！ちょっとググってくるから待ってて！"
                 is_task_started = True
 
-            # 既存機能: ホロメン応答
+            # ホロメン応答
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
             
-            # 既存機能: 時刻・天気
+            # 時刻・天気
             if not ai_text:
                 if is_time_request(message):
                     ai_text = get_japan_time()
@@ -1475,7 +1535,6 @@ def chat_lsl():
 
         res_text = limit_text_for_sl(ai_text)
         v_url = ""
-        # ★ 修正: ファイル生成関数がMP3名を返すようになったため、ここも変更なしで動作しますが、コメントだけ更新します
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
             fname = generate_voice_file(res_text, user_uuid)
             if fname: v_url = f"{SERVER_URL}/play/{fname}"
@@ -1505,7 +1564,6 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
-    # ★ 修正: ハイフン (-) を許可し、拡張子に .mp3 を追加
     if not re.match(r'^voice_[a-zA-Z0-9_-]+\.(wav|mp3)$', filename):
         return Response("Invalid filename", 400)
     return send_from_directory(VOICE_DIR, filename)
@@ -1584,28 +1642,33 @@ def check_and_migrate_db():
     logger.info("⚙️ Checking DB schema...")
     try:
         with engine.connect() as conn:
-            # 既存テーブル 'user_memories' に 'is_friend' カラムがあるか確認
-            # シンプルにSELECTして失敗したらカラムがないと判断する（DBエンジンに依存しない方法）
+            # is_friend チェック
             try:
-                # トランザクションブロックを開始（PostgreSQLでのエラー後のロールバックのため）
                 trans = conn.begin()
                 conn.execute(text("SELECT is_friend FROM user_memories LIMIT 1"))
                 trans.commit()
             except Exception:
-                # カラムが存在しない場合
                 if 'trans' in locals(): trans.rollback()
                 logger.info("🔄 DB Migration: 'is_friend' column missing. Adding it now...")
-                
-                # ALTER TABLE実行
-                # PostgreSQLではトランザクションが必要
                 with conn.begin() as trans2:
                     conn.execute(text("ALTER TABLE user_memories ADD COLUMN is_friend BOOLEAN DEFAULT FALSE"))
                 logger.info("✅ Column 'is_friend' added successfully.")
             
+            # ★ 新機能: recent_activity チェック
+            try:
+                trans = conn.begin()
+                conn.execute(text("SELECT recent_activity FROM holomem_wiki LIMIT 1"))
+                trans.commit()
+            except Exception:
+                if 'trans' in locals(): trans.rollback()
+                logger.info("🔄 DB Migration: 'recent_activity' column missing. Adding it now...")
+                with conn.begin() as trans2:
+                    conn.execute(text("ALTER TABLE holomem_wiki ADD COLUMN recent_activity TEXT"))
+                logger.info("✅ Column 'recent_activity' added successfully.")
+
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
-# ★ 追加: DB連番修復用関数
 def fix_postgres_sequences():
     """PostgreSQLのID連番ズレを修正する"""
     if 'sqlite' in str(DATABASE_URL):
@@ -1631,16 +1694,13 @@ def fix_postgres_sequences():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v33.1.1 + パーソナライズ完全版)")
+    logger.info("🔧 初期化開始 (v33.2.0 + SNSリアルタイム連携)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
         Base.metadata.create_all(engine)
         
-        # ★ マイグレーション実行
         check_and_migrate_db()
-        
-        # ★ 追加: 連番修復呼び出し
         fix_postgres_sequences()
         
         Session = sessionmaker(bind=engine)
@@ -1665,7 +1725,6 @@ def initialize_app():
             logger.info("✅ Gemini初期化完了")
     except: pass
     
-    # ★ 修正: VOICEVOX初期化（tts.questを使うように変更）
     if find_active_voicevox_url():
         global_state.voicevox_enabled = True
         logger.info("✅ VOICEVOX (tts.quest) 検出")
@@ -1679,12 +1738,17 @@ def initialize_app():
     
     # ニュース初回収集
     background_executor.submit(fetch_hololive_news)
+    
+    # ★ 初回のSNS情報収集
+    background_executor.submit(update_holomem_social_activities)
 
-    # スケジュール設定（全て保持）
+    # スケジュール設定
     schedule.every(6).hours.do(update_holomem_database)
     schedule.every(30).minutes.do(fetch_hololive_news)
     schedule.every(1).hours.do(cleanup_old_voice_files)
     schedule.every(6).hours.do(chat_rate_limiter.cleanup_old_entries)
+    # ★ 新規追加: 1時間ごとにSNS情報を更新
+    schedule.every(1).hours.do(lambda: background_executor.submit(update_holomem_social_activities))
     
     threading.Thread(target=run_scheduler, daemon=True).start()
     cleanup_old_voice_files()
