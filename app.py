@@ -1293,22 +1293,29 @@ def background_deep_search(task_id: str, query_data: Dict):
 # 修正版: generate_voice_file
 # 変更点: tts.quest用にパラメータ名を最適化 (speedScale -> speed 等)
 # ==============================================================================
+# ==============================================================================
+# 音声ファイル (VOICEVOX - tts.quest API版)
+# ==============================================================================
+def find_active_voicevox_url() -> Optional[str]:
+    """VOICEVOXのURLを特定する（今回はtts.questを固定で使用）"""
+    global_state.voicevox_enabled = True
+    return "https://api.tts.quest"
+
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
     """tts.quest APIを使用して音声を生成 (パラメータ修正版)"""
     try:
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
         
-        # ★ 修正: パラメータキーを tts.quest V3 仕様に合わせて調整
-        # 本家(speedScale) と 短縮形(speed) の両方を送ることで確実性を高める
+        # tts.quest V3 仕様に合わせてパラメータを調整
         params = {
             "text": text,
             "speaker": 20,           # もち子さん
             "key": "",
             
             # tts.quest V3用 (短縮形)
-            "speed": 1.2,           # 1.0が標準。1.2〜1.4くらいが早口ギャルっぽい
-            "pitch": 0.05,          # 声の高さ (0.0が標準)
-            "intonation": 1.4,      # 抑揚 (1.0が標準)
+            "speed": 1.2,           # 1.0が標準
+            "pitch": 0.05,          # 0.0が標準
+            "intonation": 1.4,      # 1.0が標準
             
             # 本家VOICEVOX用 (念のため残す)
             "speedScale": 1.2,
