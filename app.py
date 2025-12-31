@@ -752,17 +752,62 @@ def fetch_hololive_news():
         logger.info("✅ ニュースDB更新完了")
     except Exception as e:
         logger.error(f"News fetch failed: {e}")
+
+def fetch_hololive_tsuushin_news():
+    """ホロライブ通信からニュースを取得"""
+    logger.info("📰 ホロライブ通信の更新チェック開始...")
+    url = "https://hololive-tsuushin.com/holonews/"
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200: return
+        
+        soup = BeautifulSoup(res.content, 'html.parser')
+        
+        # 記事一覧を取得（サイトの構造に合わせたセレクター）
+        articles = soup.select('article') or soup.select('.post-list-item')
+        
+        with get_db_session() as session:
+            count = 0
+            for art in articles[:10]: # 最新10件を確認
+                a_tag = art.find('a')
+                if not a_tag: continue
+                
+                link = a_tag.get('href')
+                title_elem = art.find(['h1', 'h2', 'h3', 'p'])
+                title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
+                
+                if title and link:
+                    # 重複チェック（URLで判定）
+                    if not session.query(HololiveNews).filter_by(url=link).first():
+                        session.add(HololiveNews(
+                            title=f"【まとめ】{title}",
+                            content=title,
+                            url=link,
+                            created_at=datetime.utcnow()
+                        ))
+                        count += 1
+            logger.info(f"✅ ホロライブ通信から {count} 件の新しいニュースを追加したよ！")
+    except Exception as e:
+        logger.error(f"❌ ホロライブ通信の取得に失敗: {e}")
+
 # --- ここから追加 ---
 def wrapped_news_fetch():
-    """ニュースを取得して実行時間を記録する"""
+ """公式サイトとホロライブ通信の両方からニュースを取得"""
+    # 1. 公式サイト
     fetch_hololive_news()
+    
+    # 2. ホロライブ通信（追加分）
+    fetch_hololive_tsuushin_news()
+    
+    # 実行ログの更新
     with get_db_session() as session:
         log = session.query(TaskLog).filter_by(task_name='fetch_news').first()
         if not log:
             log = TaskLog(task_name='fetch_news')
             session.add(log)
         log.last_run = datetime.utcnow()
-
+        
 def wrapped_holomem_update():
     """ホロメンDBを更新して実行時間を記録する"""
     update_holomem_database()
