@@ -298,7 +298,11 @@ class HololiveGlossary(Base):
     term = Column(String(100), unique=True, nullable=False, index=True)
     description = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-
+# タスクの実行時間を記録するテーブル
+class TaskLog(Base):
+    __tablename__ = 'task_logs'
+    task_name = Column(String(100), primary_key=True)
+    last_run = Column(DateTime, default=datetime.utcnow)
 # ==============================================================================
 # セッション & ユーティリティ
 # ==============================================================================
@@ -748,7 +752,35 @@ def fetch_hololive_news():
         logger.info("✅ ニュースDB更新完了")
     except Exception as e:
         logger.error(f"News fetch failed: {e}")
+# --- ここから追加 ---
+def wrapped_news_fetch():
+    """ニュースを取得して実行時間を記録する"""
+    fetch_hololive_news()
+    with get_db_session() as session:
+        log = session.query(TaskLog).filter_by(task_name='fetch_news').first()
+        if not log:
+            log = TaskLog(task_name='fetch_news')
+            session.add(log)
+        log.last_run = datetime.utcnow()
 
+def wrapped_holomem_update():
+    """ホロメンDBを更新して実行時間を記録する"""
+    update_holomem_database()
+    with get_db_session() as session:
+        log = session.query(TaskLog).filter_by(task_name='update_holomem').first()
+        if not log:
+            log = TaskLog(task_name='update_holomem')
+            session.add(log)
+        log.last_run = datetime.utcnow()
+
+def catch_up_task(task_name, wrapped_func, interval_hours=1):
+    """前回の実行から時間が経ちすぎていたら実行する"""
+    with get_db_session() as session:
+        log = session.query(TaskLog).filter_by(task_name=task_name).first()
+        now = datetime.utcnow()
+        if not log or (now - log.last_run) >= timedelta(hours=interval_hours):
+            logger.info(f"⏰ タスク '{task_name}' をキャッチアップ実行します。")
+            background_executor.submit(wrapped_func)
 # ==============================================================================
 # トピック分析
 # ==============================================================================
@@ -1464,6 +1496,12 @@ def chat_lsl():
         user_name = sanitize_user_input(data.get('name', 'Guest'))
         message = sanitize_user_input(data['message'])
         generate_voice = data.get('voice', False)
+         # --- ここから追加 ---
+        if message.strip() == "スケジュール実施":
+            background_executor.submit(wrapped_news_fetch)
+            background_executor.submit(wrapped_holomem_update)
+            return Response("了解！最新ニュースとホロメン名鑑の強制更新を開始したよ！終わるまでちょっと待っててね。|", 200)
+        # --- ここまで追加 ---
         
         if not chat_rate_limiter.is_allowed(user_uuid):
             return Response("メッセージ送りすぎ～！|", 429)
@@ -1749,9 +1787,14 @@ def initialize_app():
     # ★ 初回のSNS情報収集
     background_executor.submit(update_holomem_social_activities)
 
-    # スケジュール設定
-    schedule.every(6).hours.do(update_holomem_database)
-    schedule.every(30).minutes.do(fetch_hololive_news)
+    # --- ここから追加・修正 ---
+    # 起動時のキャッチアップ（1時間/6時間 以上空いていたら実行）
+    catch_up_task('fetch_news', wrapped_news_fetch, interval_hours=1)
+    catch_up_task('update_holomem', wrapped_holomem_update, interval_hours=6)
+
+    # スケジュール設定（wrapped版を呼ぶように変更）
+    schedule.every(30).minutes.do(wrapped_news_fetch) # wrappedに変更
+    schedule.every(6).hours.do(wrapped_holomem_update) # wrappedに変更
     schedule.every(1).hours.do(cleanup_old_voice_files)
     schedule.every(6).hours.do(chat_rate_limiter.cleanup_old_entries)
     # ★ 新規追加: 1時間ごとにSNS情報を更新
