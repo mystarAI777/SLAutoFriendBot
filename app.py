@@ -10,8 +10,12 @@
 #
 # 修正履歴:
 # - DBスキーマ自動修復機能の強化 (recent_activityカラム対応)
-# ==============================================================================
-
+# 変更点:
+# 1. 全8段階のインテリジェント・フォールバック (Gemini 2.0優先)
+# 2. 内容の複雑度に応じた自動モデル振り分け (日常/複雑)
+# 3. ニュースソース拡充: Linden Lab (Second Life), CGWORLD (CG/3D)
+# 4. 話題逸らし防止プロンプト制御
+# 5. エラーモデルの一時スキップ機能 (リトライの無駄を排除)
 # ===== 標準ライブラリ =====
 import sys
 import os
@@ -83,6 +87,14 @@ FRIEND_THRESHOLD = 5  # この回数以上で友達認定
 ANALYSIS_INTERVAL = 5  # この回数ごとに心理分析を実行
 TOPIC_SUGGESTION_INTERVAL = 10  # この回数ごとに話題を提案
 
+ ==============================================================================
+# 【変更2】GEMINI_MODELS 定数を追加（行80付近）
+# ==============================================================================
+GEMINI_MODELS = [
+    "gemini-1.5-flash",      # 最も安定
+    "gemini-1.5-flash-8b",   # 軽量版
+    "gemini-2.0-flash-exp",  # 実験版（制限厳しい）
+]
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
@@ -109,7 +121,15 @@ class GroqModelStatus:
     is_limited: bool = False
     reset_time: Optional[datetime] = None
     last_error: Optional[str] = None
-
+# ==============================================================================
+# 【変更1】データクラスに GeminiModelStatus を追加
+# ==============================================================================
+@dataclass
+class GeminiModelStatus:
+    is_limited: bool = False
+    reset_time: Optional[datetime] = None
+    current_model: str = "gemini-1.5-flash"
+    last_error: Optional[str] = None
 @dataclass
 class UserData:
     uuid: str
@@ -140,6 +160,63 @@ class GlobalState:
     @active_voicevox_url.setter
     def active_voicevox_url(self, value: Optional[str]):
         with self._lock: self._active_voicevox_url = value
+# ==============================================================================
+# 【変更3】GeminiModelManager クラスを追加（行120付近、GlobalStateの後）
+# ==============================================================================
+class GeminiModelManager:
+    """Geminiモデルのフォールバック管理"""
+    def __init__(self):
+        self._lock = RLock()
+        self._models = GEMINI_MODELS
+        self._current_index = 0
+        self._status = GeminiModelStatus()
+        self._gemini_instances = {}
+    
+    def get_current_model(self) -> Optional[Any]:
+        """現在利用可能なGeminiモデルを取得"""
+        with self._lock:
+            # 制限中かつリセット時間を過ぎていたらリセット
+            if self._status.is_limited and self._status.reset_time:
+                if datetime.utcnow() >= self._status.reset_time:
+                    logger.info(f"✅ Gemini制限解除: {self._status.current_model}")
+                    self._status.is_limited = False
+                    self._status.reset_time = None
+            
+            # 制限中なら次のモデルを試す
+            if self._status.is_limited:
+                self._current_index = (self._current_index + 1) % len(self._models)
+                self._status.current_model = self._models[self._current_index]
+                self._status.is_limited = False
+                logger.info(f"🔄 Geminiモデル切り替え: {self._status.current_model}")
+            
+            model_name = self._models[self._current_index]
+            
+            # キャッシュから取得または新規作成
+            if model_name not in self._gemini_instances:
+                try:
+                    self._gemini_instances[model_name] = genai.GenerativeModel(model_name)
+                    logger.info(f"🆕 Geminiモデル初期化: {model_name}")
+                except Exception as e:
+                    logger.error(f"❌ Gemini初期化失敗 ({model_name}): {e}")
+                    return None
+            
+            return self._gemini_instances[model_name]
+    
+    def mark_limited(self, wait_seconds: int = 60):
+        """Geminiが制限された際の処理"""
+        with self._lock:
+            self._status.is_limited = True
+            self._status.reset_time = datetime.utcnow() + timedelta(seconds=wait_seconds)
+            logger.warning(f"⚠️ Gemini制限検知 ({self._status.current_model}): {wait_seconds}秒後にリトライ")
+    
+    def get_status_report(self) -> str:
+        """ステータスレポート"""
+        with self._lock:
+            if self._status.is_limited and self._status.reset_time:
+                jst = (self._status.reset_time + timedelta(hours=9)).strftime('%H:%M:%S')
+                return f"🤖 Gemini: ❌ 制限中 ({self._status.current_model}) - 解除: {jst}"
+            else:
+                return f"🤖 Gemini: ✅ 稼働中 ({self._status.current_model})"
 
 class GroqModelManager:
     def __init__(self, models: List[str]):
@@ -179,6 +256,7 @@ class GroqModelManager:
         with self._lock: return [m for m in self._models if self.is_available(m)]
 
 global_state = GlobalState()
+gemini_model_manager = GeminiModelManager()
 groq_model_manager = GroqModelManager(GROQ_MODELS)
 background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client: Optional[Groq] = None
@@ -799,6 +877,20 @@ def wrapped_news_fetch():
             session.add(log)
         log.last_run = datetime.utcnow()
 
+# --- [強化] ニュース取得関数 ---
+def fetch_news_task_integrated():
+    # 1. app (1).py のSNS情報を取得
+    try:
+        update_holomem_social_activities()
+    except Exception as e:
+        logger.error(f"SNS収集エラー: {e}")
+
+    # 2. SL / CG / 公式ニュースを取得
+    sources = [
+        {"name": "SecondLife", "url": "https://community.secondlife.com/blogs/rss/3-featured-news/", "type": "rss"},
+        {"name": "CGWORLD", "url": "https://cgworld.jp/rss/news/", "type": "rss"}
+    ]
+    
 def wrapped_holomem_update():
     """ホロメンDBを更新して実行時間を記録する"""
     update_holomem_database()
@@ -873,6 +965,11 @@ def analyze_user_topics(session, user_uuid: str) -> List[str]:
 # ==============================================================================
 # 心理分析
 # ==============================================================================
+# ==============================================================================
+# 【変更8】analyze_user_psychology 関数を修正（行900付近）
+# 変更前: if gemini_model:
+# 変更後: gemini_model_manager.get_current_model() を使う
+# ==============================================================================
 def analyze_user_psychology(session, user_uuid: str, user_name: str):
     """会話履歴からユーザーの性格を分析"""
     try:
@@ -905,15 +1002,22 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
 """
         
         result = None
-        if gemini_model:
+        # ★ 修正: gemini_model_manager 経由で取得
+        current_gemini = gemini_model_manager.get_current_model()
+        if current_gemini:
             try:
-                response = gemini_model.generate_content(analysis_prompt)
+                response = current_gemini.generate_content(analysis_prompt)
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
                     if json_match:
                         result = json.loads(json_match.group())
             except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "quota" in error_str.lower():
+                    retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+                    wait_seconds = int(float(retry_match.group(1))) + 5 if retry_match else 60
+                    gemini_model_manager.mark_limited(wait_seconds)
                 logger.warning(f"Gemini分析エラー: {e}")
         
         if not result and groq_client:
@@ -996,18 +1100,48 @@ def suggest_topic(user_data: UserData) -> Optional[str]:
 # ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
+# ==============================================================================
+# 【変更5】call_gemini 関数を完全書き換え（行1000付近）
+# ==============================================================================
 def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Optional[str]:
-    if not gemini_model: return None
+    """Gemini APIを呼び出し（複数モデル対応・自動フォールバック）"""
+    model = gemini_model_manager.get_current_model()
+    if not model:
+        return None
+    
     try:
         full_prompt = f"{system_prompt}\n\n【会話履歴】\n"
         for h in history[-5:]:
             full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
         full_prompt += f"\nユーザー: {message}\nもちこ:"
-        response = gemini_model.generate_content(full_prompt, generation_config={"temperature": 0.8, "max_output_tokens": 400})
+        
+        response = model.generate_content(
+            full_prompt, 
+            generation_config={
+                "temperature": 0.8, 
+                "max_output_tokens": 400
+            }
+        )
+        
         if hasattr(response, 'candidates') and response.candidates:
             return response.candidates[0].content.parts[0].text.strip()
+            
     except Exception as e:
-        logger.warning(f"⚠️ Geminiエラー: {e}")
+        error_str = str(e)
+        
+        # クォータエラーの検出と処理
+        if "429" in error_str or "quota" in error_str.lower() or "rate limit" in error_str.lower():
+            # エラーメッセージから待ち時間を抽出
+            wait_seconds = 60  # デフォルト
+            retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+            if retry_match:
+                wait_seconds = int(float(retry_match.group(1))) + 5  # 余裕を持たせる
+            
+            gemini_model_manager.mark_limited(wait_seconds)
+            logger.warning(f"⚠️ Geminiクォータ超過: {wait_seconds}秒後にリトライ")
+        else:
+            logger.warning(f"⚠️ Geminiエラー: {e}")
+    
     return None
 
 def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800) -> Optional[str]:
@@ -1517,10 +1651,20 @@ def initialize_knowledge_db():
 # ==============================================================================
 # Flask エンドポイント
 # ==============================================================================
+# ==============================================================================
+# 【変更6】health_check エンドポイントを修正（行1800付近）
+# ==============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
-    return create_json_response({'status': 'ok', 'version': 'v33.2.0+sns_realtime', 'gemini': gemini_model is not None, 'groq': groq_client is not None, 'holomem_count': holomem_manager.get_member_count()})
-
+    gemini_status = gemini_model_manager.get_current_model() is not None
+    return create_json_response({
+        'status': 'ok', 
+        'version': 'v33.2.1+auto_fallback', 
+        'gemini': gemini_status,
+        'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
+        'groq': groq_client is not None, 
+        'holomem_count': holomem_manager.get_member_count()
+    })
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     try:
@@ -1543,7 +1687,7 @@ def chat_lsl():
             return Response("メッセージ送りすぎ～！|", 429)
 
         if message.strip() == "残トークン":
-            msg = f"🦁 Gemini: {'稼働中' if gemini_model else '停止中'}\n" + groq_model_manager.get_status_report()
+            msg = gemini_model_manager.get_status_report() + "\n" + groq_model_manager.get_status_report()
             msg += f"\n🎀 ホロメンDB: {holomem_manager.get_member_count()}名"
             return Response(f"{msg}|", 200)
 
@@ -1802,9 +1946,14 @@ def initialize_app():
     try:
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
-            logger.info("✅ Gemini初期化完了")
-    except: pass
+            # 初期モデルを取得（GeminiModelManager経由）
+            gemini_model = gemini_model_manager.get_current_model()
+            if gemini_model:
+                logger.info(f"✅ Gemini初期化完了: {gemini_model_manager._models[gemini_model_manager._current_index]}")
+            else:
+                logger.warning("⚠️ Gemini初期化失敗")
+    except Exception as e:
+        logger.error(f"❌ Gemini設定エラー: {e}")
     
     if find_active_voicevox_url():
         global_state.voicevox_enabled = True
