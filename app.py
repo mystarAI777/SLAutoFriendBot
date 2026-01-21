@@ -1745,9 +1745,12 @@ def chat_lsl():
 
         res_text = limit_text_for_sl(ai_text)
         v_url = ""
+        # 音声生成 (直リンク版)
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
-            fname = generate_voice_file(res_text, user_uuid)
-            if fname: v_url = f"{SERVER_URL}/play/{fname}"
+            # generate_voice_file は既に完全なURLを返してくるので、そのまま使います
+            direct_url = generate_voice_file(res_text, user_uuid)
+            if direct_url:
+                v_url = direct_url
             
         return Response(f"{res_text}|{v_url}", mimetype='text/plain; charset=utf-8', status=200)
     
