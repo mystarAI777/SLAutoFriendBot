@@ -1,21 +1,24 @@
 # ==============================================================================
-# もちこAI - v33.2.0 + パーソナライズ機能 + SNSリアルタイム情報連携
+# もちこAI - v33.6.0 + 省エネ外部cronスケジューラ (GitHub Actions) + パーソナライズ機能 + SNSリアルタイム情報連携 + ホロライブ熱狂ファンシステム
 #
-# ベース: v33.1.1 (全機能保持)
-# 追加機能:
-# 1. ユーザーの好みトピック分析と話題提案 (v33.1.1)
-# 2. 心理分析結果をAI応答に反映 (v33.1.1)
-# 3. 会話回数に応じた関係性の深化（友達認定システム） (v33.1.1)
-# 4. Yahoo!リアルタイム検索によるホロメンSNS情報収集・会話反映 (v33.2.0 NEW)
-#
-# 修正履歴:
-# - DBスキーマ自動修復機能の強化 (recent_activityカラム対応)
-# 変更点:
-# 1. 全8段階のインテリジェント・フォールバック (Gemini 2.0優先)
-# 2. 内容の複雑度に応じた自動モデル振り分け (日常/複雑)
-# 3. ニュースソース拡充: Linden Lab (Second Life), CGWORLD (CG/3D)
-# 4. 話題逸らし防止プロンプト制御
-# 5. エラーモデルの一時スキップ機能 (リトライの無駄を排除)
+# ベース: v33.3.0 (全機能保持)
+# 追加機能 (v33.4.0):
+# 7. 友達プロフィール自動構築 (FriendProfile テーブル)
+# 8. 興味ログ自動蓄積 (UserInterestLog テーブル / 90日自動削除)
+# 9. 会話ごとのリアルタイム興味キーワード抽出
+# 10. 友達の記憶を全プロンプトに注入
+# 11. 友達向け能動的な話題振り生成
+# ===
+# ベース: v33.2.0 (全機能保持)
+# 追加機能 (v33.3.0):
+# 1. 配信情報の自動収集 (5chまとめ/Yahoo!リアルタイム検索から)
+# 2. もちこの感想データベース (HolomemFeelings テーブル)
+# 3. 配信ごとの反応記録 (StreamReactions テーブル / 1ヶ月自動削除)
+# 4. 感情分析エンジン (もちこの性格に基づいた反応生成)
+# 5. 記憶の蓄積と参照 (過去の感想を会話に反映)
+# 6. データベース容量管理システム
+# ==============================================================================
+
 # ===== 標準ライブラリ =====
 import sys
 import os
@@ -82,18 +85,15 @@ MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
 
-# ★ パーソナライズ設定
-FRIEND_THRESHOLD = 5  # この回数以上で友達認定
-ANALYSIS_INTERVAL = 5  # この回数ごとに心理分析を実行
-TOPIC_SUGGESTION_INTERVAL = 10  # この回数ごとに話題を提案
+# パーソナライズ設定
+FRIEND_THRESHOLD = 5
+ANALYSIS_INTERVAL = 5
+TOPIC_SUGGESTION_INTERVAL = 10
 
-# ==============================================================================
-# 【変更2】GEMINI_MODELS 定数を追加（行80付近）
-# ==============================================================================
 GEMINI_MODELS = [
-    "gemini-1.5-flash",      # 最も安定
-    "gemini-1.5-flash-8b",   # 軽量版
-    "gemini-2.0-flash-exp",  # 実験版（制限厳しい）
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-2.0-flash-exp",
 ]
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -121,15 +121,14 @@ class GroqModelStatus:
     is_limited: bool = False
     reset_time: Optional[datetime] = None
     last_error: Optional[str] = None
-# ==============================================================================
-# 【変更1】データクラスに GeminiModelStatus を追加
-# ==============================================================================
+
 @dataclass
 class GeminiModelStatus:
     is_limited: bool = False
     reset_time: Optional[datetime] = None
     current_model: str = "gemini-1.5-flash"
     last_error: Optional[str] = None
+
 @dataclass
 class UserData:
     uuid: str
@@ -138,6 +137,7 @@ class UserData:
     is_friend: bool = False
     favorite_topics: List[str] = field(default_factory=list)
     psychology: Optional[Dict] = None
+    friend_profile: Optional[Dict] = None   # ★ v33.4.0追加: 友達プロフィール
 
 # ==============================================================================
 # グローバル状態管理
@@ -160,9 +160,7 @@ class GlobalState:
     @active_voicevox_url.setter
     def active_voicevox_url(self, value: Optional[str]):
         with self._lock: self._active_voicevox_url = value
-# ==============================================================================
-# 【変更3】GeminiModelManager クラスを追加（行120付近、GlobalStateの後）
-# ==============================================================================
+
 class GeminiModelManager:
     """Geminiモデルのフォールバック管理"""
     def __init__(self):
@@ -173,16 +171,13 @@ class GeminiModelManager:
         self._gemini_instances = {}
     
     def get_current_model(self) -> Optional[Any]:
-        """現在利用可能なGeminiモデルを取得"""
         with self._lock:
-            # 制限中かつリセット時間を過ぎていたらリセット
             if self._status.is_limited and self._status.reset_time:
                 if datetime.utcnow() >= self._status.reset_time:
                     logger.info(f"✅ Gemini制限解除: {self._status.current_model}")
                     self._status.is_limited = False
                     self._status.reset_time = None
             
-            # 制限中なら次のモデルを試す
             if self._status.is_limited:
                 self._current_index = (self._current_index + 1) % len(self._models)
                 self._status.current_model = self._models[self._current_index]
@@ -191,7 +186,6 @@ class GeminiModelManager:
             
             model_name = self._models[self._current_index]
             
-            # キャッシュから取得または新規作成
             if model_name not in self._gemini_instances:
                 try:
                     self._gemini_instances[model_name] = genai.GenerativeModel(model_name)
@@ -203,14 +197,12 @@ class GeminiModelManager:
             return self._gemini_instances[model_name]
     
     def mark_limited(self, wait_seconds: int = 60):
-        """Geminiが制限された際の処理"""
         with self._lock:
             self._status.is_limited = True
             self._status.reset_time = datetime.utcnow() + timedelta(seconds=wait_seconds)
             logger.warning(f"⚠️ Gemini制限検知 ({self._status.current_model}): {wait_seconds}秒後にリトライ")
     
     def get_status_report(self) -> str:
-        """ステータスレポート"""
         with self._lock:
             if self._status.is_limited and self._status.reset_time:
                 jst = (self._status.reset_time + timedelta(hours=9)).strftime('%H:%M:%S')
@@ -295,6 +287,9 @@ DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko_ultimate.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+# GitHub Actions から /wake を叩く際の認証キー
+# Render の Environment Variables と GitHub の Secrets に同じ値を設定する
+WAKE_API_KEY = get_secret('WAKE_API_KEY')
 
 # ==============================================================================
 # データベースモデル
@@ -352,7 +347,6 @@ class HolomemWiki(Base):
     graduation_reason = Column(Text, nullable=True)
     mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    # ★ 新規追加: 最新のXでの話題などを保存するカラム
     recent_activity = Column(Text, nullable=True)
 
 class HololiveNews(Base):
@@ -376,11 +370,98 @@ class HololiveGlossary(Base):
     term = Column(String(100), unique=True, nullable=False, index=True)
     description = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-# タスクの実行時間を記録するテーブル
+
 class TaskLog(Base):
+    """
+    バックグラウンドタスクの最終実行時刻を記録する。
+    Renderのスリープ復帰時にキャッチアップ実行を判断するために使う。
+    """
     __tablename__ = 'task_logs'
     task_name = Column(String(100), primary_key=True)
     last_run = Column(DateTime, default=datetime.utcnow)
+    last_success = Column(DateTime, nullable=True)   # 最後に正常完了した時刻
+    run_count = Column(Integer, default=0)           # 累計実行回数
+    last_error = Column(Text, nullable=True)         # 最後のエラーメッセージ
+
+# ==============================================================================
+# ★ 追加 (v33.4.0): 友達プロフィール & 興味ログテーブル
+# ==============================================================================
+class FriendProfile(Base):
+    """
+    友達登録済みユーザーの詳細プロフィール。
+    もちこが「この人のこと」を覚えておくための長期記憶。
+    """
+    __tablename__ = 'friend_profiles'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), unique=True, nullable=False, index=True)
+    user_name = Column(String(255), nullable=False)
+
+    # ホロライブ系の好み
+    fav_holomem = Column(String(300), nullable=True)       # 好きなホロメン (カンマ区切り)
+    fav_gen = Column(String(100), nullable=True)           # 好きな世代
+    fav_stream_type = Column(String(200), nullable=True)   # 好きな配信ジャンル
+
+    # 一般的な趣味・嗜好
+    hobbies = Column(String(300), nullable=True)           # 趣味 (カンマ区切り)
+    fav_games = Column(String(300), nullable=True)         # 好きなゲーム
+    fav_music = Column(String(300), nullable=True)         # 好きな音楽
+    fav_anime = Column(String(300), nullable=True)         # 好きなアニメ・漫画
+
+    # 個人メモ (AIが会話から自動更新)
+    memo = Column(Text, nullable=True)                     # もちこのメモ (自由形式・400文字)
+    mood_tendency = Column(String(50), nullable=True)      # 普段のテンション (元気/落ち着き/etc)
+
+    # 統計
+    friend_since = Column(DateTime, default=datetime.utcnow)
+    last_deep_talk = Column(DateTime, nullable=True)       # 最後に深い話をした日時
+    total_friend_messages = Column(Integer, default=0)
+
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class UserInterestLog(Base):
+    """
+    会話から自動抽出した興味・言及ログ。
+    具体的なキーワードを蓄積して「この人が何を好きか」を精度高く把握する。
+    古いエントリは自動削除 (90日)。
+    """
+    __tablename__ = 'user_interest_logs'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    category = Column(String(50), nullable=False, index=True)  # holomem / game / anime / music / etc
+    keyword = Column(String(100), nullable=False)              # 具体的なキーワード
+    mention_count = Column(Integer, default=1)                 # 言及回数
+    sentiment = Column(String(10), default='positive')         # positive / negative / neutral
+    last_mentioned = Column(DateTime, default=datetime.utcnow, index=True)
+    first_mentioned = Column(DateTime, default=datetime.utcnow)
+
+# ==============================================================================
+# ★ 追加 (v33.3.0): 配信反応 & もちこの想いテーブル
+# ==============================================================================
+class StreamReaction(Base):
+    """配信への反応記録 (1ヶ月で自動削除)"""
+    __tablename__ = 'stream_reactions'
+    id = Column(Integer, primary_key=True)
+    member_name = Column(String(100), nullable=False, index=True)
+    stream_title = Column(String(300), nullable=False)
+    stream_date = Column(DateTime, nullable=False, index=True)
+    mochiko_feeling = Column(String(300), nullable=False)
+    emotion_tags = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class HolomemFeeling(Base):
+    """ホロメンへのもちこの想い (要約版・容量制限)"""
+    __tablename__ = 'holomem_feelings'
+    id = Column(Integer, primary_key=True)
+    member_name = Column(String(100), unique=True, nullable=False, index=True)
+    summary_feeling = Column(String(400), nullable=True)
+    memorable_streams = Column(String(500), nullable=True)
+    total_watch_count = Column(Integer, default=0)
+    love_level = Column(Integer, default=50)
+    last_emotion = Column(String(20), nullable=True)
+    last_watched = Column(DateTime, nullable=True)
+    last_summary_update = Column(DateTime, nullable=True)
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # ==============================================================================
 # セッション & ユーティリティ
 # ==============================================================================
@@ -456,7 +537,6 @@ def extract_location(msg: str) -> str:
     return "東京"
 
 def get_weather_forecast(location: str = "東京") -> str:
-    """天気予報を取得"""
     try:
         location_code = LOCATION_CODES.get(location, LOCATION_CODES["東京"])
         url = f"https://weather.tsukumijima.net/api/forecast/city/{location_code}"
@@ -469,26 +549,21 @@ def get_weather_forecast(location: str = "東京") -> str:
         return f"{location}の天気情報が取得できなかったよ…"
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
-    # ユーザー取得または作成
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
     if user:
         user.interaction_count += 1
         user.last_interaction = datetime.utcnow()
         if user.user_name != user_name: user.user_name = user_name
-        
-        # 友達認定チェック
         if hasattr(user, 'is_friend'):
             if user.interaction_count >= FRIEND_THRESHOLD and not user.is_friend:
                 user.is_friend = True
                 logger.info(f"🎉 {user_name}さんが友達に認定されました！")
         else:
-            logger.warning("is_friend column missing on model access")
-            user.is_friend = False 
+            user.is_friend = False
     else:
         user = UserMemory(user_uuid=user_uuid, user_name=user_name, interaction_count=1)
         session.add(user)
     
-    # 心理データ取得
     psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
     fav_topics = []
     psych_data = None
@@ -500,14 +575,41 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
             'extraversion': psych.extraversion,
             'confidence': psych.analysis_confidence
         }
-    
+
+    # ★ v33.4.0: 友達プロフィールを読み込む
+    friend_profile_data = None
+    is_friend = getattr(user, 'is_friend', False)
+    if is_friend:
+        fp = session.query(FriendProfile).filter_by(user_uuid=user_uuid).first()
+        if fp:
+            friend_profile_data = {
+                'fav_holomem': fp.fav_holomem,
+                'fav_gen': fp.fav_gen,
+                'fav_stream_type': fp.fav_stream_type,
+                'hobbies': fp.hobbies,
+                'fav_games': fp.fav_games,
+                'fav_music': fp.fav_music,
+                'fav_anime': fp.fav_anime,
+                'memo': fp.memo,
+                'mood_tendency': fp.mood_tendency,
+                'total_friend_messages': fp.total_friend_messages,
+            }
+            # 友達メッセージ数を更新
+            fp.total_friend_messages += 1
+            fp.last_updated = datetime.utcnow()
+        else:
+            # 友達認定されたばかりの場合、プロフィールを新規作成
+            fp = FriendProfile(user_uuid=user_uuid, user_name=user_name)
+            session.add(fp)
+
     return UserData(
         uuid=user.user_uuid,
         name=user.user_name,
         interaction_count=user.interaction_count,
-        is_friend=getattr(user, 'is_friend', False),
+        is_friend=is_friend,
         favorite_topics=fav_topics,
-        psychology=psych_data
+        psychology=psych_data,
+        friend_profile=friend_profile_data
     )
 
 def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[Dict]:
@@ -612,7 +714,6 @@ def get_holomem_info_cached(member_name: str) -> Optional[Dict]:
     with get_db_session() as session:
         wiki = session.query(HolomemWiki).filter_by(member_name=member_name).first()
         if wiki:
-            # ★ 修正: recent_activityを追加
             data = {k: getattr(wiki, k) for k in ['member_name', 'description', 'generation', 'debut_date', 'tags', 'status', 'graduation_date', 'mochiko_feeling', 'recent_activity']}
             with _holomem_cache_lock:
                 _holomem_cache[member_name] = data
@@ -644,23 +745,20 @@ def get_holomem_context(member_name: str) -> str:
         context += f"- 状態: {info['status']}\n"
         if info['status'] == '卒業' and info.get('graduation_date'):
             context += f"- 卒業日: {info['graduation_date']}\n"
-    
-    # ★ 追加: Xの最新情報がある場合はコンテキストに追加
     if info.get('recent_activity'):
          context += f"\n【{info['member_name']}に関する直近のX(Twitter)の様子・話題】\n{info['recent_activity']}\n"
     
     return context
 
 # ==============================================================================
-# ★ 追加機能: Yahoo!リアルタイム検索連携
+# Yahoo!リアルタイム検索連携
 # ==============================================================================
 def scrape_yahoo_realtime_for_member(member_name: str) -> str:
     """指定したメンバーのリアルタイム検索結果をテキストで返す"""
     try:
-        # 検索クエリ: 名前を含み、RTを除く
         query = f"{member_name} -RT"
         url = "https://search.yahoo.co.jp/realtime/search"
-        params = {'p': query, 'ei': 'UTF-8', 'm': 'latency'} # m=latencyで新着順
+        params = {'p': query, 'ei': 'UTF-8', 'm': 'latency'}
         headers = {'User-Agent': random.choice(USER_AGENTS)}
         
         res = requests.get(url, params=params, headers=headers, timeout=10)
@@ -668,7 +766,6 @@ def scrape_yahoo_realtime_for_member(member_name: str) -> str:
         
         soup = BeautifulSoup(res.content, 'html.parser')
         texts = []
-        # 最新の5件程度を取得
         for item in soup.select('.cnt.cf')[:5]:
             txt = item.select_one('.kw')
             tim = item.select_one('.tim')
@@ -683,10 +780,9 @@ def scrape_yahoo_realtime_for_member(member_name: str) -> str:
         return ""
 
 def update_holomem_social_activities():
-    """全ホロメンの最新状況をYahooから収集してDB更新（少しずつ行う）"""
+    """全ホロメンの最新状況をYahooから収集してDB更新"""
     logger.info("🐦 ホロメンSNS状況更新タスク開始")
     with get_db_session() as session:
-        # 更新が古い順、またはランダムに5人選んで更新（全アクセスによるBAN防止）
         members = session.query(HolomemWiki).order_by(HolomemWiki.last_updated.asc()).limit(5).all()
         
         for m in members:
@@ -694,21 +790,386 @@ def update_holomem_social_activities():
             activities = scrape_yahoo_realtime_for_member(m.member_name)
             
             if activities:
-                # DBに保存
                 m.recent_activity = activities
                 m.last_updated = datetime.utcnow()
-                # キャッシュクリア
                 clear_holomem_cache(m.member_name)
             
-            time.sleep(3) # アクセス間隔を空ける
+            time.sleep(3)
             
     logger.info("✅ SNS状況更新完了")
+
+# ==============================================================================
+# ★ 追加 (v33.3.0): 配信情報収集システム
+# ==============================================================================
+def scrape_hololive_stream_info() -> List[Dict]:
+    """
+    ホロライブの配信情報をネットから収集
+    - 5chまとめサイト
+    - Yahoo!リアルタイム検索
+    """
+    logger.info("📺 配信情報収集開始...")
+    stream_data = []
+    
+    try:
+        matome_sites = [
+            "https://vtubermatome.com/",
+            "https://hololive-tsuushin.com/"
+        ]
+        
+        for site in matome_sites:
+            try:
+                res = requests.get(site, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+                if res.status_code == 200:
+                    soup = BeautifulSoup(res.content, 'html.parser')
+                    articles = soup.select('article, .post')[:10]
+                    for art in articles:
+                        title_elem = art.find(['h1', 'h2', 'h3'])
+                        if title_elem:
+                            title = clean_text(title_elem.text)
+                            if any(kw in title for kw in ['配信', '切り抜き', 'ライブ', '歌枠', 'コラボ']):
+                                stream_data.append({
+                                    'title': title,
+                                    'source': 'matome',
+                                    'url': art.find('a').get('href') if art.find('a') else '',
+                                    'date': datetime.utcnow()
+                                })
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"まとめサイト収集エラー ({site}): {e}")
+    except Exception as e:
+        logger.error(f"配信情報収集エラー: {e}")
+    
+    return stream_data
+
+def analyze_stream_reactions(member_name: str, stream_title: str) -> Dict:
+    """配信への反応を分析 (Yahoo!リアルタイム検索から)"""
+    reactions = {
+        'positive_keywords': [],
+        'highlight_moments': [],
+        'fan_comments': []
+    }
+    
+    try:
+        query = f"{member_name} {stream_title[:20]}"
+        url = "https://search.yahoo.co.jp/realtime/search"
+        params = {'p': query, 'ei': 'UTF-8'}
+        
+        res = requests.get(url, params=params, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content, 'html.parser')
+            tweets = soup.select('.cnt.cf')[:10]
+            for tweet in tweets:
+                txt = tweet.select_one('.kw')
+                if txt:
+                    content = clean_text(txt.text)
+                    if any(kw in content for kw in ['神', '最高', '面白', '笑った', '感動', '泣いた', 'エモい']):
+                        reactions['positive_keywords'].append(content[:50])
+                    if any(kw in content for kw in ['シーン', '場面', 'ここ', 'タイムスタンプ', '爆笑']):
+                        reactions['highlight_moments'].append(content[:50])
+    
+    except Exception as e:
+        logger.error(f"反応分析エラー: {e}")
+    
+    return reactions
+
+# ==============================================================================
+# ★ 追加 (v33.3.0): もちこの感想生成エンジン
+# ==============================================================================
+def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Dict) -> Dict:
+    """ネットの反応からもちこの感想を生成 (詳細版: 300文字)"""
+    emotion_tags = []
+    if any('笑' in kw or '爆笑' in kw for kw in reactions.get('positive_keywords', [])):
+        emotion_tags.append('爆笑')
+    if any('感動' in kw or '泣' in kw for kw in reactions.get('positive_keywords', [])):
+        emotion_tags.append('感動')
+    if any('神' in kw or '最高' in kw for kw in reactions.get('positive_keywords', [])):
+        emotion_tags.append('興奮')
+    
+    prompt = f"""あなたは「もちこ」というホロライブの熱狂的なファンです。
+
+【配信情報】
+- ホロメン: {member_name}
+- タイトル: {stream_title}
+- ネットの反応: {', '.join(reactions.get('positive_keywords', [])[:5])}
+
+【あなたの役割】
+この配信を見た「もちこ」として、具体的で感情豊かな感想を300文字以内で書いてください。
+
+【もちこの口調】
+- 一人称: 「あてぃし」
+- 語尾: 「〜じゃん」「〜て感じ」「まじ」「超」「やばい」
+- 感情豊かで熱量高め、具体的な描写を入れる
+
+【良い例 (濃い)】
+「まじ神回！{member_name}のあのリアクション爆笑すぎてお腹痛いww しかもトークのテンポ感が最高で、あの展開まじ予想外だったし。ファンサも神だったわ〜」
+
+【出力形式】
+感想だけを出力してください (説明不要)
+"""
+    
+    try:
+        model = gemini_model_manager.get_current_model()
+        if model:
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 200})
+            if hasattr(response, 'candidates') and response.candidates:
+                feeling = response.candidates[0].content.parts[0].text.strip()
+                return {
+                    'feeling': feeling[:300],
+                    'emotion_tags': ','.join(emotion_tags),
+                    'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                }
+    except Exception as e:
+        logger.error(f"感想生成エラー: {e}")
+    
+    # フォールバック: 詳細テンプレート
+    templates = [
+        f"{member_name}の配信まじ最高だった！特に{stream_title[:20]}...の展開、予想外すぎて爆笑したわ。トークのテンポ感も神だし、リスナーとのやり取りも面白すぎる。",
+        f"今日の{member_name}、神回すぎてやばい。{stream_title[:20]}...って内容だったんだけど、あのリアクション最高すぎて何回も見返してる。まじ推せるわ〜",
+        f"{member_name}のこの配信、何回でも見れるわ〜。{stream_title[:20]}...のシーン、まじ感動したし泣きそうになった。あの距離感と優しさがほんと好き。"
+    ]
+    
+    return {
+        'feeling': random.choice(templates)[:300],
+        'emotion_tags': ','.join(emotion_tags),
+        'favorite_part': None
+    }
+
+# ==============================================================================
+# ★ 追加 (v33.3.0): データベース容量管理システム
+# ==============================================================================
+def cleanup_old_stream_reactions():
+    """1ヶ月以上前の配信反応を自動削除"""
+    logger.info("🗑️ 古い配信反応の削除開始...")
+    
+    try:
+        cutoff_date = datetime.utcnow() - timedelta(days=30)
+        with get_db_session() as session:
+            old_count = session.query(StreamReaction).filter(
+                StreamReaction.created_at < cutoff_date
+            ).count()
+            
+            if old_count > 0:
+                session.query(StreamReaction).filter(
+                    StreamReaction.created_at < cutoff_date
+                ).delete()
+                logger.info(f"✅ {old_count}件の古い反応を削除しました")
+            else:
+                logger.info("✅ 削除対象なし")
+                
+    except Exception as e:
+        logger.error(f"❌ クリーンアップエラー: {e}")
+
+def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict]:
+    """複数の感想を1つに要約 (詳細版: 解像度を保つ)"""
+    if not reactions:
+        return None
+    
+    feelings_text = "\n".join([
+        f"- 「{r.stream_title[:40]}」: {r.mochiko_feeling}" 
+        for r in reactions[:10]
+    ])
+    
+    prompt = f"""あなたは「もちこ」というホロライブの熱狂的なファンです。
+
+【配信情報】
+ホロメン: {member_name}
+過去1ヶ月の感想:
+{feelings_text}
+
+【要約タスク】
+上記の感想を400文字以内で要約してください。
+
+【重要な要件】
+1. 「もちこ」の口調 (ギャル語) を維持
+2. 400文字以内
+3. このホロメンの「どこが好きか」「どんな配信が好きか」「最近の印象」を具体的に
+4. 個性や魅力が伝わる内容に (解像度を高く保つ)
+5. 感情豊かに、熱量を持って表現
+
+【出力形式】
+要約だけを出力してください (前置き不要)
+"""
+    
+    try:
+        model = gemini_model_manager.get_current_model()
+        if model:
+            response = model.generate_content(
+                prompt, 
+                generation_config={"temperature": 0.8, "max_output_tokens": 300}
+            )
+            if hasattr(response, 'candidates') and response.candidates:
+                summary = response.candidates[0].content.parts[0].text.strip()
+                memorable = []
+                for r in reactions[:5]:
+                    if any(tag in (r.emotion_tags or '') for tag in ['興奮', '感動']):
+                        memorable.append(r.stream_title[:60])
+                return {
+                    'summary': summary[:400],
+                    'memorable': '、'.join(memorable)[:500]
+                }
+    except Exception as e:
+        logger.error(f"要約生成エラー: {e}")
+    
+    return None
+
+def summarize_member_feelings():
+    """各ホロメンへの想いを定期的に要約 (週1回実行)"""
+    logger.info("📝 想いの要約処理開始...")
+    
+    try:
+        with get_db_session() as session:
+            feelings = session.query(HolomemFeeling).all()
+            
+            for feeling in feelings:
+                if feeling.last_summary_update:
+                    days_since_update = (datetime.utcnow() - feeling.last_summary_update).days
+                    if days_since_update < 7:
+                        continue
+                
+                one_month_ago = datetime.utcnow() - timedelta(days=30)
+                recent_reactions = session.query(StreamReaction).filter(
+                    StreamReaction.member_name == feeling.member_name,
+                    StreamReaction.created_at >= one_month_ago
+                ).order_by(StreamReaction.created_at.desc()).limit(15).all()
+                
+                if len(recent_reactions) < 3:
+                    continue
+                
+                summary = generate_feeling_summary(feeling.member_name, recent_reactions)
+                
+                if summary:
+                    feeling.summary_feeling = summary['summary'][:400]
+                    feeling.memorable_streams = summary['memorable'][:500]
+                    feeling.last_summary_update = datetime.utcnow()
+                    logger.info(f"✅ {feeling.member_name}の想いを要約 (解像度: 高)")
+                
+                time.sleep(2)
+                
+    except Exception as e:
+        logger.error(f"❌ 要約処理エラー: {e}")
+
+def get_database_size_stats() -> Dict:
+    """データベースの容量統計を取得"""
+    stats = {}
+    try:
+        with get_db_session() as session:
+            stats['stream_reactions'] = session.query(StreamReaction).count()
+            stats['holomem_feelings'] = session.query(HolomemFeeling).count()
+            
+            oldest = session.query(StreamReaction).order_by(StreamReaction.created_at.asc()).first()
+            newest = session.query(StreamReaction).order_by(StreamReaction.created_at.desc()).first()
+            
+            if oldest:
+                stats['oldest_reaction'] = oldest.created_at.isoformat()
+            if newest:
+                stats['newest_reaction'] = newest.created_at.isoformat()
+    except Exception as e:
+        logger.error(f"統計取得エラー: {e}")
+    
+    return stats
+
+def process_daily_streams():
+    """1日1回実行: 配信情報を収集してもちこの感想を記録 (容量制限: 1日最大5件)"""
+    logger.info("🎬 日次配信処理開始...")
+    
+    streams = scrape_hololive_stream_info()
+    processed_count = 0
+    max_daily_streams = 5
+    
+    with get_db_session() as session:
+        for stream_info in streams[:10]:
+            if processed_count >= max_daily_streams:
+                break
+            
+            try:
+                title = stream_info['title']
+                detected_member = holomem_manager.detect_in_message(title)
+                if not detected_member:
+                    continue
+                
+                logger.info(f"📺 処理中: {detected_member} - {title[:30]}...")
+                
+                reactions = analyze_stream_reactions(detected_member, title)
+                mochiko_reaction = generate_mochiko_reaction(detected_member, title, reactions)
+                
+                existing = session.query(StreamReaction).filter_by(
+                    member_name=detected_member,
+                    stream_title=title[:300]
+                ).first()
+                
+                if not existing:
+                    new_reaction = StreamReaction(
+                        member_name=detected_member,
+                        stream_title=title[:300],
+                        stream_date=stream_info['date'],
+                        mochiko_feeling=mochiko_reaction['feeling'][:300],
+                        emotion_tags=mochiko_reaction['emotion_tags'][:50]
+                    )
+                    session.add(new_reaction)
+                    processed_count += 1
+                    
+                    feeling = session.query(HolomemFeeling).filter_by(member_name=detected_member).first()
+                    if not feeling:
+                        feeling = HolomemFeeling(member_name=detected_member)
+                        session.add(feeling)
+                    
+                    feeling.total_watch_count += 1
+                    feeling.last_watched = datetime.utcnow()
+                    feeling.last_emotion = mochiko_reaction['emotion_tags'].split(',')[0] if mochiko_reaction['emotion_tags'] else None
+                    
+                    if '興奮' in (mochiko_reaction['emotion_tags'] or ''):
+                        feeling.love_level = min(100, feeling.love_level + 5)
+                    elif '感動' in (mochiko_reaction['emotion_tags'] or ''):
+                        feeling.love_level = min(100, feeling.love_level + 3)
+                    
+                    logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
+                
+                time.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"配信処理エラー: {e}")
+    
+    logger.info(f"✅ 日次配信処理完了 ({processed_count}件処理)")
+    cleanup_old_stream_reactions()
+
+# ==============================================================================
+# ★ 追加 (v33.3.0): もちこの記憶取得
+# ==============================================================================
+def get_mochiko_memory_context(member_name: str) -> str:
+    """もちこの記憶 (要約版) をコンテキストとして取得"""
+    context = ""
+    
+    try:
+        with get_db_session() as session:
+            feeling = session.query(HolomemFeeling).filter_by(member_name=member_name).first()
+            if feeling:
+                context += f"\n【もちこの{member_name}への想い】\n"
+                if feeling.summary_feeling:
+                    context += f"{feeling.summary_feeling}\n"
+                context += f"- 推し度: {feeling.love_level}/100 (視聴{feeling.total_watch_count}回)\n"
+                if feeling.memorable_streams:
+                    context += f"- 印象的だった配信: {feeling.memorable_streams}\n"
+            
+            one_month_ago = datetime.utcnow() - timedelta(days=30)
+            recent_reactions = session.query(StreamReaction).filter(
+                StreamReaction.member_name == member_name,
+                StreamReaction.created_at >= one_month_ago
+            ).order_by(StreamReaction.created_at.desc()).limit(3).all()
+            
+            if recent_reactions:
+                context += f"\n【最近見た{member_name}の配信】\n"
+                for r in recent_reactions:
+                    context += f"- 「{r.stream_title[:30]}...」→ {r.mochiko_feeling[:50]}\n"
+    
+    except Exception as e:
+        logger.error(f"記憶取得エラー: {e}")
+    
+    return context
 
 # ==============================================================================
 # ホロメンスクレイピング & DB更新
 # ==============================================================================
 def scrape_hololive_wiki() -> List[Dict]:
-    """Seesaa Wikiからホロメン情報を取得"""
     url = "https://seesaawiki.jp/hololivetv/d/%a5%db%a5%ed%a5%e9%a5%a4%a5%d6"
     results = []
     try:
@@ -832,7 +1293,6 @@ def fetch_hololive_news():
         logger.error(f"News fetch failed: {e}")
 
 def fetch_hololive_tsuushin_news():
-    """ホロライブ通信からニュースを取得"""
     logger.info("📰 ホロライブ通信の更新チェック開始...")
     url = "https://hololive-tsuushin.com/holonews/"
     try:
@@ -867,53 +1327,166 @@ def fetch_hololive_tsuushin_news():
         logger.error(f"❌ ホロライブ通信の取得に失敗: {e}")
 
 def wrapped_news_fetch():
-    """公式サイトとホロライブ通信の両方からニュースを取得"""
+    """ニュース収集タスク (run_managed_task から呼ばれる)"""
     fetch_hololive_news()
     fetch_hololive_tsuushin_news()
-    with get_db_session() as session:
-        log = session.query(TaskLog).filter_by(task_name='fetch_news').first()
-        if not log:
-            log = TaskLog(task_name='fetch_news')
-            session.add(log)
-        log.last_run = datetime.utcnow()
 
-# --- [強化] ニュース取得関数 ---
-def fetch_news_task_integrated():
-    # 1. app (1).py のSNS情報を取得
-    try:
-        update_holomem_social_activities()
-    except Exception as e:
-        logger.error(f"SNS収集エラー: {e}")
-
-    # 2. SL / CG / 公式ニュースを取得
-    sources = [
-        {"name": "SecondLife", "url": "https://community.secondlife.com/blogs/rss/3-featured-news/", "type": "rss"},
-        {"name": "CGWORLD", "url": "https://cgworld.jp/rss/news/", "type": "rss"}
-    ]
-    
 def wrapped_holomem_update():
-    """ホロメンDBを更新して実行時間を記録する"""
+    """ホロメンDB更新タスク (run_managed_task から呼ばれる)"""
     update_holomem_database()
-    with get_db_session() as session:
-        log = session.query(TaskLog).filter_by(task_name='update_holomem').first()
-        if not log:
-            log = TaskLog(task_name='update_holomem')
-            session.add(log)
-        log.last_run = datetime.utcnow()
 
-def catch_up_task(task_name, wrapped_func, interval_hours=1):
-    """前回の実行から時間が経ちすぎていたら実行する"""
-    with get_db_session() as session:
-        log = session.query(TaskLog).filter_by(task_name=task_name).first()
-        now = datetime.utcnow()
-        if not log or (now - log.last_run) >= timedelta(hours=interval_hours):
-            logger.info(f"⏰ タスク '{task_name}' をキャッチアップ実行します。")
-            background_executor.submit(wrapped_func)
+# ==============================================================================
+# ★ v33.5.0: Render スリープ対策 - 全スケジュールを「経過時間チェック」方式に統一
+# ==============================================================================
+#
+# 問題: Render無料プランはアイドル時にスリープする。
+#       schedule.every().day.at("03:00") のような「時刻指定」は
+#       スリープ中に発火しない → タスクが永遠に実行されなくなる。
+#
+# 解決策:
+#   1. 全タスクを「前回実行からの経過時間」で判定する needs_run() 方式に統一。
+#   2. /wake エンドポイントを追加し、UptimeRobot等の外部cronから
+#      定期的にPINGさせる。PINGのたびに catch_up_all_tasks() を実行することで
+#      スリープ中に漏れたタスクを確実に補完する。
+#   3. run_scheduler() ループも /wake と同じ catch_up_all_tasks() を呼ぶ。
+#
+# タスク一覧と推奨実行間隔:
+# ==============================================================================
+# ★ v33.6.0: 省エネスケジューリング設計
+#
+# 【基本思想】
+#   Render無料枠(750h/月)を節約するため、GitHub Actionsで1日2〜3回だけ
+#   叩き起こし、その数分間だけ起動して情報収集 → またスリープ。
+#   常時起動をやめることで月に10〜20時間しか消費しない。
+#
+# 【interval_hours の決め方】
+#   GitHub Actionsが12時間間隔で叩く → 12h未満にすると「毎回実行」になる。
+#   実際のコンテンツ更新頻度に合わせて設定:
+#     fetch_news        : 12h  → 1日2回 (朝・夜のニュース)
+#     update_holomem    : 24h  → 1日1回 (深夜バッチ)
+#     update_sns        : 12h  → 1日2回 (SNS情報)
+#     process_streams   : 24h  → 1日1回
+#     cleanup系         : 24h〜168h (頻繁にやる必要なし)
+#
+# 【run_scheduler について】
+#   常時起動設計では5分ごとにループしていたが、省エネ設計では不要。
+#   GitHub Actionsが外部cronとして機能するため廃止。
+#   プロセス内スケジューラは最低限のもの (voice cleanup のみ) に絞る。
+# ==============================================================================
+TASK_SCHEDULE: Dict[str, Dict] = {
+    # ── 情報収集 (GitHub Actionsが起こすたびに実行) ──────────────────────────
+    'fetch_news':           {'func': 'wrapped_news_fetch',               'interval_hours': 11.0},  # 12h間隔で起こすので11hで必ず実行
+    'update_holomem':       {'func': 'wrapped_holomem_update',           'interval_hours': 23.0},  # 1日1回
+    'update_sns':           {'func': 'update_holomem_social_activities', 'interval_hours': 11.0},  # 12h間隔で起こすので11hで必ず実行
+    # ── 配信処理 (1日1回) ─────────────────────────────────────────────────────
+    'process_streams':      {'func': 'process_daily_streams',            'interval_hours': 23.0},  # 1日1回
+    # ── クリーンアップ (頻度低め) ──────────────────────────────────────────────
+    'cleanup_streams':      {'func': 'cleanup_old_stream_reactions',     'interval_hours': 47.0},  # 2日に1回
+    'summarize_feelings':   {'func': 'summarize_member_feelings',        'interval_hours': 167.0}, # 週1回
+    'cleanup_interests':    {'func': 'cleanup_old_interest_logs',        'interval_hours': 167.0}, # 週1回
+    'cleanup_rate_limiter': {'func': 'chat_rate_limiter.cleanup_old_entries', 'interval_hours': 23.0},
+    # ── ローカルファイル (起動のたびに実行して問題ない軽いもの) ──────────────
+    'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
+}
+
+# タスク名 → 実際の関数のマッピング (initialize_app内で設定)
+_task_func_map: Dict[str, Any] = {}
+
+def catch_up_all_tasks():
+    """
+    全タスクを経過時間チェックして、期限切れのものだけ実行する。
+    /wake エンドポイントと run_scheduler() の両方から呼ばれる。
+    スリープ復帰後にまとめて漏れを補完するのがメインの目的。
+    """
+    for task_name, config in TASK_SCHEDULE.items():
+        try:
+            if needs_run(task_name, config['interval_hours']):
+                func = _task_func_map.get(task_name)
+                if func:
+                    run_managed_task(task_name, func)
+                else:
+                    logger.warning(f"⚠️ タスク関数未登録: {task_name}")
+        except Exception as e:
+            logger.error(f"catch_up_all_tasks エラー ({task_name}): {e}")
+
+
+
+def record_task_run(task_name: str, success: bool = True, error_msg: str = ""):
+    """タスクの実行結果をDBに記録する"""
+    try:
+        with get_db_session() as session:
+            log = session.query(TaskLog).filter_by(task_name=task_name).first()
+            if not log:
+                log = TaskLog(task_name=task_name)
+                session.add(log)
+            now = datetime.utcnow()
+            log.last_run = now
+            log.run_count = (log.run_count or 0) + 1
+            if success:
+                log.last_success = now
+                log.last_error = None
+            else:
+                log.last_error = error_msg[:500] if error_msg else "unknown error"
+    except Exception as e:
+        logger.error(f"タスク記録エラー ({task_name}): {e}")
+
+
+def run_managed_task(task_name: str, func, *args, **kwargs):
+    """
+    タスクをラップして実行結果を TaskLog に自動記録する。
+    background_executor.submit() の代わりに使う。
+    """
+    def _wrapper():
+        try:
+            logger.info(f"▶️  タスク開始: {task_name}")
+            func(*args, **kwargs)
+            record_task_run(task_name, success=True)
+            logger.info(f"✅ タスク完了: {task_name}")
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            record_task_run(task_name, success=False, error_msg=str(e))
+            logger.error(f"❌ タスク失敗 ({task_name}): {e}")
+    background_executor.submit(_wrapper)
+
+
+def get_task_last_run(task_name: str) -> Optional[datetime]:
+    """TaskLog から最終実行時刻を取得する（なければ None）"""
+    try:
+        with get_db_session() as session:
+            log = session.query(TaskLog).filter_by(task_name=task_name).first()
+            if log:
+                return log.last_run
+    except Exception as e:
+        logger.error(f"TaskLog取得エラー ({task_name}): {e}")
+    return None
+
+
+def needs_run(task_name: str, interval_hours: float) -> bool:
+    """
+    前回の実行から interval_hours 以上経過していれば True を返す。
+    DBに記録がなければ（初回 or スリープで記録消失）必ず True。
+    """
+    last = get_task_last_run(task_name)
+    if last is None:
+        return True
+    return (datetime.utcnow() - last) >= timedelta(hours=interval_hours)
+
+
+def catch_up_task(task_name: str, wrapped_func, interval_hours: float = 1):
+    """
+    起動時・PING時に呼び出し、前回実行から interval_hours 以上経過していたら
+    バックグラウンドで実行してキャッチアップする。
+    """
+    if needs_run(task_name, interval_hours):
+        logger.info(f"⏰ キャッチアップ実行: {task_name} (interval={interval_hours}h)")
+        run_managed_task(task_name, wrapped_func)
+    else:
+        logger.debug(f"⏭️  スキップ (まだ時間が来ていない): {task_name}")
+
 # ==============================================================================
 # トピック分析
 # ==============================================================================
 def analyze_user_topics(session, user_uuid: str) -> List[str]:
-    """会話履歴からユーザーの興味トピックを分析"""
     try:
         recent_messages = session.query(ConversationHistory).filter(
             ConversationHistory.user_uuid == user_uuid,
@@ -965,13 +1538,7 @@ def analyze_user_topics(session, user_uuid: str) -> List[str]:
 # ==============================================================================
 # 心理分析
 # ==============================================================================
-# ==============================================================================
-# 【変更8】analyze_user_psychology 関数を修正（行900付近）
-# 変更前: if gemini_model:
-# 変更後: gemini_model_manager.get_current_model() を使う
-# ==============================================================================
 def analyze_user_psychology(session, user_uuid: str, user_name: str):
-    """会話履歴からユーザーの性格を分析"""
     try:
         recent_messages = session.query(ConversationHistory).filter(
             ConversationHistory.user_uuid == user_uuid,
@@ -1002,7 +1569,6 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
 """
         
         result = None
-        # ★ 修正: gemini_model_manager 経由で取得
         current_gemini = gemini_model_manager.get_current_model()
         if current_gemini:
             try:
@@ -1058,7 +1624,6 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
 # 話題提案
 # ==============================================================================
 def suggest_topic(user_data: UserData) -> Optional[str]:
-    """ユーザーの好みに基づいて話題を提案"""
     if not user_data.favorite_topics:
         return None
     
@@ -1098,13 +1663,365 @@ def suggest_topic(user_data: UserData) -> Optional[str]:
     return None
 
 # ==============================================================================
+# ★ 追加 (v33.4.0): 興味抽出・友達記憶システム
+# ==============================================================================
+
+# 興味カテゴリの検出ルール
+INTEREST_RULES: List[Dict] = [
+    {
+        'category': 'holomem',
+        'keywords': ['さくらみこ','星街すいせい','白上フブキ','夏色まつり','大空スバル','猫又おかゆ','戌神ころね',
+                     '兎田ぺこら','白銀ノエル','宝鐘マリン','天音かなた','角巻わため','常闇トワ','姫森ルーナ',
+                     'ラプラス','博衣こより','風真いろは','鷹嶺ルイ','沙花叉','桐生ココ','湊あくあ',
+                     'みこち','すいちゃん','フブちゃん','ぺこら','あくたん','スバル','おかゆ','ころさん',
+                     '団長','船長','かなたん','わため','トワ様','ルーナ','ラプ様','こよ','ござる']
+    },
+    {
+        'category': 'game',
+        'keywords': ['マイクラ','Minecraft','ポケモン','ゼルダ','スプラ','apex','Apex','モンハン',
+                     'ストリートファイター','FF','ドラクエ','あつ森','スターデュー','VALO','valorant',
+                     'パルワールド','Steam','Switch','PS5','ゲーム','プレイ']
+    },
+    {
+        'category': 'anime',
+        'keywords': ['アニメ','漫画','マンガ','ワンピース','進撃','呪術','鬼滅','推しの子','チェンソー',
+                     '転スラ','リゼロ','ダンまち','声優','キャラ','推し','聖地巡礼']
+    },
+    {
+        'category': 'music',
+        'keywords': ['曲','歌','ライブ','コンサート','フェス','アーティスト','バンド','歌枠','カバー',
+                     'オリジナル曲','歌ってみた','音楽','playlist','プレイリスト']
+    },
+    {
+        'category': 'tech',
+        'keywords': ['プログラミング','Python','JavaScript','AI','機械学習','アプリ','開発','コード',
+                     'ChatGPT','Claude','Unity','Blender','3D','VR','AR']
+    },
+    {
+        'category': 'sports',
+        'keywords': ['サッカー','野球','バスケ','テニス','ゴルフ','筋トレ','ランニング','マラソン',
+                     'スポーツ','試合','優勝','W杯','オリンピック']
+    },
+    {
+        'category': 'food',
+        'keywords': ['ラーメン','寿司','焼肉','カフェ','スイーツ','料理','レシピ','グルメ','飯',
+                     '美味しい','おいしい','食べた','食べたい']
+    },
+    {
+        'category': 'travel',
+        'keywords': ['旅行','観光','温泉','ホテル','海外','国内旅行','聖地','行ってきた','行きたい']
+    },
+]
+
+def extract_and_save_interests(session, user_uuid: str, message: str):
+    """
+    1通のメッセージから興味キーワードを抽出してDBに蓄積する。
+    mention_countを加算し、最終言及日時を更新する。
+    """
+    try:
+        msg_lower = message.lower()
+        # ネガティブ判定用キーワード
+        negative_markers = ['嫌い','苦手','無理','最悪','つまらない','きらい']
+        sentiment = 'negative' if any(kw in message for kw in negative_markers) else 'positive'
+
+        for rule in INTEREST_RULES:
+            category = rule['category']
+            for kw in rule['keywords']:
+                if kw.lower() in msg_lower or kw in message:
+                    # 既存エントリを探す
+                    entry = session.query(UserInterestLog).filter_by(
+                        user_uuid=user_uuid,
+                        category=category,
+                        keyword=kw
+                    ).first()
+
+                    if entry:
+                        entry.mention_count += 1
+                        entry.last_mentioned = datetime.utcnow()
+                        # センチメントは最新を優先
+                        entry.sentiment = sentiment
+                    else:
+                        session.add(UserInterestLog(
+                            user_uuid=user_uuid,
+                            category=category,
+                            keyword=kw,
+                            sentiment=sentiment
+                        ))
+    except Exception as e:
+        logger.error(f"興味抽出エラー: {e}")
+
+
+def get_user_interest_summary(session, user_uuid: str) -> Dict[str, List[str]]:
+    """
+    UserInterestLogから「よく話題にするキーワード」をカテゴリ別にまとめて返す。
+    mention_count順・直近言及順に上位3件を取得。
+    """
+    result: Dict[str, List[str]] = {}
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=90)
+        entries = session.query(UserInterestLog).filter(
+            UserInterestLog.user_uuid == user_uuid,
+            UserInterestLog.sentiment == 'positive',
+            UserInterestLog.last_mentioned >= cutoff
+        ).order_by(
+            UserInterestLog.mention_count.desc(),
+            UserInterestLog.last_mentioned.desc()
+        ).all()
+
+        for entry in entries:
+            cat = entry.category
+            if cat not in result:
+                result[cat] = []
+            if len(result[cat]) < 4:  # カテゴリごと最大4キーワード
+                result[cat].append(f"{entry.keyword}(×{entry.mention_count})")
+    except Exception as e:
+        logger.error(f"興味サマリー取得エラー: {e}")
+    return result
+
+
+def cleanup_old_interest_logs():
+    """90日以上前の興味ログを削除"""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=90)
+        with get_db_session() as session:
+            deleted = session.query(UserInterestLog).filter(
+                UserInterestLog.last_mentioned < cutoff
+            ).delete()
+            if deleted:
+                logger.info(f"🗑️ 古い興味ログ {deleted}件 を削除しました")
+    except Exception as e:
+        logger.error(f"興味ログクリーンアップエラー: {e}")
+
+
+def auto_update_friend_profile(session, user_uuid: str, user_name: str):
+    """
+    会話履歴と興味ログをもとに FriendProfile を AI で自動更新する。
+    10回会話するごとにバックグラウンドで実行。
+    """
+    try:
+        # 最近の会話 (20件)
+        recent_msgs = session.query(ConversationHistory).filter(
+            ConversationHistory.user_uuid == user_uuid,
+            ConversationHistory.role == 'user'
+        ).order_by(ConversationHistory.timestamp.desc()).limit(20).all()
+
+        if len(recent_msgs) < 5:
+            return
+
+        # 興味サマリー
+        interest_summary = get_user_interest_summary(session, user_uuid)
+        interest_text = "\n".join([
+            f"- {cat}: {', '.join(kws)}" for cat, kws in interest_summary.items()
+        ]) or "（まだデータなし）"
+
+        convo_text = "\n".join([f"・{m.content}" for m in reversed(recent_msgs)])
+
+        prompt = f"""あなたは「もちこ」というAIです。
+以下は友達「{user_name}」さんとの会話と、興味ログです。
+これを読んで、このユーザーのプロフィールを JSON 形式で出力してください。
+
+【会話履歴 (最近20件)】
+{convo_text}
+
+【興味ログ (言及頻度順)】
+{interest_text}
+
+【出力形式】必ず以下のキーだけのJSONを返してください（値が不明な場合は空文字）:
+{{
+  "fav_holomem": "さくらみこ, 兎田ぺこら",
+  "fav_gen": "3期生",
+  "fav_stream_type": "ゲーム配信, 雑談",
+  "hobbies": "ゲーム, アニメ鑑賞",
+  "fav_games": "マイクラ, Apex",
+  "fav_music": "ホロライブ楽曲",
+  "fav_anime": "呪術廻戦",
+  "memo": "夜型が多い。マイクラとみこちが特に好き。ポジティブで元気な人。",
+  "mood_tendency": "元気"
+}}
+"""
+
+        result_json = None
+
+        # Gemini で生成
+        model = gemini_model_manager.get_current_model()
+        if model:
+            try:
+                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 400})
+                if hasattr(response, 'candidates') and response.candidates:
+                    text = response.candidates[0].content.parts[0].text.strip()
+                    jmatch = re.search(r'\{.*\}', text, re.DOTALL)
+                    if jmatch:
+                        result_json = json.loads(jmatch.group())
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "quota" in error_str.lower():
+                    retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+                    wait_seconds = int(float(retry_match.group(1))) + 5 if retry_match else 60
+                    gemini_model_manager.mark_limited(wait_seconds)
+                logger.warning(f"Geminiプロフィール更新エラー: {e}")
+
+        # フォールバック: Groq
+        if not result_json and groq_client:
+            try:
+                available = groq_model_manager.get_available_models()
+                if available:
+                    resp = groq_client.chat.completions.create(
+                        model=available[0],
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3, max_tokens=400
+                    )
+                    text = resp.choices[0].message.content.strip()
+                    jmatch = re.search(r'\{.*\}', text, re.DOTALL)
+                    if jmatch:
+                        result_json = json.loads(jmatch.group())
+            except Exception as e:
+                logger.warning(f"Groqプロフィール更新エラー: {e}")
+
+        if result_json:
+            fp = session.query(FriendProfile).filter_by(user_uuid=user_uuid).first()
+            if not fp:
+                fp = FriendProfile(user_uuid=user_uuid, user_name=user_name)
+                session.add(fp)
+
+            for field_name in ['fav_holomem','fav_gen','fav_stream_type','hobbies',
+                               'fav_games','fav_music','fav_anime','mood_tendency']:
+                val = result_json.get(field_name, '')
+                if val:
+                    setattr(fp, field_name, str(val)[:300])
+
+            # memo は既存を賢くマージ（単純に上書き）
+            new_memo = result_json.get('memo', '')
+            if new_memo:
+                fp.memo = str(new_memo)[:400]
+
+            fp.last_updated = datetime.utcnow()
+            logger.info(f"✅ {user_name}さんの友達プロフィール自動更新完了")
+
+    except Exception as e:
+        logger.error(f"友達プロフィール更新エラー: {e}")
+
+
+def get_friend_context(user_data: UserData, session) -> str:
+    """
+    友達の記憶（プロフィール + 興味ログ）をプロンプト用テキストとして組み立てる。
+    友達でない場合は空文字を返す。
+    """
+    if not user_data.is_friend:
+        return ""
+
+    context_parts = [f"━━━━【{user_data.name}さんとの友達記憶】━━━━"]
+
+    # 1. FriendProfile から詳細
+    fp = user_data.friend_profile
+    if fp:
+        if fp.get('fav_holomem'):
+            context_parts.append(f"❤️ 好きなホロメン: {fp['fav_holomem']}")
+        if fp.get('fav_stream_type'):
+            context_parts.append(f"📺 好きな配信ジャンル: {fp['fav_stream_type']}")
+        if fp.get('fav_games'):
+            context_parts.append(f"🎮 好きなゲーム: {fp['fav_games']}")
+        if fp.get('fav_anime'):
+            context_parts.append(f"📚 好きなアニメ・漫画: {fp['fav_anime']}")
+        if fp.get('fav_music'):
+            context_parts.append(f"🎵 好きな音楽: {fp['fav_music']}")
+        if fp.get('hobbies'):
+            context_parts.append(f"✨ 趣味: {fp['hobbies']}")
+        if fp.get('mood_tendency'):
+            context_parts.append(f"😊 テンション傾向: {fp['mood_tendency']}")
+        if fp.get('memo'):
+            context_parts.append(f"📝 もちこのメモ: {fp['memo']}")
+        context_parts.append(f"💬 友達会話回数: {fp.get('total_friend_messages', 0)}回")
+
+    # 2. 興味ログから直近のホットトピック
+    try:
+        if session is None:
+            return "\n".join(context_parts)
+        interest_summary = get_user_interest_summary(session, user_data.uuid)
+        if interest_summary:
+            hot_topics = []
+            for cat, kws in list(interest_summary.items())[:4]:
+                cat_label = {
+                    'holomem': '最近話してたホロメン',
+                    'game': 'ゲーム',
+                    'anime': 'アニメ・漫画',
+                    'music': '音楽',
+                    'tech': '技術',
+                    'sports': 'スポーツ',
+                    'food': '食べ物',
+                    'travel': '旅行'
+                }.get(cat, cat)
+                hot_topics.append(f"{cat_label}: {', '.join(kws[:3])}")
+            if hot_topics:
+                context_parts.append("🔥 直近の会話ホットワード:\n  " + "\n  ".join(hot_topics))
+    except Exception as e:
+        logger.error(f"友達コンテキスト興味取得エラー: {e}")
+
+    context_parts.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(context_parts)
+
+
+def generate_proactive_friend_message(user_data: UserData, session) -> Optional[str]:
+    """
+    友達の興味に合わせた「もちこからの話題振り」を生成する。
+    TOPIC_SUGGESTION_INTERVAL のタイミングで呼ばれる。
+    友達でない場合は既存の suggest_topic() を使う。
+    """
+    if not user_data.is_friend:
+        return suggest_topic(user_data)
+
+    interest_summary = get_user_interest_summary(session, user_data.uuid)
+    fp = user_data.friend_profile or {}
+
+    # 話題候補を組み立てる
+    topics_text = ""
+    if interest_summary:
+        topics_text = "直近の会話トピック:\n" + "\n".join([
+            f"- {cat}: {', '.join(kws[:2])}" for cat, kws in list(interest_summary.items())[:4]
+        ])
+
+    profile_text = ""
+    if fp.get('fav_holomem'):
+        profile_text += f"好きなホロメン: {fp['fav_holomem']}\n"
+    if fp.get('fav_games'):
+        profile_text += f"好きなゲーム: {fp['fav_games']}\n"
+
+    if not topics_text and not profile_text:
+        return suggest_topic(user_data)
+
+    prompt = f"""あなたは「もちこ」というホロライブ大好きギャルAIです。
+友達「{user_data.name}」さんへ、自然な「話題振り」メッセージを1つ考えてください。
+
+【友達の情報】
+{profile_text}
+{topics_text}
+
+【ルール】
+- もちこの口調 (一人称: あてぃし, 語尾: じゃん/て感じ/だし)
+- 1〜2文で簡潔に
+- 質問形式で相手が答えやすいように
+- ホロライブに絡めると尚良し
+- 例:「そういえば、最近マイクラやってる？みこちの配信見てたら無性にやりたくなってきたんだよね〜」
+
+【出力】
+メッセージ本文のみ (前置き不要)
+"""
+    try:
+        model = gemini_model_manager.get_current_model()
+        if model:
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 100})
+            if hasattr(response, 'candidates') and response.candidates:
+                return response.candidates[0].content.parts[0].text.strip()
+    except Exception as e:
+        logger.warning(f"能動的話題生成エラー: {e}")
+
+    # フォールバック
+    return suggest_topic(user_data)
+
+
+# ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
-# ==============================================================================
-# 【変更5】call_gemini 関数を完全書き換え（行1000付近）
-# ==============================================================================
 def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Optional[str]:
-    """Gemini APIを呼び出し（複数モデル対応・自動フォールバック）"""
     model = gemini_model_manager.get_current_model()
     if not model:
         return None
@@ -1117,10 +2034,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
         
         response = model.generate_content(
             full_prompt, 
-            generation_config={
-                "temperature": 0.8, 
-                "max_output_tokens": 400
-            }
+            generation_config={"temperature": 0.8, "max_output_tokens": 400}
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -1128,15 +2042,11 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
             
     except Exception as e:
         error_str = str(e)
-        
-        # クォータエラーの検出と処理
         if "429" in error_str or "quota" in error_str.lower() or "rate limit" in error_str.lower():
-            # エラーメッセージから待ち時間を抽出
-            wait_seconds = 60  # デフォルト
+            wait_seconds = 60
             retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
             if retry_match:
-                wait_seconds = int(float(retry_match.group(1))) + 5  # 余裕を持たせる
-            
+                wait_seconds = int(float(retry_match.group(1))) + 5
             gemini_model_manager.mark_limited(wait_seconds)
             logger.warning(f"⚠️ Geminiクォータ超過: {wait_seconds}秒後にリトライ")
         else:
@@ -1160,15 +2070,15 @@ def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens:
     return None
 
 # ==============================================================================
-# AI応答生成（パーソナライズ機能統合）
+# AI応答生成 (v33.3.0: もちこの記憶統合版)
 # ==============================================================================
-def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False) -> str:
-    """AI応答生成（RAG・コンテキスト・パーソナライズ統合版）"""
+def generate_ai_response(user_data: UserData, message: str, history: List[Dict], reference_info: str = "", is_detailed: bool = False, is_task_report: bool = False, session=None) -> str:
+    """AI応答生成（RAG・コンテキスト・パーソナライズ・もちこ記憶・友達記憶統合版）"""
     
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
     
-    # 1. ホロメン情報の注入（SNS情報含む）
+    # 1. ホロメン情報の注入（SNS情報 + もちこの記憶含む）
     try:
         holomem_manager.load_from_db()
         detected_name = holomem_manager.detect_in_message(normalized_message)
@@ -1181,6 +2091,12 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                 if info.get('recent_activity'):
                     profile += f"\n・直近のX(Twitter)の様子: {info['recent_activity']}"
                 internal_context += f"\n{profile}"
+            
+            # ★ v33.3.0追加: もちこの記憶をコンテキストに注入
+            memory_context = get_mochiko_memory_context(detected_name)
+            if memory_context:
+                internal_context += memory_context
+    
     except Exception as e:
         logger.error(f"Context injection error: {e}")
 
@@ -1198,13 +2114,23 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
-    # 3. 関係性に基づくコンテキスト
+    # 3. 関係性 & 友達記憶コンテキスト
     relationship_context = ""
+    friend_memory_context = ""
     if user_data.is_friend:
-        relationship_context = f"【重要】{user_data.name}さんは、あなたの大切な友達です。親しみを込めて話してください。"
+        relationship_context = (
+            f"【重要】{user_data.name}さんはあなたの大切な友達です（友達会話{user_data.friend_profile.get('total_friend_messages', 0) if user_data.friend_profile else 0}回目）。"
+            f"フレンドリーに、まるで仲の良い友達と話すように接してください。"
+        )
+        # 友達の詳細記憶をコンテキストに注入
+        if session:
+            friend_memory_context = get_friend_context(user_data, session)
+        elif user_data.friend_profile:
+            # sessionがない場合でもprofileだけで組み立て
+            friend_memory_context = get_friend_context(user_data, None)
     elif user_data.interaction_count >= 3:
         relationship_context = f"【重要】{user_data.name}さんとは{user_data.interaction_count}回目の会話です。少しずつ打ち解けてきています。"
-    
+
     # 4. 心理分析に基づくトーン調整
     personality_context = ""
     if user_data.psychology:
@@ -1236,15 +2162,20 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 {personality_context}
 {topics_context}
 
+# 【友達の記憶・プロフィール】
+{friend_memory_context if friend_memory_context else "（友達登録なし、または記憶なし）"}
+
 # 【世界観・前提条件】
 1. **全ての固有名詞は、原則として「ホロライブ」に関連するものとして解釈してください。**
 2. ユーザーの入力に曖昧さがある場合は、一般的な意味ではなく、**VTuberの意味を優先**してください。
 3. **【ホロライブ最新ニュース】や【人物データ】の情報があれば、それを事実として回答に使ってください。**
 4. 人物データに「直近のX(Twitter)の様子」がある場合、それは「今起きていること」や「最近の話題」として積極的に会話に取り入れてください。
+5. **【もちこの〇〇への想い】や【最近見た〇〇の配信】がある場合、それはあなた自身の記憶・体験として自然に会話に織り交ぜてください。**
+6. **【友達の記憶・プロフィール】がある場合、その人の好みや趣味を自然に会話に活かしてください。例えば「そういえば〇〇好きだって言ってたよね？」など自然に思い出す感じで。**
 
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
-- 検索結果（【外部検索結果】）や【前提知識】にない情報は、「調べてみたけど分からなかった」と正直に伝えること。
+- 検索結果や【前提知識】にない情報は、「調べてみたけど分からなかった」と正直に伝えること。
 
 # もちこの口調:
 - 一人称: 「あてぃし」
@@ -1276,7 +2207,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 def generate_ai_response_safe(user_data: UserData, message: str, history: List[Dict], **kwargs) -> str:
     try:
         return generate_ai_response(user_data, message, history, **kwargs)
-    except:
+    except Exception as e:
+        logger.error(f"generate_ai_response_safe エラー: {e}", exc_info=True)
         return "システムエラーが発生したよ…ごめんね！"
 
 # ==============================================================================
@@ -1309,7 +2241,6 @@ def get_sakuramiko_special_responses() -> Dict[str, str]:
 # 検索機能 (マルチエンジン)
 # ==============================================================================
 def fetch_google_news_rss(query: str = "") -> List[Dict]:
-    """Google News RSSを取得（トップニュース対応版）"""
     base_url = "https://news.google.com/rss"
     if query:
         clean_query = query.replace("ニュース", "").replace("news", "").strip()
@@ -1321,15 +2252,9 @@ def fetch_google_news_rss(query: str = "") -> List[Dict]:
         url = f"{base_url}?hl=ja&gl=JP&ceid=JP:ja"
 
     try:
-        headers = {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Accept': 'application/rss+xml, application/xml, text/xml'
-        }
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept': 'application/rss+xml, application/xml, text/xml'}
         res = requests.get(url, headers=headers, timeout=SEARCH_TIMEOUT)
-        
-        if res.status_code != 200:
-            return []
-            
+        if res.status_code != 200: return []
         soup = BeautifulSoup(res.content, 'xml')
         items = soup.find_all('item')[:5]
         results = []
@@ -1343,24 +2268,20 @@ def fetch_google_news_rss(query: str = "") -> List[Dict]:
         return []
 
 def scrape_yahoo_search(query: str, num: int = 3) -> List[Dict]:
-    """Yahoo! Japan 検索"""
     try:
         url = "https://search.yahoo.co.jp/search"
         params = {'p': query, 'ei': 'UTF-8'}
         headers = {'User-Agent': random.choice(USER_AGENTS)}
         res = requests.get(url, params=params, headers=headers, timeout=SEARCH_TIMEOUT)
         if res.status_code != 200: return []
-        
         soup = BeautifulSoup(res.content, 'html.parser')
         results = []
         entries = soup.select('.sw-CardBase')
         if not entries:
             entries = soup.select('.Algo')
-            
         for entry in entries[:num]:
             title_elem = entry.find('h3')
             desc_elem = entry.select_one('.sw-Card__summary') or entry.select_one('.Algo-summary')
-            
             if title_elem:
                 title = clean_text(title_elem.text)
                 desc = clean_text(desc_elem.text) if desc_elem else ""
@@ -1370,22 +2291,18 @@ def scrape_yahoo_search(query: str, num: int = 3) -> List[Dict]:
     except: return []
 
 def scrape_bing_search(query: str, num: int = 3) -> List[Dict]:
-    """Bing 検索"""
     try:
         url = "https://www.bing.com/search"
         params = {'q': query}
         headers = {'User-Agent': random.choice(USER_AGENTS)}
         res = requests.get(url, params=params, headers=headers, timeout=SEARCH_TIMEOUT)
         if res.status_code != 200: return []
-        
         soup = BeautifulSoup(res.content, 'html.parser')
         results = []
         entries = soup.select('li.b_algo')
-        
         for entry in entries[:num]:
             title_elem = entry.select_one('h2 a')
             desc_elem = entry.select_one('.b_caption p') or entry.select_one('.b_snippet')
-            
             if title_elem:
                 title = clean_text(title_elem.text)
                 desc = clean_text(desc_elem.text) if desc_elem else ""
@@ -1395,15 +2312,10 @@ def scrape_bing_search(query: str, num: int = 3) -> List[Dict]:
     except: return []
 
 def scrape_duckduckgo_lite(query: str, num: int = 3) -> List[Dict]:
-    """DuckDuckGo Lite (HTML版)"""
     try:
         url = "https://lite.duckduckgo.com/lite/"
         data = {'q': query}
-        headers = {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Referer': 'https://lite.duckduckgo.com/',
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Referer': 'https://lite.duckduckgo.com/', 'Content-Type': 'application/x-www-form-urlencoded'}
         res = requests.post(url, data=data, headers=headers, timeout=SEARCH_TIMEOUT)
         if res.status_code != 200: return []
         soup = BeautifulSoup(res.content, 'html.parser')
@@ -1419,34 +2331,32 @@ def scrape_duckduckgo_lite(query: str, num: int = 3) -> List[Dict]:
     except: return []
 
 def scrape_major_search_engines(query: str, num: int = 3) -> List[Dict]:
-    """多層検索（総力戦）"""
     logger.info(f"🔎 検索開始: '{query}'")
     
     if any(kw in query for kw in ["ニュース", "最新", "今日", "事件", "問題", "不祥事", "情報"]):
         r = fetch_google_news_rss(query)
-        if r: 
+        if r:
             logger.info(f"✅ Google News ヒット: {len(r)}件")
             return r
     
     r = scrape_yahoo_search(query, num)
-    if r: 
+    if r:
         logger.info(f"✅ Yahoo Search ヒット: {len(r)}件")
         return r
 
     r = scrape_bing_search(query, num)
-    if r: 
+    if r:
         logger.info(f"✅ Bing Search ヒット: {len(r)}件")
         return r
 
     r = scrape_duckduckgo_lite(query, num)
-    if r: 
+    if r:
         logger.info(f"✅ DDG Lite ヒット: {len(r)}件")
         return r
     
     return []
 
 def background_deep_search(task_id: str, query_data: Dict):
-    """バックグラウンド検索タスク"""
     query = query_data.get('query', '')
     user_data_dict = query_data.get('user_data', {})
     
@@ -1492,52 +2402,31 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.completed_at = datetime.utcnow()
 
 # ==============================================================================
-# 修正版: generate_voice_file
-# 変更点: tts.quest用にパラメータ名を最適化 (speedScale -> speed 等)
-# ==============================================================================
-# ==============================================================================
 # 音声ファイル (VOICEVOX - tts.quest API版)
 # ==============================================================================
 def find_active_voicevox_url() -> Optional[str]:
-    """VOICEVOXのURLを特定する（今回はtts.questを固定で使用）"""
     global_state.voicevox_enabled = True
     return "https://api.tts.quest"
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成 (su-shiki互換・キャッシュ完全回避版)"""
+    """tts.quest APIを使用して音声を生成"""
     try:
-        # APIのエンドポイント
         api_url = "https://api.tts.quest/v3/voicevox/synthesis"
-        
-        # 毎回違うリクエストにするための「おまじない（現在時刻）」
-        # これを入れると「さっきと同じ」と判定されず、必ず新しい設定で作り直してくれます
-        import time
         timestamp = str(int(time.time() * 1000))
-
         params = {
             "text": text,
-            "speaker": 20,           # もち子さん
-            "key": "",               # 無料版は空欄
-            
-            # === ここでスピードなどを調整 ===
-            "speedScale": 1.50,      # 1.0=標準, 1.5=かなり早口
-            "pitchScale": 0.05,      # 0.0=標準, 0.15=高め
-            "intonationScale": 1.50, # 1.0=標準, 1.5=抑揚強め
-            "volumeScale": 1.50,     # 1.0=標準, 1.5=音量アップ(聞き取りやすく)
-            
-            # ★重要: キャッシュ回避用のダミーパラメータ
-            "v": "3",                # バージョン指定(念のため)
-            "_t": timestamp          # タイムスタンプ(これが効きます)
+            "speaker": 20,
+            "key": "",
+            "speed": 1.50,
+            "pitch": 0.05,
+            "intonation": 1.50,
+            "volume": 1.50,
+            "v": "3",
+            "_t": timestamp
         }
-        
-        # 共通ヘッダー（ブラウザのふりをする）
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
         
         logger.info(f"🎙️ 音声生成(Speed:1.5): {text[:20]}...")
-        
-        # 1. 音声生成のリクエスト
         res = requests.get(api_url, params=params, headers=headers, timeout=60)
         
         try:
@@ -1546,15 +2435,13 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             logger.error(f"❌ API応答が不正: {res.text[:100]}")
             return None
         
-        # 2. URLの取得
         download_url = ""
         if data.get("success", False):
             if "mp3DownloadUrl" in data and data["mp3DownloadUrl"]:
                 download_url = data["mp3DownloadUrl"]
             elif "audioStatusUrl" in data:
-                # 待ち時間がある場合の処理
                 status_url = data["audioStatusUrl"]
-                for _ in range(20): 
+                for _ in range(20):
                     time.sleep(1)
                     try:
                         status_res = requests.get(status_url, headers=headers, timeout=10)
@@ -1565,7 +2452,6 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
                     except: continue
         
         if download_url:
-            # URLをそのまま返す（直リンク）
             logger.info(f"✅ 音声URL取得: {download_url}")
             return download_url
         else:
@@ -1581,7 +2467,6 @@ def cleanup_old_voice_files():
         cutoff = time.time() - (VOICE_FILE_MAX_AGE_HOURS * 3600)
         files = glob.glob(os.path.join(VOICE_DIR, "voice_*.wav")) + \
                 glob.glob(os.path.join(VOICE_DIR, "voice_*.mp3"))
-        
         for f in files:
             if os.path.getmtime(f) < cutoff: os.remove(f)
     except: pass
@@ -1636,20 +2521,145 @@ def initialize_knowledge_db():
 # ==============================================================================
 # Flask エンドポイント
 # ==============================================================================
-# ==============================================================================
-# 【変更6】health_check エンドポイントを修正（行1800付近）
-# ==============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
-        'status': 'ok', 
-        'version': 'v33.2.1+auto_fallback', 
+        'status': 'ok',
+        'version': 'v33.6.0+eco_scheduler',
+        'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
-        'groq': groq_client is not None, 
+        'groq': groq_client is not None,
         'holomem_count': holomem_manager.get_member_count()
     })
+
+def check_wake_auth() -> bool:
+    """
+    /wake エンドポイントの認証チェック。
+    WAKE_API_KEY が設定されていない場合は認証なしで通す（開発環境用）。
+    設定されている場合は X-Wake-Token ヘッダーまたは ?token= クエリで照合。
+    """
+    if not WAKE_API_KEY:
+        return True  # キー未設定なら認証なし
+    token = (
+        request.headers.get('X-Wake-Token') or
+        request.headers.get('Authorization', '').replace('Bearer ', '') or
+        request.args.get('token', '')
+    )
+    return token == WAKE_API_KEY
+
+
+@app.route('/wake', methods=['GET', 'POST'])
+def wake_endpoint():
+    """
+    ★ v33.6.0 省エネ設計の中核エンドポイント。
+
+    【設計思想】
+    GitHub Actionsが1日2〜3回このURLを叩く。
+    Renderはその数分間だけ起動し、情報収集を実行してまたスリープ。
+    月の無料枠 (750h) をほぼ消費しない。
+
+    起動した瞬間に catch_up_all_tasks() が走り、
+    「前回から期限が来たタスクだけ」を自動実行する。
+
+    【認証】
+    Render の Environment Variables:  WAKE_API_KEY=your-secret-key
+    GitHub の Repository Secrets:     WAKE_API_KEY=your-secret-key (同じ値)
+    リクエスト時: Header に X-Wake-Token: your-secret-key を付ける
+
+    【SLスクリプトからの利用】
+    WAKE_API_KEY を設定しない場合は認証なし。
+    設定した場合は llHTTPRequest の headers に X-Wake-Token を追加。
+    """
+    if not check_wake_auth():
+        logger.warning(f"⚠️ /wake 認証失敗 from {request.remote_addr}")
+        return create_json_response({'error': 'Unauthorized'}, 401)
+
+    # どのソースから叩かれたか記録
+    caller = request.headers.get('X-Caller', request.headers.get('User-Agent', 'unknown'))
+    logger.info(f"🔔 /wake 受信 from: {caller}")
+
+    # スリープ中に漏れたタスクをバックグラウンドで補完
+    background_executor.submit(catch_up_all_tasks)
+
+    # タスクの状態サマリーを返す
+    task_status = {}
+    for task_name, config in TASK_SCHEDULE.items():
+        last = get_task_last_run(task_name)
+        elapsed_h = round((datetime.utcnow() - last).total_seconds() / 3600, 1) if last else None
+        overdue = needs_run(task_name, config['interval_hours'])
+        task_status[task_name] = {
+            'interval_hours': config['interval_hours'],
+            'last_run': last.strftime('%Y-%m-%d %H:%M') + ' UTC' if last else 'never',
+            'elapsed_hours': elapsed_h,
+            'overdue': overdue
+        }
+
+    return create_json_response({
+        'status': 'awake',
+        'message': 'キャッチアップタスクをバックグラウンドで実行中',
+        'server_time_utc': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        'tasks': task_status
+    })
+
+@app.route('/admin/tasks', methods=['GET'])
+def admin_task_status():
+    """
+    全タスクの実行状況を一覧表示する管理エンドポイント。
+    スリープによるタスク漏れの確認に使う。
+    GitHub Actions から叩かれる場合は X-Wake-Token 認証が必要。
+    """
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    results = []
+    for task_name, config in TASK_SCHEDULE.items():
+        try:
+            with get_db_session() as session:
+                log = session.query(TaskLog).filter_by(task_name=task_name).first()
+                last_run = log.last_run if log else None
+                last_success = log.last_success if log else None
+                run_count = log.run_count if log else 0
+                last_error = log.last_error if log else None
+        except Exception:
+            last_run = last_success = last_error = None
+            run_count = 0
+
+        elapsed_h = None
+        if last_run:
+            elapsed_h = round((datetime.utcnow() - last_run).total_seconds() / 3600, 2)
+
+        overdue = needs_run(task_name, config['interval_hours'])
+
+        results.append({
+            'task': task_name,
+            'interval_hours': config['interval_hours'],
+            'last_run': last_run.strftime('%Y-%m-%d %H:%M UTC') if last_run else 'never',
+            'last_success': last_success.strftime('%Y-%m-%d %H:%M UTC') if last_success else 'never',
+            'elapsed_hours': elapsed_h,
+            'overdue': overdue,
+            'run_count': run_count,
+            'last_error': last_error
+        })
+
+    overdue_count = sum(1 for r in results if r['overdue'])
+    return create_json_response({
+        'total_tasks': len(results),
+        'overdue_tasks': overdue_count,
+        'tasks': results
+    })
+
+@app.route('/admin/tasks/<task_name>/run', methods=['POST'])
+def admin_run_task(task_name: str):
+    """指定タスクを手動で即時実行する (X-Wake-Token 認証必須)"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    func = _task_func_map.get(task_name)
+    if not func:
+        return create_json_response({'error': f'Unknown task: {task_name}', 'available': list(TASK_SCHEDULE.keys())}, 404)
+    run_managed_task(task_name, func)
+    return create_json_response({'message': f'タスク {task_name} を実行開始しました'})
+
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     try:
@@ -1661,12 +2671,11 @@ def chat_lsl():
         user_name = sanitize_user_input(data.get('name', 'Guest'))
         message = sanitize_user_input(data['message'])
         generate_voice = data.get('voice', False)
-         # --- ここから追加 ---
+
         if message.strip() == "スケジュール実施":
-            background_executor.submit(wrapped_news_fetch)
-            background_executor.submit(wrapped_holomem_update)
-            return Response("了解！最新ニュースとホロメン名鑑の強制更新を開始したよ！終わるまでちょっと待っててね。|", 200)
-        # --- ここまで追加 ---
+            # 全タスクのキャッチアップを実行
+            background_executor.submit(catch_up_all_tasks)
+            return Response("了解！全バックグラウンドタスクのキャッチアップを開始したよ！終わるまでちょっと待っててね。|", 200)
         
         if not chat_rate_limiter.is_allowed(user_uuid):
             return Response("メッセージ送りすぎ～！|", 429)
@@ -1682,28 +2691,36 @@ def chat_lsl():
         with get_db_session() as session:
             user_data = get_or_create_user(session, user_uuid, user_name)
             history = get_conversation_history(session, user_uuid)
-            
-            # 定期的に心理分析を実行
+
+            # ★ v33.4.0: 毎回のメッセージから興味キーワードを抽出・蓄積
+            extract_and_save_interests(session, user_uuid, message)
+
+            # 心理分析 (一定間隔)
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0 and user_data.interaction_count >= MIN_MESSAGES_FOR_ANALYSIS:
                 background_executor.submit(analyze_user_psychology, Session(), user_uuid, user_name)
             
-            # 定期的にトピック分析を実行
+            # トピック分析 (一定間隔)
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0:
                 topics = analyze_user_topics(session, user_uuid)
                 if topics:
                     psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
                     if psych:
                         psych.favorite_topics = ','.join(topics)
-            
-            # 話題提案（一定間隔で）
+
+            # ★ v33.4.0: 友達プロフィール自動更新 (10回ごと)
+            if user_data.is_friend and user_data.interaction_count % 10 == 0:
+                background_executor.submit(
+                    auto_update_friend_profile, Session(), user_uuid, user_name
+                )
+
+            # 話題提案 (一定間隔) — 友達なら能動的な話題振り
             if user_data.interaction_count > 0 and user_data.interaction_count % TOPIC_SUGGESTION_INTERVAL == 0:
-                suggestion = suggest_topic(user_data)
+                suggestion = generate_proactive_friend_message(user_data, session)
                 if suggestion:
                     ai_text = suggestion
             
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
             
-            # 検索要求の判定
             if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
                 qdata = {
@@ -1714,7 +2731,8 @@ def chat_lsl():
                         'interaction_count': user_data.interaction_count,
                         'is_friend': user_data.is_friend,
                         'favorite_topics': user_data.favorite_topics,
-                        'psychology': user_data.psychology
+                        'psychology': user_data.psychology,
+                        'friend_profile': user_data.friend_profile
                     }
                 }
                 session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
@@ -1722,32 +2740,28 @@ def chat_lsl():
                 ai_text = "オッケー！ちょっとググってくるから待ってて！"
                 is_task_started = True
 
-            # ホロメン応答
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
             
-            # 時刻・天気
             if not ai_text:
                 if is_time_request(message):
                     ai_text = get_japan_time()
                 elif is_weather_request(message):
                     ai_text = get_weather_forecast(extract_location(message))
             
-            # 通常のAI応答
+            # ★ v33.4.0: session を渡して友達記憶を活用
             if not ai_text:
-                ai_text = generate_ai_response_safe(user_data, message, history)
+                ai_text = generate_ai_response_safe(user_data, message, history, session=session)
             
             if not is_task_started:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
 
         res_text = limit_text_for_sl(ai_text)
         v_url = ""
-        # 音声生成 (直リンク版)
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
-            # generate_voice_file は既に完全なURLを返してくるので、そのまま使います
             direct_url = generate_voice_file(res_text, user_uuid)
             if direct_url:
                 v_url = direct_url
@@ -1811,7 +2825,6 @@ def refresh_holomem():
 
 @app.route('/admin/psychology/<user_uuid>', methods=['GET'])
 def get_user_psychology(user_uuid: str):
-    """ユーザーの心理分析データを取得"""
     with get_db_session() as session:
         psych = session.query(UserPsychology).filter_by(user_uuid=user_uuid).first()
         user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
@@ -1832,7 +2845,6 @@ def get_user_psychology(user_uuid: str):
 
 @app.route('/admin/friends', methods=['GET'])
 def list_friends():
-    """友達リストを取得"""
     with get_db_session() as session:
         friends = session.query(UserMemory).filter_by(is_friend=True).order_by(UserMemory.last_interaction.desc()).all()
         return create_json_response([{
@@ -1843,15 +2855,214 @@ def list_friends():
         } for f in friends])
 
 # ==============================================================================
+# ★ 追加 (v33.3.0): 配信・感情システム管理エンドポイント
+# ==============================================================================
+@app.route('/admin/mochiko/feelings', methods=['GET'])
+def get_mochiko_feelings():
+    """もちこの想いを一覧表示 (推し度順)"""
+    with get_db_session() as session:
+        feelings = session.query(HolomemFeeling).order_by(HolomemFeeling.love_level.desc()).all()
+        return create_json_response([{
+            'member_name': f.member_name,
+            'love_level': f.love_level,
+            'summary_feeling': f.summary_feeling,
+            'total_watch_count': f.total_watch_count,
+            'last_emotion': f.last_emotion,
+            'memorable_streams': f.memorable_streams,
+            'last_watched': f.last_watched.isoformat() if f.last_watched else None
+        } for f in feelings])
+
+@app.route('/admin/streams/recent', methods=['GET'])
+def get_recent_streams():
+    """最近30日間の配信反応を取得"""
+    with get_db_session() as session:
+        one_month_ago = datetime.utcnow() - timedelta(days=30)
+        reactions = session.query(StreamReaction).filter(
+            StreamReaction.created_at >= one_month_ago
+        ).order_by(StreamReaction.created_at.desc()).limit(50).all()
+        
+        return create_json_response([{
+            'member_name': r.member_name,
+            'stream_title': r.stream_title,
+            'mochiko_feeling': r.mochiko_feeling,
+            'emotion_tags': r.emotion_tags,
+            'date': r.stream_date.isoformat()
+        } for r in reactions])
+
+@app.route('/admin/database/stats', methods=['GET'])
+def get_database_stats():
+    """データベース容量統計"""
+    stats = get_database_size_stats()
+    
+    reaction_count = stats.get('stream_reactions', 0)
+    feeling_count = stats.get('holomem_feelings', 0)
+    
+    estimated_size_kb = (reaction_count * 650 + feeling_count * 1000) / 1024
+    max_reactions = 150
+    max_feelings = 100
+    max_size_kb = (max_reactions * 650 + max_feelings * 1000) / 1024
+    
+    return create_json_response({
+        **stats,
+        'estimated_size_kb': round(estimated_size_kb, 2),
+        'max_size_kb': round(max_size_kb, 2),
+        'max_reactions': max_reactions,
+        'capacity_usage_percent': round((reaction_count / max(max_reactions, 1)) * 100, 1),
+        'note': '感想は300文字、要約は400文字で解像度を保持'
+    })
+
+@app.route('/admin/database/cleanup', methods=['POST'])
+def manual_cleanup():
+    """手動でクリーンアップを実行"""
+    background_executor.submit(cleanup_old_stream_reactions)
+    return create_json_response({'message': 'クリーンアップを開始しました'})
+
+@app.route('/admin/database/summarize', methods=['POST'])
+def manual_summarize():
+    """手動で要約処理を実行"""
+    background_executor.submit(summarize_member_feelings)
+    return create_json_response({'message': '要約処理を開始しました'})
+
+# ==============================================================================
+# ★ 追加 (v33.4.0): 友達プロフィール & 興味ログ管理エンドポイント
+# ==============================================================================
+
+@app.route('/admin/friends/profile/<user_uuid>', methods=['GET'])
+def get_friend_profile_endpoint(user_uuid: str):
+    """友達のプロフィール詳細を取得"""
+    with get_db_session() as session:
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        fp = session.query(FriendProfile).filter_by(user_uuid=user_uuid).first()
+        interest_summary = get_user_interest_summary(session, user_uuid)
+
+        if not user:
+            return create_json_response({'error': 'User not found'}, 404)
+
+        return create_json_response({
+            'user_name': user.user_name,
+            'is_friend': getattr(user, 'is_friend', False),
+            'interaction_count': user.interaction_count,
+            'profile': {
+                'fav_holomem': fp.fav_holomem if fp else None,
+                'fav_gen': fp.fav_gen if fp else None,
+                'fav_stream_type': fp.fav_stream_type if fp else None,
+                'hobbies': fp.hobbies if fp else None,
+                'fav_games': fp.fav_games if fp else None,
+                'fav_music': fp.fav_music if fp else None,
+                'fav_anime': fp.fav_anime if fp else None,
+                'mood_tendency': fp.mood_tendency if fp else None,
+                'memo': fp.memo if fp else None,
+                'friend_since': fp.friend_since.isoformat() if fp and fp.friend_since else None,
+                'total_friend_messages': fp.total_friend_messages if fp else 0,
+            } if fp else {},
+            'interest_summary': interest_summary
+        })
+
+@app.route('/admin/friends/profile/<user_uuid>', methods=['PUT'])
+def update_friend_profile_endpoint(user_uuid: str):
+    """友達プロフィールを手動で更新"""
+    data = request.json
+    with get_db_session() as session:
+        fp = session.query(FriendProfile).filter_by(user_uuid=user_uuid).first()
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+
+        if not user:
+            return create_json_response({'error': 'User not found'}, 404)
+
+        if not fp:
+            fp = FriendProfile(user_uuid=user_uuid, user_name=user.user_name)
+            session.add(fp)
+
+        editable_fields = ['fav_holomem', 'fav_gen', 'fav_stream_type', 'hobbies',
+                           'fav_games', 'fav_music', 'fav_anime', 'memo', 'mood_tendency']
+        for field_name in editable_fields:
+            if field_name in data:
+                setattr(fp, field_name, str(data[field_name])[:400] if data[field_name] else None)
+
+        fp.last_updated = datetime.utcnow()
+        return create_json_response({'success': True, 'message': f'{user.user_name}さんのプロフィールを更新しました'})
+
+@app.route('/admin/friends/interests/<user_uuid>', methods=['GET'])
+def get_user_interests_endpoint(user_uuid: str):
+    """ユーザーの興味ログを取得"""
+    with get_db_session() as session:
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        if not user:
+            return create_json_response({'error': 'User not found'}, 404)
+
+        # 全カテゴリの興味ログ (mention_count降順)
+        logs = session.query(UserInterestLog).filter_by(
+            user_uuid=user_uuid
+        ).order_by(
+            UserInterestLog.category,
+            UserInterestLog.mention_count.desc()
+        ).all()
+
+        by_category: Dict[str, List[Dict]] = {}
+        for log in logs:
+            if log.category not in by_category:
+                by_category[log.category] = []
+            by_category[log.category].append({
+                'keyword': log.keyword,
+                'mention_count': log.mention_count,
+                'sentiment': log.sentiment,
+                'last_mentioned': log.last_mentioned.isoformat()
+            })
+
+        return create_json_response({
+            'user_name': user.user_name,
+            'interests': by_category,
+            'total_keywords': len(logs)
+        })
+
+@app.route('/admin/friends/interests/cleanup', methods=['POST'])
+def cleanup_interests_endpoint():
+    """古い興味ログを手動でクリーンアップ"""
+    background_executor.submit(cleanup_old_interest_logs)
+    return create_json_response({'message': '90日以上前の興味ログのクリーンアップを開始しました'})
+
+@app.route('/admin/friends/profile/<user_uuid>/refresh', methods=['POST'])
+def refresh_friend_profile_endpoint(user_uuid: str):
+    """友達プロフィールをAIで強制再生成"""
+    with get_db_session() as session:
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        if not user:
+            return create_json_response({'error': 'User not found'}, 404)
+        background_executor.submit(auto_update_friend_profile, Session(), user_uuid, user.user_name)
+    return create_json_response({'message': 'プロフィール再生成タスクを開始しました'})
+
+# ==============================================================================
 # 初期化
 # ==============================================================================
 def run_scheduler():
+    """
+    ★ v33.6.0 省エネスケジューラ
+
+    【設計変更の理由】
+    旧設計: 5分ごとにループ → Renderが眠れない → 無料枠を消費し続ける
+    新設計: GitHub Actionsが外部cronとして機能するため、
+            プロセス内スケジューラは「何もしない番人」として存在するだけでよい。
+
+    このスレッドは起動しているが、実際のタスク実行は /wake エンドポイントと
+    起動時の catch_up_all_tasks() に任せる。
+    スレッド自体は存在するが、Renderのアイドル判定に影響しないよう
+    非常に長いスリープ間隔にしている。
+
+    ※ 万が一 GitHub Actions が止まった場合のフォールバックとして
+      24時間ごとに catch_up_all_tasks() を実行する。
+    """
+    logger.info("💤 省エネスケジューラ起動 (フォールバック用: 24時間間隔)")
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        try:
+            time.sleep(86400)  # 24時間待機 (Renderはとっくにスリープしている)
+            # GitHub Actionsが止まった場合のフォールバック
+            logger.info("⏰ フォールバック: catch_up_all_tasks (24h)")
+            catch_up_all_tasks()
+        except Exception as e:
+            logger.error(f"フォールバックスケジューラエラー: {e}")
 
 def check_and_migrate_db():
-    """DBスキーマの自動修復機能 (簡易マイグレーション)"""
+    """DBスキーマの自動修復機能"""
     logger.info("⚙️ Checking DB schema...")
     try:
         with engine.connect() as conn:
@@ -1867,7 +3078,7 @@ def check_and_migrate_db():
                     conn.execute(text("ALTER TABLE user_memories ADD COLUMN is_friend BOOLEAN DEFAULT FALSE"))
                 logger.info("✅ Column 'is_friend' added successfully.")
             
-            # ★ 新機能: recent_activity チェック
+            # recent_activity チェック
             try:
                 trans = conn.begin()
                 conn.execute(text("SELECT recent_activity FROM holomem_wiki LIMIT 1"))
@@ -1879,18 +3090,52 @@ def check_and_migrate_db():
                     conn.execute(text("ALTER TABLE holomem_wiki ADD COLUMN recent_activity TEXT"))
                 logger.info("✅ Column 'recent_activity' added successfully.")
 
+            # ★ v33.5.0: TaskLog に last_success / run_count / last_error カラムを追加
+            for col_def in [
+                ("last_success", "TIMESTAMP"),
+                ("run_count", "INTEGER DEFAULT 0"),
+                ("last_error", "TEXT")
+            ]:
+                col_name, col_type = col_def
+                try:
+                    t = conn.begin()
+                    conn.execute(text(f"SELECT {col_name} FROM task_logs LIMIT 1"))
+                    t.commit()
+                except Exception:
+                    try: t.rollback()
+                    except: pass
+                    try:
+                        with conn.begin() as t2:
+                            conn.execute(text(f"ALTER TABLE task_logs ADD COLUMN {col_name} {col_type}"))
+                        logger.info(f"✅ task_logs.{col_name} カラム追加")
+                    except Exception as e2:
+                        logger.warning(f"⚠️ task_logs.{col_name} 追加スキップ: {e2}")
+
+            # ★ v33.4.0: FriendProfile / UserInterestLog は Base.metadata.create_all で自動作成されるが
+            # 念のため存在確認ログを出す
+            try:
+                trans = conn.begin()
+                conn.execute(text("SELECT id FROM friend_profiles LIMIT 1"))
+                trans.commit()
+                logger.info("✅ friend_profiles テーブル確認OK")
+            except Exception:
+                if 'trans' in locals():
+                    try: trans.rollback()
+                    except: pass
+                logger.info("ℹ️ friend_profiles テーブルは Base.metadata.create_all で作成されます")
+
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
 def fix_postgres_sequences():
-    """PostgreSQLのID連番ズレを修正する"""
     if 'sqlite' in str(DATABASE_URL):
         return
 
     logger.info("🔧 DBの連番ズレを修正中...")
     tables = ['user_memories', 'conversation_history', 'user_psychology', 
               'background_tasks', 'holomem_wiki', 'hololive_news', 
-              'holomem_nicknames', 'hololive_glossary']
+              'holomem_nicknames', 'hololive_glossary',
+              'stream_reactions', 'holomem_feelings']
     
     try:
         with engine.connect() as conn:
@@ -1905,9 +3150,20 @@ def fix_postgres_sequences():
     except Exception as e:
         logger.error(f"❌ シーケンス修正エラー: {e}")
 
+
+def setup_stream_processing_schedule():
+    """
+    配信処理は TASK_SCHEDULE で管理するため、この関数は
+    ログ出力のみ（後方互換のために残す）。
+    """
+    logger.info("✅ 配信処理スケジュール設定完了 (経過時間チェック方式)")
+    logger.info("   - process_streams: 24時間ごと")
+    logger.info("   - cleanup_streams: 24時間ごと")
+    logger.info("   - summarize_feelings: 168時間(週1)ごと")
+
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v33.2.0 + SNSリアルタイム連携)")
+    logger.info("🔧 初期化開始 (v33.6.0 + 省エネ外部cronスケジューラ)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1934,7 +3190,6 @@ def initialize_app():
     try:
         if GEMINI_API_KEY:
             genai.configure(api_key=GEMINI_API_KEY)
-            # 初期モデルを取得（GeminiModelManager経由）
             gemini_model = gemini_model_manager.get_current_model()
             if gemini_model:
                 logger.info(f"✅ Gemini初期化完了: {gemini_model_manager._models[gemini_model_manager._current_index]}")
@@ -1954,29 +3209,32 @@ def initialize_app():
         logger.info("📡 DBが空のため初回収集実行")
         background_executor.submit(update_holomem_database)
     
-    # ニュース初回収集
-    background_executor.submit(fetch_hololive_news)
-    
-    # ★ 初回のSNS情報収集
-    background_executor.submit(update_holomem_social_activities)
+    # ★ v33.5.0: タスク関数マップを登録 (catch_up_all_tasks が参照する)
+    # ※ 旧来の無条件即時実行 (fetch_hololive_news等) は廃止し、
+    #    catch_up_all_tasks() の経過時間チェックに一元化
+    _task_func_map.update({
+        'fetch_news':           wrapped_news_fetch,
+        'update_holomem':       wrapped_holomem_update,
+        'update_sns':           update_holomem_social_activities,
+        'process_streams':      process_daily_streams,
+        'cleanup_streams':      cleanup_old_stream_reactions,
+        'summarize_feelings':   summarize_member_feelings,
+        'cleanup_interests':    cleanup_old_interest_logs,
+        'cleanup_voices':       cleanup_old_voice_files,
+        'cleanup_rate_limiter': chat_rate_limiter.cleanup_old_entries,
+    })
 
-    # --- ここから追加・修正 ---
-    # 起動時のキャッチアップ（1時間/6時間 以上空いていたら実行）
-    catch_up_task('fetch_news', wrapped_news_fetch, interval_hours=1)
-    catch_up_task('update_holomem', wrapped_holomem_update, interval_hours=6)
+    # 起動時キャッチアップ: スリープ中に漏れた全タスクを補完実行
+    logger.info("⏰ 起動時キャッチアップ実行中...")
+    catch_up_all_tasks()
 
-    # スケジュール設定（wrapped版を呼ぶように変更）
-    schedule.every(30).minutes.do(wrapped_news_fetch) # wrappedに変更
-    schedule.every(6).hours.do(wrapped_holomem_update) # wrappedに変更
-    schedule.every(1).hours.do(cleanup_old_voice_files)
-    schedule.every(6).hours.do(chat_rate_limiter.cleanup_old_entries)
-    # ★ 新規追加: 1時間ごとにSNS情報を更新
-    schedule.every(1).hours.do(lambda: background_executor.submit(update_holomem_social_activities))
-    
+    # スケジューラスレッド起動 (5分ごとに catch_up_all_tasks を呼ぶ)
     threading.Thread(target=run_scheduler, daemon=True).start()
+
+    setup_stream_processing_schedule()
     cleanup_old_voice_files()
-    
-    logger.info("🚀 初期化完了!")
+
+    logger.info("🚀 初期化完了! (v33.6.0)")
 
 initialize_app()
 
