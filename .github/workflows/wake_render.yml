@@ -1,0 +1,211 @@
+name: 🌅 Render 省エネ起動 & 情報収集
+
+# ==============================================================================
+# 【設計思想】
+#
+#   Render無料枠 (750時間/月) を節約するため、
+#   「必要な時だけ起こして仕事させ、終わったらスリープに戻す」設計。
+#
+#   旧設計 (常時起動):  750時間/月 を丸ごと消費 → 月末に無料枠切れリスク
+#   新設計 (省エネ):    起動時間 約5分 × 3回/日 × 30日 = 約7.5時間/月
+#                      → 無料枠の 1% だけ消費
+#
+# 【動作の流れ】
+#
+#   GitHub Actions (cron)
+#       ↓ 定刻になったら
+#   POST /wake  ← Renderを叩き起こす (スリープ中でも確実に起動)
+#       ↓ Renderが起動
+#   catch_up_all_tasks() ← 期限切れのタスクだけ実行
+#       ↓ 完了したら
+#   Render は自然にスリープ (次の /wake まで起きない)
+#
+# 【セットアップ方法】
+#
+#   GitHub リポジトリの Settings → Secrets and variables → Actions に追加:
+#
+#     RENDER_APP_URL  : https://your-app-name.onrender.com  (末尾スラッシュなし)
+#     WAKE_API_KEY    : Render の Environment Variables に設定した WAKE_API_KEY と同じ値
+#
+# ==============================================================================
+
+on:
+  schedule:
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 1日3回だけ起こす (JST表記、cronはUTCで指定)
+    # UTC = JST - 9時間
+    #
+    #   JST  8:00 → UTC 23:00 (前日)  : 朝の情報収集
+    #   JST 15:00 → UTC  6:00         : 夕方の情報収集
+    #   JST 23:00 → UTC 14:00         : 深夜バッチ (配信まとめ・クリーンアップ)
+    #
+    # 3回 × 約5分起動 × 30日 = 7.5時間/月 (無料枠750hの1%)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    - cron: '0 23 * * *'   # JST  8:00 朝 (UTC 前日23時)
+    - cron: '0 6  * * *'   # JST 15:00 夕 (UTC 6時)
+    - cron: '0 14 * * *'   # JST 23:00 深夜 (UTC 14時)
+
+  # Actionsタブから手動実行
+  workflow_dispatch:
+    inputs:
+      task:
+        description: '実行タスク名 (空欄=全タスク自動判定)'
+        required: false
+        default: ''
+
+jobs:
+  wake-and-collect:
+    name: 🔔 起こして収集
+    runs-on: ubuntu-latest
+    timeout-minutes: 8  # Renderの起動+タスク実行に十分な時間
+
+    steps:
+      # ─────────────────────────────────────────────
+      # Step 1: /wake を叩いてRenderを起動
+      #         Renderがスリープ中の場合、起動に最大30秒かかる
+      # ─────────────────────────────────────────────
+      - name: 🌅 Renderを起こす
+        id: wake
+        env:
+          RENDER_APP_URL: ${{ secrets.RENDER_APP_URL }}
+          WAKE_API_KEY:   ${{ secrets.WAKE_API_KEY }}
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📡 接続先: $RENDER_APP_URL"
+          echo "🕐 UTC時刻: $(date -u '+%Y-%m-%d %H:%M')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Renderがスリープ中なら起動に時間がかかるので --max-time 40 で待つ
+          HTTP_CODE=$(curl -s -o /tmp/wake_response.json \
+            -w "%{http_code}" \
+            --max-time 40 \
+            --retry 2 \
+            --retry-delay 10 \
+            -X POST \
+            -H "X-Wake-Token: $WAKE_API_KEY" \
+            -H "X-Caller: github-actions/$(date -u '+%H:%M')" \
+            -H "Content-Type: application/json" \
+            "$RENDER_APP_URL/wake")
+
+          echo "HTTP Status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Render起動成功"
+            # 期限切れタスクのサマリーを表示
+            python3 - << 'PYEOF'
+          import json, sys
+          try:
+              with open('/tmp/wake_response.json') as f:
+                  d = json.load(f)
+              tasks = d.get('tasks', {})
+              overdue = [(k, v) for k, v in tasks.items() if v.get('overdue')]
+              ok = [(k, v) for k, v in tasks.items() if not v.get('overdue')]
+              print(f"\n📋 タスク状況: 期限切れ {len(overdue)}件 / 正常 {len(ok)}件")
+              if overdue:
+                  print("  🔴 実行予定:")
+                  for name, v in overdue:
+                      elapsed = v.get('elapsed_hours', '?')
+                      print(f"    ・{name:30s} ({elapsed}h経過)")
+              if ok:
+                  print("  🟢 スキップ:")
+                  for name, v in ok:
+                      elapsed = v.get('elapsed_hours', '?')
+                      print(f"    ・{name:30s} ({elapsed}h経過)")
+          except Exception as e:
+              print(f"解析エラー: {e}")
+          PYEOF
+          elif [ "$HTTP_CODE" = "401" ]; then
+            echo "❌ 認証失敗 — GitHub Secrets の WAKE_API_KEY を確認してください"
+            exit 1
+          else
+            echo "⚠️  HTTP $HTTP_CODE — Renderがまだ起動中の可能性あり、続行します"
+          fi
+
+      # ─────────────────────────────────────────────
+      # Step 2: タスクの完了を待つ
+      #         情報収集はバックグラウンドで動くので少し待つ
+      # ─────────────────────────────────────────────
+      - name: ⏳ タスク完了待機 (30秒)
+        run: |
+          echo "バックグラウンドタスクの完了を待機中..."
+          sleep 30
+          echo "✅ 待機完了"
+
+      # ─────────────────────────────────────────────
+      # Step 3: (手動実行時のみ) 特定タスクを指定実行
+      # ─────────────────────────────────────────────
+      - name: 🎯 指定タスク実行 (手動時のみ)
+        if: ${{ github.event.inputs.task != '' }}
+        env:
+          RENDER_APP_URL: ${{ secrets.RENDER_APP_URL }}
+          WAKE_API_KEY:   ${{ secrets.WAKE_API_KEY }}
+          TASK_NAME:      ${{ github.event.inputs.task }}
+        run: |
+          echo "🎯 タスク手動実行: $TASK_NAME"
+          HTTP_CODE=$(curl -s -o /tmp/task_response.json \
+            -w "%{http_code}" \
+            --max-time 15 \
+            -X POST \
+            -H "X-Wake-Token: $WAKE_API_KEY" \
+            "$RENDER_APP_URL/admin/tasks/$TASK_NAME/run")
+
+          cat /tmp/task_response.json
+          [ "$HTTP_CODE" = "200" ] && echo "✅ タスク開始" || { echo "❌ 失敗 (HTTP $HTTP_CODE)"; exit 1; }
+
+      # ─────────────────────────────────────────────
+      # Step 4: 最終ステータス確認 & ログ出力
+      # ─────────────────────────────────────────────
+      - name: 📊 実行結果レポート
+        if: always()
+        env:
+          RENDER_APP_URL: ${{ secrets.RENDER_APP_URL }}
+          WAKE_API_KEY:   ${{ secrets.WAKE_API_KEY }}
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 最終ステータス確認"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # /admin/tasks でタスク状況を確認
+          HTTP_CODE=$(curl -s -o /tmp/tasks_status.json \
+            -w "%{http_code}" \
+            --max-time 10 \
+            -H "X-Wake-Token: $WAKE_API_KEY" \
+            "$RENDER_APP_URL/admin/tasks")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            python3 - << 'PYEOF'
+          import json
+          try:
+              with open('/tmp/tasks_status.json') as f:
+                  d = json.load(f)
+              print(f"総タスク: {d['total_tasks']}件 / 期限切れ残: {d['overdue_tasks']}件")
+              print()
+              print(f"{'タスク名':<30} {'最終成功':<22} {'回数':>5} {'状態'}")
+              print("-" * 75)
+              for t in d['tasks']:
+                  state = "⏰ 期限切れ" if t['overdue'] else "✅"
+                  err   = f"  ⚠ {t['last_error'][:50]}" if t.get('last_error') else ""
+                  print(f"{t['task']:<30} {t['last_success']:<22} {t['run_count']:>5}  {state}{err}")
+          except Exception as e:
+              print(f"解析エラー: {e}")
+          PYEOF
+          else
+            # /admin/tasksが失敗してもジョブはfailにしない (Renderがスリープに入った可能性)
+            echo "⚠️  ステータス取得失敗 (HTTP $HTTP_CODE) — タスクはバックグラウンドで実行済みの可能性があります"
+          fi
+
+          # /health で最終確認
+          HEALTH=$(curl -s --max-time 8 "$RENDER_APP_URL/health" 2>/dev/null || echo "{}")
+          python3 -c "
+          import json
+          try:
+              d = json.loads('$HEALTH'.replace(\"'\", '\"'))
+              print()
+              print(f'バージョン: {d.get(\"version\",\"?\")}')
+              print(f'Gemini: {\"✅\" if d.get(\"gemini\") else \"❌\"} / Groq: {\"✅\" if d.get(\"groq\") else \"❌\"} / ホロメン: {d.get(\"holomem_count\",0)}名')
+          except: pass
+          " 2>/dev/null || true
+
+          echo ""
+          echo "🏁 完了 — Renderはこれからスリープに入ります"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
