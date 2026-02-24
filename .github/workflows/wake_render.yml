@@ -24,8 +24,8 @@ name: 🌅 Render 省エネ起動 & 情報収集
 #
 #   GitHub リポジトリの Settings → Secrets and variables → Actions に追加:
 #
-#     RENDER_APP_URL  : https://your-app-name.onrender.com  (末尾スラッシュなし)
-#     WAKE_API_KEY    : Render の Environment Variables に設定した WAKE_API_KEY と同じ値
+#     RENDER_APP_URL  : https://slautofriendbot.onrender.com  (末尾スラッシュなし)
+#     WAKE_API_KEY    : mochiko-wake-2024-Tiananmen
 #
 # ==============================================================================
 
