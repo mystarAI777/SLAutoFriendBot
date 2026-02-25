@@ -2844,10 +2844,10 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             "text": text,
             "speaker": 20,
             "key": "",
-            "speedScale": 1.50,
-            "pitchScale": 0.05,
-            "intonationScale": 1.50,
-            "volumeScale": 1.50,
+            "speed": 1.50,
+            "pitch": 0.05,
+            "intonation": 1.50,
+            "volume": 1.50,
             "v": "3",
             "_t": timestamp
         }
