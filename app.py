@@ -463,6 +463,42 @@ class HolomemFeeling(Base):
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ==============================================================================
+# ★ 追加 (v33.7.0): セカンドライフニュース & アニメキャッシュテーブル
+# ==============================================================================
+class SecondLifeNews(Base):
+    """
+    セカンドライフの最新情報を蓄積するテーブル。
+    公式ブログ・コミュニティニュース・マーケットトレンドなどを保存。
+    30日で自動削除。
+    """
+    __tablename__ = 'secondlife_news'
+    id = Column(Integer, primary_key=True)
+    source = Column(String(100), nullable=False)    # 'official_blog' / 'community' / 'marketplace'
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=True)
+    url = Column(String(1000), nullable=True)
+    news_hash = Column(String(100), unique=True, index=True)
+    category = Column(String(50), nullable=True)    # 'update' / 'event' / 'trend' / 'news'
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class AnimeInfoCache(Base):
+    """
+    アニメ作品情報のキャッシュ。
+    会話中に知らないアニメが出てきた時にWeb検索した結果を保存し、
+    次回の同じ作品への言及時は検索不要になる。7日で自動更新。
+    """
+    __tablename__ = 'anime_info_cache'
+    id = Column(Integer, primary_key=True)
+    title = Column(String(200), nullable=False, unique=True, index=True)
+    synopsis = Column(Text, nullable=True)
+    genre = Column(String(200), nullable=True)
+    status = Column(String(50), nullable=True)      # '放送中' / '完結' / '放送前'
+    season = Column(String(50), nullable=True)      # '2025年秋' など
+    raw_search_result = Column(Text, nullable=True) # 検索結果の生テキスト (最大500文字)
+    cached_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_accessed = Column(DateTime, default=datetime.utcnow)
+
+# ==============================================================================
 # セッション & ユーティリティ
 # ==============================================================================
 class RateLimiter:
@@ -1326,6 +1362,362 @@ def fetch_hololive_tsuushin_news():
     except Exception as e:
         logger.error(f"❌ ホロライブ通信の取得に失敗: {e}")
 
+# ==============================================================================
+# ★ 追加 (v33.7.0): セカンドライフ情報収集
+# ==============================================================================
+
+SL_SOURCES = [
+    # 公式ブログ RSS
+    {
+        'name': 'official_blog',
+        'type': 'rss',
+        'url': 'https://community.secondlife.com/blogs.xml/',
+        'category': 'news',
+    },
+    # SLuniverseニュース RSS
+    {
+        'name': 'sluniverse',
+        'type': 'rss',
+        'url': 'https://www.sluniverse.com/php/vb/external.php?type=RSS2',
+        'category': 'community',
+    },
+    # 公式Twitter/Xの代わりにGoogle News RSS (Second Life)
+    {
+        'name': 'google_news_sl',
+        'type': 'google_news_rss',
+        'query': 'Second Life virtual world',
+        'category': 'news',
+    },
+    # Google News RSS (日本語SL情報)
+    {
+        'name': 'google_news_sl_jp',
+        'type': 'google_news_rss',
+        'query': 'セカンドライフ SL',
+        'category': 'news',
+    },
+]
+
+def _make_news_hash(text: str) -> str:
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+def fetch_sl_rss(source_config: Dict) -> List[Dict]:
+    """RSS/Atomフィードを取得してリストで返す"""
+    results = []
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept': 'application/rss+xml,application/xml,text/xml'}
+        res = requests.get(source_config['url'], headers=headers, timeout=15)
+        if res.status_code != 200:
+            return []
+        soup = BeautifulSoup(res.content, 'xml')
+        items = soup.find_all('item') or soup.find_all('entry')
+        for item in items[:8]:
+            title_tag = item.find('title')
+            desc_tag = item.find('description') or item.find('summary') or item.find('content')
+            link_tag = item.find('link')
+            if not title_tag:
+                continue
+            title = clean_text(title_tag.get_text())[:500]
+            content = clean_text(desc_tag.get_text())[:600] if desc_tag else ''
+            url = ''
+            if link_tag:
+                url = link_tag.get('href') or link_tag.get_text() or ''
+            if title:
+                results.append({
+                    'source': source_config['name'],
+                    'category': source_config.get('category', 'news'),
+                    'title': title,
+                    'content': content,
+                    'url': url,
+                })
+    except Exception as e:
+        logger.warning(f"SL RSS取得失敗 ({source_config['name']}): {e}")
+    return results
+
+def fetch_sl_google_news(source_config: Dict) -> List[Dict]:
+    """Google News RSSでSL関連ニュースを取得"""
+    results = []
+    try:
+        query = source_config['query']
+        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ja&gl=JP&ceid=JP:ja"
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return []
+        soup = BeautifulSoup(res.content, 'xml')
+        for item in soup.find_all('item')[:5]:
+            title = clean_text(item.title.get_text()) if item.title else ''
+            link = item.link.get_text() if item.link else ''
+            pub = item.pubDate.get_text() if item.pubDate else ''
+            if title:
+                results.append({
+                    'source': source_config['name'],
+                    'category': source_config.get('category', 'news'),
+                    'title': title,
+                    'content': f"({pub})" if pub else '',
+                    'url': link,
+                })
+    except Exception as e:
+        logger.warning(f"SL Google News取得失敗: {e}")
+    return results
+
+def fetch_sl_marketplace_trends() -> List[Dict]:
+    """
+    SL Marketplace の新着・人気アイテムをスクレイピング。
+    トレンドとして保存する。
+    """
+    results = []
+    try:
+        url = "https://marketplace.secondlife.com/products/search?search[category_id]=0&search[sort]=relevance&search[per_page]=20"
+        headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept-Language': 'en-US,en;q=0.9'}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return []
+        soup = BeautifulSoup(res.content, 'html.parser')
+        items = soup.select('.product-listing') or soup.select('[data-product-id]')
+        seen_titles = set()
+        for item in items[:10]:
+            name_elem = item.select_one('.product-title, .item-name, h4 a, h3 a')
+            price_elem = item.select_one('.price, .product-price')
+            if not name_elem:
+                continue
+            name = clean_text(name_elem.get_text())[:200]
+            price = clean_text(price_elem.get_text()) if price_elem else ''
+            link = name_elem.get('href', '')
+            if link and not link.startswith('http'):
+                link = 'https://marketplace.secondlife.com' + link
+            if name and name not in seen_titles:
+                seen_titles.add(name)
+                results.append({
+                    'source': 'marketplace',
+                    'category': 'trend',
+                    'title': f"【マーケット】{name}",
+                    'content': f"価格: {price}" if price else '',
+                    'url': link,
+                })
+    except Exception as e:
+        logger.warning(f"SL Marketplace取得失敗: {e}")
+    return results
+
+def fetch_all_sl_news() -> int:
+    """
+    全SLソースから情報を収集してDBに保存。
+    重複はnews_hashで除外。返り値は新規保存件数。
+    """
+    logger.info("🌐 セカンドライフ情報収集開始...")
+    all_items: List[Dict] = []
+
+    for source in SL_SOURCES:
+        if source['type'] == 'rss':
+            all_items.extend(fetch_sl_rss(source))
+        elif source['type'] == 'google_news_rss':
+            all_items.extend(fetch_sl_google_news(source))
+        time.sleep(0.5)  # 礼儀的なウェイト
+
+    # Marketplace トレンド
+    all_items.extend(fetch_sl_marketplace_trends())
+
+    new_count = 0
+    with get_db_session() as session:
+        for item in all_items:
+            h = _make_news_hash(item['title'])
+            if session.query(SecondLifeNews).filter_by(news_hash=h).first():
+                continue
+            session.add(SecondLifeNews(
+                source=item['source'],
+                title=item['title'],
+                content=item.get('content', ''),
+                url=item.get('url', ''),
+                news_hash=h,
+                category=item.get('category', 'news'),
+                created_at=datetime.utcnow(),
+            ))
+            new_count += 1
+
+        # 30日以上前のデータを削除
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        deleted = session.query(SecondLifeNews).filter(SecondLifeNews.created_at < cutoff).delete()
+        if deleted:
+            logger.info(f"🗑️ 古いSLニュース {deleted}件を削除")
+
+    logger.info(f"✅ SL情報収集完了: 新規{new_count}件")
+    return new_count
+
+def get_sl_news_context(limit: int = 5) -> str:
+    """
+    最新のSLニュース・トレンドをプロンプト注入用テキストとして返す。
+    """
+    try:
+        with get_db_session() as session:
+            items = session.query(SecondLifeNews).order_by(
+                SecondLifeNews.created_at.desc()
+            ).limit(limit).all()
+            if not items:
+                return ''
+            lines = []
+            for it in items:
+                cat_label = {'update': '🔧アップデート', 'event': '🎉イベント', 'trend': '🔥トレンド', 'news': '📰ニュース', 'community': '💬コミュニティ'}.get(it.category, '📰')
+                line = f"{cat_label}【{it.source}】{it.title}"
+                if it.content and len(it.content) > 5:
+                    line += f" — {it.content[:120]}"
+                lines.append(line)
+            return "\n【セカンドライフ最新情報】\n" + "\n".join(lines)
+    except Exception as e:
+        logger.error(f"SLニュースコンテキスト取得エラー: {e}")
+        return ''
+
+# セカンドライフ関連キーワード検出
+SL_KEYWORDS = [
+    'セカンドライフ', 'second life', 'secondlife', 'SL', 'sl', 'インワールド', 'リンデン',
+    'Linden', 'L$', 'アバター', 'リージョン', 'sim', 'SIM', 'メッシュ', 'ガチャ',
+    'グループ', 'テレポート', 'TP', 'スキン', 'AO', 'ボディ', 'Maitreya', 'Belleza',
+    'CATWA', 'BOM', 'ブレント', 'Firestorm', 'ビューア', 'マーケット', 'marketplace',
+    'ロールプレイ', 'RP', 'フルパーミ', '全perm', 'ガレージセール', 'ハントイベント'
+]
+
+def is_sl_topic(message: str) -> bool:
+    """メッセージがセカンドライフに関する発言かどうか判定"""
+    msg_lower = message.lower()
+    return any(kw.lower() in msg_lower for kw in SL_KEYWORDS)
+
+
+# ==============================================================================
+# ★ 追加 (v33.7.0): アニメ自動検索 & 知識キャッシュ
+# ==============================================================================
+
+# 既知アニメ (もちこが事前に知っている主要作品。これにないものは自動検索)
+KNOWN_ANIME_TITLES = {
+    'ワンピース', '進撃の巨人', '鬼滅の刃', '呪術廻戦', '推しの子', 'チェンソーマン',
+    '転スラ', 'リゼロ', 'ダンまち', 'ブルーロック', '葬送のフリーレン', 'ダンダダン',
+    '薬屋のひとりごと', '異世界転生', 'ナルト', 'NARUTO', 'ドラゴンボール', 'ハンターハンター',
+    '僕のヒーローアカデミア', 'ヒロアカ', '東京リベンジャーズ', 'SPY×FAMILY', 'スパイファミリー',
+    'スラムダンク', '銀魂', '少年ジャンプ', '進撃', 'エヴァ', 'コードギアス',
+    'BLEACH', 'ブリーチ', 'FAIRY TAIL', 'フェアリーテイル', 'ソードアートオンライン', 'SAO',
+    'まどマギ', '魔法少女まどか', 'リコリコ', 'ぼっち・ざ・ろっく', '青のオーケストラ',
+    'スキップとローファー', '浜辺美波', 'かげきしょうじょ',
+}
+
+# アニメっぽい発言を検出する正規表現パターン
+ANIME_MENTION_PATTERN = re.compile(
+    r'(?:見てる|観てる|見た|観た|ハマってる|好き|おすすめ|面白い|最高|神アニメ|神作画|作品|アニメ化|原作|漫画|マンガ|manga)'
+    r'|(?:キャラ|主人公|ヒロイン|声優|OPが|EDが|第[\d一二三四五六七八九十百]+話|最終回|最新話)',
+    re.IGNORECASE
+)
+
+def extract_anime_titles_from_message(message: str) -> List[str]:
+    """
+    メッセージからアニメ作品名と思われる単語を抽出する。
+    既知リストにないもの (= もちこが知らない可能性がある) を返す。
+    """
+    candidates = []
+
+    # カタカナ or 漢字2文字以上で構成される名詞的なトークンを候補とする
+    # 「○○って知ってる?」「○○見てる」などのパターンから抽出
+    patterns = [
+        r'「([^」]{2,20})」',           # 鉤括弧内
+        r'『([^』]{2,20})』',           # 二重鉤括弧内
+        r'([ァ-ヶー]{3,20})(?:が|を|は|って|の)',   # カタカナ語
+        r'([一-龥ぁ-んァ-ヶa-zA-Z]{2,15})(?:って|は|が)(?:面白|最高|神|おすすめ|好き)',
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, message):
+            word = m.group(1).strip()
+            if word and word not in KNOWN_ANIME_TITLES and len(word) >= 2:
+                # ホロメン名や一般語は除外
+                if not any(kw in word for kw in ['ライブ','配信','ゲーム','スバル','みこ','ぺこ']):
+                    candidates.append(word)
+
+    return list(set(candidates))
+
+def get_anime_info_from_cache_or_search(title: str) -> Optional[str]:
+    """
+    アニメ作品情報をキャッシュから取得、なければWeb検索して保存。
+    返り値はプロンプト注入用テキスト (Noneなら情報なし)。
+    """
+    try:
+        with get_db_session() as session:
+            # キャッシュチェック (7日以内)
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            cached = session.query(AnimeInfoCache).filter(
+                AnimeInfoCache.title == title,
+                AnimeInfoCache.cached_at >= cutoff
+            ).first()
+
+            if cached:
+                cached.last_accessed = datetime.utcnow()
+                logger.info(f"📦 アニメキャッシュHIT: {title}")
+                return cached.raw_search_result
+
+            # キャッシュなし → Web検索
+            logger.info(f"🔍 アニメ情報検索: {title}")
+            results = scrape_major_search_engines(f"{title} アニメ あらすじ 概要", 3)
+
+            if not results:
+                return None
+
+            raw = "\n".join([f"{r['title']}: {r['snippet']}" for r in results])[:500]
+
+            # キャッシュに保存
+            existing = session.query(AnimeInfoCache).filter_by(title=title).first()
+            if existing:
+                existing.raw_search_result = raw
+                existing.cached_at = datetime.utcnow()
+                existing.last_accessed = datetime.utcnow()
+            else:
+                session.add(AnimeInfoCache(
+                    title=title,
+                    raw_search_result=raw,
+                    cached_at=datetime.utcnow(),
+                    last_accessed=datetime.utcnow(),
+                ))
+
+            return raw
+
+    except Exception as e:
+        logger.error(f"アニメ情報取得エラー ({title}): {e}")
+        return None
+
+def build_anime_context(message: str) -> str:
+    """
+    メッセージにアニメっぽい発言があれば、作品情報をWeb検索して
+    プロンプト注入用テキストとして返す。
+    """
+    # アニメ系の発言かどうか確認
+    has_anime_keyword = any(kw in message for kw in ['アニメ','漫画','マンガ','manga'])
+    has_anime_action = bool(ANIME_MENTION_PATTERN.search(message))
+
+    if not (has_anime_keyword or has_anime_action):
+        return ''
+
+    # 作品名候補を抽出
+    titles = extract_anime_titles_from_message(message)
+    if not titles:
+        return ''
+
+    context_parts = []
+    for title in titles[:2]:  # 最大2作品まで (API節約)
+        info = get_anime_info_from_cache_or_search(title)
+        if info:
+            context_parts.append(f"【アニメ情報: {title}】\n{info}")
+
+    if context_parts:
+        return "\n\n" + "\n".join(context_parts)
+    return ''
+
+def cleanup_anime_cache():
+    """7日以上アクセスされていないアニメキャッシュを削除"""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        with get_db_session() as session:
+            deleted = session.query(AnimeInfoCache).filter(
+                AnimeInfoCache.last_accessed < cutoff
+            ).delete()
+            if deleted:
+                logger.info(f"🗑️ 古いアニメキャッシュ {deleted}件を削除")
+    except Exception as e:
+        logger.error(f"アニメキャッシュクリーンアップエラー: {e}")
+
+
 def wrapped_news_fetch():
     """ニュース収集タスク (run_managed_task から呼ばれる)"""
     fetch_hololive_news()
@@ -1385,6 +1777,9 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'summarize_feelings':   {'func': 'summarize_member_feelings',        'interval_hours': 167.0}, # 週1回
     'cleanup_interests':    {'func': 'cleanup_old_interest_logs',        'interval_hours': 167.0}, # 週1回
     'cleanup_rate_limiter': {'func': 'chat_rate_limiter.cleanup_old_entries', 'interval_hours': 23.0},
+    # ★ v33.7.0追加
+    'fetch_sl_news':        {'func': 'fetch_all_sl_news',   'interval_hours': 11.0},  # 1日2回
+    'cleanup_anime_cache':  {'func': 'cleanup_anime_cache', 'interval_hours': 167.0}, # 週1回
     # ── ローカルファイル (起動のたびに実行して問題ない軽いもの) ──────────────
     'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
 }
@@ -1710,6 +2105,19 @@ INTEREST_RULES: List[Dict] = [
     {
         'category': 'travel',
         'keywords': ['旅行','観光','温泉','ホテル','海外','国内旅行','聖地','行ってきた','行きたい']
+    },
+    # ★ v33.7.0追加
+    {
+        'category': 'secondlife',
+        'keywords': ['セカンドライフ','second life','secondlife','インワールド','アバター','リンデン',
+                     'Linden','L$','リージョン','sim','SIM','メッシュ','テレポート','Firestorm',
+                     'マーケット','marketplace','スキン','Maitreya','Belleza','CATWA','BOM',
+                     'ガチャ','ロールプレイ','RP','ハントイベント']
+    },
+    {
+        'category': 'anime_detail',
+        'keywords': ['最終回','神アニメ','神作画','作画崩壊','聖地巡礼','1話','2話','最新話',
+                     '伏線','主人公','ヒロイン','声優','OP','ED','OP曲','ED曲','配信停止']
     },
 ]
 
@@ -2111,6 +2519,23 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"News injection error: {e}")
 
+    # 2b. ★ v33.7.0: セカンドライフ情報の注入
+    try:
+        if is_sl_topic(message) or "セカンドライフ" in message or "SL" in message:
+            sl_ctx = get_sl_news_context(limit=4)
+            if sl_ctx:
+                internal_context += sl_ctx
+    except Exception as e:
+        logger.error(f"SL context injection error: {e}")
+
+    # 2c. ★ v33.7.0: アニメ情報の自動検索・注入
+    try:
+        anime_ctx = build_anime_context(message)
+        if anime_ctx:
+            internal_context += anime_ctx
+    except Exception as e:
+        logger.error(f"Anime context injection error: {e}")
+
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
@@ -2172,6 +2597,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 4. 人物データに「直近のX(Twitter)の様子」がある場合、それは「今起きていること」や「最近の話題」として積極的に会話に取り入れてください。
 5. **【もちこの〇〇への想い】や【最近見た〇〇の配信】がある場合、それはあなた自身の記憶・体験として自然に会話に織り交ぜてください。**
 6. **【友達の記憶・プロフィール】がある場合、その人の好みや趣味を自然に会話に活かしてください。例えば「そういえば〇〇好きだって言ってたよね？」など自然に思い出す感じで。**
+7. **【セカンドライフ最新情報】がある場合、SLユーザーと話しているので積極的に活用してください。**
+8. **【アニメ情報】がある場合、それを使ってアニメの話を盛り上げてください。知らなかった作品でも、検索して得た情報から「あー、それ知ってる！〇〇なやつでしょ？」と自然に反応してください。**
 
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
@@ -2417,10 +2844,10 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             "text": text,
             "speaker": 20,
             "key": "",
-            "speed": 1.50,
-            "pitch": 0.05,
-            "intonation": 1.50,
-            "volume": 1.50,
+            "speedScale": 1.50,
+            "pitchScale": 0.05,
+            "intonationScale": 1.50,
+            "volumeScale": 1.50,
             "v": "3",
             "_t": timestamp
         }
@@ -2526,7 +2953,7 @@ def health_check():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.6.0+eco_scheduler',
+        'version': 'v33.7.0+sl_anime_support',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -2720,7 +3147,21 @@ def chat_lsl():
                     ai_text = suggestion
             
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
-            
+
+            # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
+            # build_anime_context はgenerate_ai_response内でも呼ばれるが、
+            # キャッシュ未ヒット時のWeb検索はブロッキングになるため、
+            # 知らない作品が含まれそうなら事前にバックグラウンドでキャッシュを作っておく
+            if any(kw in message for kw in ['アニメ','漫画','マンガ']):
+                titles = extract_anime_titles_from_message(message)
+                for _title in titles[:2]:
+                    background_executor.submit(get_anime_info_from_cache_or_search, _title)
+
+            # ★ v33.7.0: SL発言なら最新SL情報をバックグラウンドでリフレッシュ予約
+            # (次回の応答に間に合わせるため早めに投げておく)
+            if is_sl_topic(message):
+                logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
+
             if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
                 qdata = {
@@ -3032,6 +3473,70 @@ def refresh_friend_profile_endpoint(user_uuid: str):
     return create_json_response({'message': 'プロフィール再生成タスクを開始しました'})
 
 # ==============================================================================
+# ★ v33.7.0: SLニュース & アニメキャッシュ 管理エンドポイント
+# ==============================================================================
+@app.route('/admin/sl-news', methods=['GET'])
+def admin_sl_news():
+    """SLニュースの一覧を確認する管理エンドポイント"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        limit = int(request.args.get('limit', 20))
+        category = request.args.get('category')
+        with get_db_session() as session:
+            q = session.query(SecondLifeNews).order_by(SecondLifeNews.created_at.desc())
+            if category:
+                q = q.filter(SecondLifeNews.category == category)
+            items = q.limit(limit).all()
+            total = session.query(SecondLifeNews).count()
+        return create_json_response({
+            'total': total,
+            'showing': len(items),
+            'items': [{
+                'id': it.id,
+                'source': it.source,
+                'category': it.category,
+                'title': it.title,
+                'content': (it.content or '')[:150],
+                'url': it.url,
+                'created_at': it.created_at.strftime('%Y-%m-%d %H:%M UTC') if it.created_at else None,
+            } for it in items]
+        })
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+@app.route('/admin/sl-news/fetch', methods=['POST'])
+def admin_sl_news_fetch():
+    """SLニュースを今すぐ収集する"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    run_managed_task('fetch_sl_news', fetch_all_sl_news)
+    return create_json_response({'message': 'SLニュース収集を開始しました'})
+
+@app.route('/admin/anime-cache', methods=['GET'])
+def admin_anime_cache():
+    """アニメキャッシュの一覧を確認する管理エンドポイント"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        with get_db_session() as session:
+            items = session.query(AnimeInfoCache).order_by(AnimeInfoCache.last_accessed.desc()).limit(50).all()
+            total = session.query(AnimeInfoCache).count()
+        return create_json_response({
+            'total': total,
+            'items': [{
+                'title': it.title,
+                'status': it.status,
+                'season': it.season,
+                'cached_at': it.cached_at.strftime('%Y-%m-%d %H:%M') if it.cached_at else None,
+                'last_accessed': it.last_accessed.strftime('%Y-%m-%d %H:%M') if it.last_accessed else None,
+                'snippet': (it.raw_search_result or '')[:100],
+            } for it in items]
+        })
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+# ==============================================================================
 # 初期化
 # ==============================================================================
 def run_scheduler():
@@ -3124,6 +3629,18 @@ def check_and_migrate_db():
                     except: pass
                 logger.info("ℹ️ friend_profiles テーブルは Base.metadata.create_all で作成されます")
 
+            # ★ v33.7.0: secondlife_news / anime_info_cache
+            for tbl in ['secondlife_news', 'anime_info_cache']:
+                try:
+                    t = conn.begin()
+                    conn.execute(text(f"SELECT id FROM {tbl} LIMIT 1"))
+                    t.commit()
+                    logger.info(f"✅ {tbl} テーブル確認OK")
+                except Exception:
+                    try: t.rollback()
+                    except: pass
+                    logger.info(f"ℹ️ {tbl} は Base.metadata.create_all で作成されます")
+
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
@@ -3163,7 +3680,7 @@ def setup_stream_processing_schedule():
 
 def initialize_app():
     global engine, Session, groq_client, gemini_model
-    logger.info("🔧 初期化開始 (v33.6.0 + 省エネ外部cronスケジューラ)")
+    logger.info("🔧 初期化開始 (v33.7.0 + セカンドライフ情報 & アニメ自動検索)")
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -3222,6 +3739,9 @@ def initialize_app():
         'cleanup_interests':    cleanup_old_interest_logs,
         'cleanup_voices':       cleanup_old_voice_files,
         'cleanup_rate_limiter': chat_rate_limiter.cleanup_old_entries,
+        # ★ v33.7.0追加
+        'fetch_sl_news':        fetch_all_sl_news,
+        'cleanup_anime_cache':  cleanup_anime_cache,
     })
 
     # 起動時キャッチアップ: スリープ中に漏れた全タスクを補完実行
@@ -3234,7 +3754,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.6.0)")
+    logger.info("🚀 初期化完了! (v33.7.0)")
 
 initialize_app()
 
