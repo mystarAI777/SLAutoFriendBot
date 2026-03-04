@@ -1680,32 +1680,57 @@ def get_anime_info_from_cache_or_search(title: str) -> Optional[str]:
         logger.error(f"アニメ情報取得エラー ({title}): {e}")
         return None
 
+def _get_anime_from_cache_only(title: str) -> Optional[str]:
+    """
+    DBキャッシュのみを参照してアニメ情報を返す。
+    キャッシュMISSの場合は None を返し、Webアクセスは行わない。
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        with get_db_session() as session:
+            cached = session.query(AnimeInfoCache).filter(
+                AnimeInfoCache.title == title,
+                AnimeInfoCache.cached_at >= cutoff
+            ).first()
+            if cached:
+                cached.last_accessed = datetime.utcnow()
+                return cached.raw_search_result
+    except Exception as e:
+        logger.error(f"アニメキャッシュ参照エラー ({title}): {e}")
+    return None
+    
 def build_anime_context(message: str) -> str:
     """
-    メッセージにアニメっぽい発言があれば、作品情報をWeb検索して
-    プロンプト注入用テキストとして返す。
+    メッセージにアニメっぽい発言があれば、キャッシュ済み作品情報を返す。
+    キャッシュMISS時はバックグラウンドで取得してスケジュール (次回HIT)。
+    → 同期Webスクレイピングを一切行わないのでレスポンスをブロックしない。
     """
     # アニメ系の発言かどうか確認
-    has_anime_keyword = any(kw in message for kw in ['アニメ','漫画','マンガ','manga'])
+    has_anime_keyword = any(kw in message for kw in ['アニメ', '漫画', 'マンガ', 'manga'])
     has_anime_action = bool(ANIME_MENTION_PATTERN.search(message))
 
     if not (has_anime_keyword or has_anime_action):
         return ''
 
-    # 作品名候補を抽出
     titles = extract_anime_titles_from_message(message)
     if not titles:
         return ''
 
     context_parts = []
-    for title in titles[:2]:  # 最大2作品まで (API節約)
-        info = get_anime_info_from_cache_or_search(title)
-        if info:
-            context_parts.append(f"【アニメ情報: {title}】\n{info}")
+    for title in titles[:2]:
+        try:
+            # キャッシュのみ確認 (Webアクセスしない)
+            cached_info = _get_anime_from_cache_only(title)
+            if cached_info:
+                context_parts.append(f"【アニメ情報: {title}】\n{cached_info}")
+            else:
+                # キャッシュMISS → バックグラウンドで取得予約 (今回は使わない)
+                background_executor.submit(get_anime_info_from_cache_or_search, title)
+                logger.info(f"🎬 アニメ情報をバックグラウンドで取得予約: {title}")
+        except Exception as e:
+            logger.error(f"アニメコンテキスト構築エラー ({title}): {e}")
 
-    if context_parts:
-        return "\n\n" + "\n".join(context_parts)
-    return ''
+    return "\n\n" + "\n".join(context_parts) if context_parts else ''
 
 def cleanup_anime_cache():
     """7日以上アクセスされていないアニメキャッシュを削除"""
@@ -3152,14 +3177,7 @@ def chat_lsl():
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
 
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
-            # build_anime_context はgenerate_ai_response内でも呼ばれるが、
-            # キャッシュ未ヒット時のWeb検索はブロッキングになるため、
-            # 知らない作品が含まれそうなら事前にバックグラウンドでキャッシュを作っておく
-            if any(kw in message for kw in ['アニメ','漫画','マンガ']):
-                titles = extract_anime_titles_from_message(message)
-                for _title in titles[:2]:
-                    background_executor.submit(get_anime_info_from_cache_or_search, _title)
-
+           
             # ★ v33.7.0: SL発言なら最新SL情報をバックグラウンドでリフレッシュ予約
             # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
@@ -3198,7 +3216,7 @@ def chat_lsl():
             
             # ★ v33.4.0: session を渡して友達記憶を活用
             if not ai_text:
-                ai_text = generate_ai_response_safe(user_data, message, history, session=session)
+                ai_text = _generate_with_timeout(user_data, message, history, session, user_uuid)
             
             if not is_task_started:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
