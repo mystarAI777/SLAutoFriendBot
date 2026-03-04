@@ -95,12 +95,15 @@ GEMINI_MODELS = [
     "gemini-1.5-flash-8b",
     "gemini-2.0-flash-exp",
 ]
+# ==========================================
+# Groqで使用するモデルの優先順位 (2026年実務最適化版)
+# ==========================================
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it"
+    "llama-3.3-70b-versatile",        # メイン火力：汎用性・日本語能力・コードの総合力No.1
+    "deepseek-r1-distill-llama-70b",  # 推論特化：複雑なロジックや長考が必要な時用
+    "deepseek-r1-distill-qwen-32b",   # Qwen系エース：コードと論理推論のバランス型
+    "qwen-2.5-32b",                   # 多言語ベース：Qwen独自の素直な応答が必要な時
+    "llama-3.1-8b-instant"            # 高速・軽量：Botの日常会話や補助タスクの常用
 ]
 
 USER_AGENTS = [
