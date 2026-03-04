@@ -35,6 +35,7 @@ import traceback
 import threading
 import atexit
 import glob
+import concurrent.futures as _cf  # ← これも先頭の import ブロックに追加
 from html import escape
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -2665,6 +2666,56 @@ def generate_ai_response_safe(user_data: UserData, message: str, history: List[D
     except Exception as e:
         logger.error(f"generate_ai_response_safe エラー: {e}", exc_info=True)
         return "システムエラーが発生したよ…ごめんね！"
+def _generate_with_timeout(
+    user_data,
+    message: str,
+    history: list,
+    session,
+    user_uuid: str,
+    timeout: int = _CHAT_TIMEOUT_SECONDS
+) -> str:
+    """
+    generate_ai_response_safe をタイムアウト付きで実行する。
+    18秒以内に応答できない場合は「待ってて」メッセージを即返し、
+    バックグラウンドで処理を継続してタスクとして保存する。
+    """
+    future = background_executor.submit(
+        generate_ai_response_safe,
+        user_data, message, history,
+        session=session
+    )
+    try:
+        return future.result(timeout=timeout)
+
+    except _cf.TimeoutError:
+        logger.warning(
+            f"⏱️ AI応答タイムアウト ({timeout}s) "
+            f"user={user_uuid}: {message[:30]}"
+        )
+        tid = f"timeout_{user_uuid}_{int(time.time())}"
+
+        def _save_when_done():
+            try:
+                result = future.result(timeout=60)
+                with get_db_session() as s:
+                    s.add(BackgroundTask(
+                        task_id=tid,
+                        user_uuid=user_uuid,
+                        task_type='timeout_recovery',
+                        query=message[:500],
+                        result=result,
+                        status='completed',
+                        completed_at=datetime.utcnow()
+                    ))
+            except Exception as e:
+                logger.error(f"タイムアウト回復エラー: {e}")
+
+        background_executor.submit(_save_when_done)
+        return "ごめん、ちょっと考えるのに時間かかってるみたい！少しだけ待ってからもう一度話しかけてみて！"
+
+    except Exception as e:
+        logger.error(f"_generate_with_timeout エラー: {e}")
+        return "うーん、何かエラーが起きちゃった…もう一回話しかけてみて！"
 
 # ==============================================================================
 # ホロメンチャット処理
