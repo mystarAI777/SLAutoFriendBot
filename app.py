@@ -37,7 +37,6 @@
 # 5. 記憶の蓄積と参照 (過去の感想を会話に反映)
 # 6. データベース容量管理システム
 # ==============================================================================
-# ==============================================================================
 
 # ===== 標準ライブラリ =====
 import sys
@@ -3054,7 +3053,7 @@ def health_check():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.7.0+sl_anime_support',
+        'version': 'v33.8.0+pgvector_rag',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
