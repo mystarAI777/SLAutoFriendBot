@@ -1,6 +1,25 @@
 # ==============================================================================
-# もちこAI - v33.6.0 + 省エネ外部cronスケジューラ (GitHub Actions) + パーソナライズ機能 + SNSリアルタイム情報連携 + ホロライブ熱狂ファンシステム
+# もちこAI - v33.8.0 + pgvector RAGシステム + Gemini 2.5モデル更新
 #
+# ベース: v33.7.0 (全機能保持)
+# 追加機能 (v33.8.0):
+# 12. pgvector RAGシステム (HoloRAGクラス / PostgreSQL vectorストア)
+# 13. Gemini text-embedding-004 によるセマンティック検索
+# 14. GitHub Actions による自動ベクターDB構築 (build_holo_rag.yml)
+# 15. Geminiモデル更新 (gemini-2.5-flash / gemini-2.5-flash-lite)
+# 16. PostgreSQLシーケンス修正対象テーブル追加 (user_interest_logs等)
+# ===
+# ベース: v33.6.0 (全機能保持)
+# 追加機能 (v33.7.0):
+# セカンドライフ情報収集 (SecondLifeNews テーブル / 30日自動削除)
+# アニメ自動検索 & 知識キャッシュ (AnimeInfoCache テーブル / 7日更新)
+# ===
+# ベース: v33.5.0 (全機能保持)
+# 追加機能 (v33.6.0):
+# 省エネ外部cronスケジューラ (GitHub Actions / 1日2回wake)
+# /wake エンドポイント追加 (WAKE_API_KEY認証)
+# TaskLog テーブル追加 (タスク実行履歴管理)
+# ===
 # ベース: v33.3.0 (全機能保持)
 # 追加機能 (v33.4.0):
 # 7. 友達プロフィール自動構築 (FriendProfile テーブル)
@@ -17,6 +36,7 @@
 # 4. 感情分析エンジン (もちこの性格に基づいた反応生成)
 # 5. 記憶の蓄積と参照 (過去の感想を会話に反映)
 # 6. データベース容量管理システム
+# ==============================================================================
 # ==============================================================================
 
 # ===== 標準ライブラリ =====
@@ -93,9 +113,10 @@ ANALYSIS_INTERVAL = 5
 TOPIC_SUGGESTION_INTERVAL = 10
 
 GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-1.5-flash",
     "gemini-1.5-flash-8b",
-    "gemini-2.0-flash-exp",
 ]
 # ==========================================
 # Groqで使用するモデルの優先順位 (2026年実務最適化版)
@@ -3722,10 +3743,13 @@ def fix_postgres_sequences():
         return
 
     logger.info("🔧 DBの連番ズレを修正中...")
+    # 修正後
     tables = ['user_memories', 'conversation_history', 'user_psychology', 
               'background_tasks', 'holomem_wiki', 'hololive_news', 
               'holomem_nicknames', 'hololive_glossary',
-              'stream_reactions', 'holomem_feelings']
+              'stream_reactions', 'holomem_feelings',
+              'user_interest_logs', 'friend_profiles',
+              'secondlife_news', 'anime_info_cache']
     
     try:
         with engine.connect() as conn:
@@ -3757,6 +3781,14 @@ def initialize_app():
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# ★ pgvector拡張の有効化
+　　try:
+　　    with engine.connect() as conn:
+　　        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+　　        conn.commit()
+　　    logger.info("✅ pgvector拡張 有効化完了")
+　　except Exception as e:
+　　    logger.warning(f"⚠️ pgvector: {e}")
         Base.metadata.create_all(engine)
         
         check_and_migrate_db()
