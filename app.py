@@ -3781,14 +3781,16 @@ def initialize_app():
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-# ★ pgvector拡張の有効化
-　　try:
-　　    with engine.connect() as conn:
-　　        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-　　        conn.commit()
-　　    logger.info("✅ pgvector拡張 有効化完了")
-　　except Exception as e:
-　　    logger.warning(f"⚠️ pgvector: {e}")
+
+        # ★ pgvector拡張の有効化
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+            logger.info("✅ pgvector拡張 有効化完了")
+        except Exception as e:
+            logger.warning(f"⚠️ pgvector: {e}")
+
         Base.metadata.create_all(engine)
         
         check_and_migrate_db()
