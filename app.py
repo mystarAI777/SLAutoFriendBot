@@ -971,7 +971,7 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
     try:
         model = gemini_model_manager.get_current_model()
         if model:
-            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 200})
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 1000})
             if hasattr(response, 'candidates') and response.candidates:
                 feeling = response.candidates[0].content.parts[0].text.strip()
                 return {
@@ -1056,7 +1056,7 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
         if model:
             response = model.generate_content(
                 prompt, 
-                generation_config={"temperature": 0.8, "max_output_tokens": 300}
+                generation_config={"temperature": 0.8, "max_output_tokens": 1000}
             )
             if hasattr(response, 'candidates') and response.candidates:
                 summary = response.candidates[0].content.parts[0].text.strip()
@@ -2304,7 +2304,7 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
         model = gemini_model_manager.get_current_model()
         if model:
             try:
-                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 400})
+                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 1000})
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -2466,7 +2466,7 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
     try:
         model = gemini_model_manager.get_current_model()
         if model:
-            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 100})
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 1000})
             if hasattr(response, 'candidates') and response.candidates:
                 return response.candidates[0].content.parts[0].text.strip()
     except Exception as e:
@@ -2492,7 +2492,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
         
         response = model.generate_content(
             full_prompt, 
-            generation_config={"temperature": 0.8, "max_output_tokens": 400}
+            generation_config={"temperature": 0.8, "max_output_tokens": 1000}
         )
         
         if hasattr(response, 'candidates') and response.candidates:
