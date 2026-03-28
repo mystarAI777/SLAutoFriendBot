@@ -2039,7 +2039,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
                         model=models[0],
                         messages=[{"role": "user", "content": analysis_prompt}],
                         temperature=0.3,
-                        max_tokens=300
+                        max_tokens=800
                     )
                     text = response.choices[0].message.content.strip()
                     json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
@@ -2326,7 +2326,7 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
                     resp = groq_client.chat.completions.create(
                         model=available[0],
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3, max_tokens=400
+                        temperature=0.3, max_tokens=800
                     )
                     text = resp.choices[0].message.content.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
