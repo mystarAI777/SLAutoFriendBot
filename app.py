@@ -2958,7 +2958,21 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             "_t": timestamp
         }
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+# 🚀 【デバッグ用ログ】送信直前の全パラメータを書き出す
+        import json
+        logger.info(f"🔍 [DEBUG] TTS送信パラメータ: {json.dumps(params, indent=2)}")
+
+        # 実行
+        res = requests.get(api_url, params=params, headers=headers, timeout=60)
         
+        # 🚀 【デバッグ用ログ】APIからのレスポンス(JSON)に何が書かれているか確認
+        if res.status_code == 200:
+            res_json = res.json()
+            # もしレスポンスに audio_query が含まれるタイプなら、その中の speedScale を見る
+            if "audio_query" in res_json:
+                actual_speed = res_json["audio_query"].get("speedScale")
+                logger.info(f"📢 [RESULT] API側で受理された速度: {actual_speed}")
+                
         logger.info(f"🎙️ 音声生成(Speed:1.5): {text[:20]}...")
         res = requests.get(api_url, params=params, headers=headers, timeout=60)
         
