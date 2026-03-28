@@ -2950,10 +2950,10 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
             "text": text,
             "speaker": 20,
             "key": "",
-            "speed": 1.50,
-            "pitch": 0.05,
-            "intonation": 1.50,
-            "volume": 1.50,
+            "speedScale": 1.50,      # ✨ speed ではなく speedScale
+            "pitchScale": 0.05,      # ✨ pitch ではなく pitchScale
+            "intonationScale": 1.50, # ✨ intonation ではなく intonationScale
+            "volumeScale": 1.50,     # ✨ volume ではなく volumeScale
             "v": "3",
             "_t": timestamp
         }
