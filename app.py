@@ -524,6 +524,26 @@ class AnimeInfoCache(Base):
     last_accessed = Column(DateTime, default=datetime.utcnow)
 
 # ==============================================================================
+# ★ 追加: 専門サイト検索結果キャッシュテーブル
+# ==============================================================================
+class SpecializedNews(Base):
+    """
+    専門サイト（Blender公式ドキュメント・CGニュース等）への
+    スコープ限定検索から得た知見を蓄積するテーブル。
+    ユーザーが質問するたびに最新情報が追加される自律学習型。
+    SL・アニメは専用テーブルで管理するため除外。30日で自動削除。
+    """
+    __tablename__ = 'specialized_news'
+    id = Column(Integer, primary_key=True)
+    site_name = Column(String(100), nullable=False, index=True)
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=True)
+    url = Column(String(1000), nullable=True)
+    news_hash = Column(String(100), unique=True, index=True)
+    query_keyword = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+# ==============================================================================
 # セッション & ユーティリティ
 # ==============================================================================
 class RateLimiter:
@@ -1606,6 +1626,224 @@ def is_sl_topic(message: str) -> bool:
 
 
 # ==============================================================================
+# ★ 追加: 専門サイト検索スコープ定義 & 検索ロジック
+# ==============================================================================
+
+SPECIALIZED_SITES: Dict[str, Dict] = {
+    "blender": {
+        "name": "Blender公式ドキュメント",
+        "base_url": "https://docs.blender.org/manual/ja/latest/",
+        "keywords": ["blender", "ブレンダー", "ブレンド", "blenderで", "blenderの"],
+        "prompt_role": "Blender 3DCGソフトウェアの専門家",
+        "category": "3dcg"
+    },
+    "cg_news": {
+        "name": "ModelingHappy (CGニュース)",
+        "base_url": "https://modelinghappy.com/",
+        "keywords": ["cgニュース", "モデリングハッピー", "cg情報", "3dニュース", "cg業界"],
+        "prompt_role": "CG・3DCG業界のニュース専門家",
+        "category": "cg"
+    },
+    "science": {
+        "name": "ナゾロジー (脳科学・心理学)",
+        "base_url": "https://nazology.kusuguru.co.jp/",
+        "keywords": ["脳科学", "心理学", "ナゾロジー", "認知科学", "神経科学", "行動経済学", "認知バイアス"],
+        "prompt_role": "脳科学・心理学の専門家",
+        "category": "science"
+    },
+}
+
+
+def detect_specialized_topic(message: str) -> Optional[Dict]:
+    """
+    メッセージから専門サイト検索が必要なトピックを検出する。
+    SL・アニメ系は既存システムが担当するため除外。
+    一致したサイト情報(Dict)を返す。該当なしはNone。
+    """
+    msg_lower = message.lower()
+    for key, site in SPECIALIZED_SITES.items():
+        if any(kw.lower() in msg_lower for kw in site["keywords"]):
+            return site
+    return None
+
+
+def save_to_specialized_news(
+    site_name: str,
+    title: str,
+    content: str,
+    url: str = "",
+    query_keyword: str = ""
+):
+    """
+    専門サイト検索結果をspecialized_newsテーブルに保存する。
+    重複はnews_hashで除外。
+    """
+    try:
+        news_hash = hashlib.md5(
+            f"{site_name}:{title}:{content[:100]}".encode('utf-8')
+        ).hexdigest()
+        with get_db_session() as session:
+            if not session.query(SpecializedNews).filter_by(news_hash=news_hash).first():
+                session.add(SpecializedNews(
+                    site_name=site_name,
+                    title=title[:500],
+                    content=content[:2000],
+                    url=url[:1000] if url else "",
+                    news_hash=news_hash,
+                    query_keyword=query_keyword[:200] if query_keyword else "",
+                    created_at=datetime.utcnow()
+                ))
+                logger.info(f"✅ specialized_news 保存: {site_name} - {title[:40]}")
+    except Exception as e:
+        logger.error(f"specialized_news 保存エラー: {e}")
+
+
+def execute_specialized_site_search(query: str, site_info: Dict) -> str:
+    """
+    指定された専門サイト内のみをsite:演算子で検索し、専門家として回答する。
+    検索結果はspecialized_newsテーブルに自動蓄積（次回以降のRAGに活用）。
+    フォールバック: site:検索失敗時はサイト名込みの一般検索に切り替え。
+    """
+    target_site = site_info['base_url']
+    search_query = f"site:{target_site} {query}"
+    logger.info(f"🔍 専門サイト検索: {search_query[:80]}")
+
+    results = scrape_major_search_engines(search_query, 4)
+
+    if not results:
+        fallback_query = f"{site_info['name']} {query}"
+        logger.info(f"⚡ フォールバック検索: {fallback_query[:60]}")
+        results = scrape_major_search_engines(fallback_query, 3)
+
+    if not results:
+        return (
+            f"ごめん、{site_info['name']}の中を調べてみたけど、"
+            f"直接の回答は見つからなかったじゃん…"
+            f"公式サイト({target_site})を直接見てみてね！"
+        )
+
+    for r in results:
+        save_to_specialized_news(
+            site_name=site_info['name'],
+            title=r.get('title', ''),
+            content=r.get('snippet', ''),
+            url=r.get('url', ''),
+            query_keyword=query
+        )
+
+    results_text = "\n".join([
+        f"{i+1}. {r['title']}: {r['snippet']}"
+        for i, r in enumerate(results)
+    ])
+
+    prompt = f"""あなたは{site_info['name']}に精通した{site_info['prompt_role']}です。
+以下の検索結果（{site_info['name']}内の情報）のみをソースとして、
+ユーザーの質問「{query}」に回答してください。
+
+【回答ルール】
+- もちこの口調を維持（一人称: あてぃし、語尾: じゃん/だね/て感じ）
+- {site_info['prompt_role']}として正確に、でも分かりやすく説明する
+- 検索結果にない情報は「ドキュメントには記載がないじゃん」と正直に答える
+- 300〜400文字以内に凝縮する
+
+【検索結果】
+{results_text}
+"""
+
+    response = None
+    model = gemini_model_manager.get_current_model()
+    if model:
+        try:
+            resp = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.5, "max_output_tokens": 1000}
+            )
+            if hasattr(resp, 'candidates') and resp.candidates:
+                response = resp.candidates[0].content.parts[0].text.strip()
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "quota" in error_str.lower():
+                retry_match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_str)
+                wait_seconds = int(float(retry_match.group(1))) + 5 if retry_match else 60
+                gemini_model_manager.mark_limited(wait_seconds)
+            logger.warning(f"専門検索Geminiエラー: {e}")
+
+    if not response and groq_client:
+        response = call_groq(prompt, query, [], 800)
+
+    if not response:
+        response = (
+            f"{site_info['name']}で調べた結果じゃん！\n"
+            f"{results_text[:300]}"
+        )
+
+    return response
+
+
+def get_specialized_news_context(message: str, limit: int = 3) -> str:
+    """
+    specialized_newsテーブルからメッセージに関連する情報を取得し、
+    プロンプト注入用テキストとして返す。
+    キーワードマッチングで関連度を判断。
+    """
+    try:
+        with get_db_session() as session:
+            items = session.query(SpecializedNews).order_by(
+                SpecializedNews.created_at.desc()
+            ).limit(limit * 5).all()
+
+            if not items:
+                return ''
+
+            query_words = [w for w in message.lower().split() if len(w) >= 2]
+            scored: List[tuple] = []
+            for item in items:
+                kw = (item.query_keyword or '').lower()
+                title_lower = (item.title or '').lower()
+                content_lower = (item.content or '').lower()
+                score = sum(
+                    1 for w in query_words
+                    if w in kw or w in title_lower or w in content_lower
+                )
+                if score > 0:
+                    scored.append((score, item))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            relevant = [item for _, item in scored[:limit]]
+
+            if not relevant:
+                return ''
+
+            lines = []
+            for it in relevant:
+                line = f"【{it.site_name}】{it.title}"
+                if it.content and len(it.content) > 5:
+                    line += f"\n{it.content[:250]}"
+                lines.append(line)
+
+            return "\n\n【専門サイト検索キャッシュ】\n" + "\n\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"specialized_news コンテキスト取得エラー: {e}")
+        return ''
+
+
+def cleanup_old_specialized_news():
+    """30日以上前のspecialized_newsを削除"""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        with get_db_session() as session:
+            deleted = session.query(SpecializedNews).filter(
+                SpecializedNews.created_at < cutoff
+            ).delete()
+            if deleted:
+                logger.info(f"🗑️ 古い専門ニュース {deleted}件を削除")
+    except Exception as e:
+        logger.error(f"specialized_news クリーンアップエラー: {e}")
+
+
+
+# ==============================================================================
 # ★ 追加 (v33.7.0): アニメ自動検索 & 知識キャッシュ
 # ==============================================================================
 
@@ -1830,6 +2068,8 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     # ★ v33.7.0追加
     'fetch_sl_news':        {'func': 'fetch_all_sl_news',   'interval_hours': 11.0},  # 1日2回
     'cleanup_anime_cache':  {'func': 'cleanup_anime_cache', 'interval_hours': 167.0}, # 週1回
+    # ★ 追加
+    'cleanup_specialized_news': {'func': 'cleanup_old_specialized_news', 'interval_hours': 167.0},  # 週1回
     # ── ローカルファイル (起動のたびに実行して問題ない軽いもの) ──────────────
     'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
 }
@@ -2586,6 +2826,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Anime context injection error: {e}")
 
+    # 2d. ★ 追加: 専門サイト検索キャッシュの注入
+    # Blender / CGニュース / 脳科学など専門ドメインの蓄積情報を注入
+    try:
+        specialized_ctx = get_specialized_news_context(message)
+        if specialized_ctx:
+            internal_context += specialized_ctx
+    except Exception as e:
+        logger.error(f"Specialized news context injection error: {e}")
+
+
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
@@ -2944,6 +3194,55 @@ def background_deep_search(task_id: str, query_data: Dict):
             task.status = 'completed'
             task.completed_at = datetime.utcnow()
 
+
+def background_specialized_search(task_id: str, query_data: Dict):
+    """
+    専門サイト限定検索をバックグラウンドで実行するタスク。
+    execute_specialized_site_search() を呼び出し、結果をBackgroundTaskに保存。
+    """
+    query = query_data.get('query', '')
+    site_info = query_data.get('specialized_site', {})
+    user_data_dict = query_data.get('user_data', {})
+
+    result_text = (
+        f"「{query}」について{site_info.get('name', '専門サイト')}で"
+        f"調べたけど、見つからなかったじゃん…"
+    )
+
+    try:
+        # 専門サイト限定検索実行（結果はDBに自動保存される）
+        search_result = execute_specialized_site_search(query, site_info)
+
+        user_data = UserData(
+            uuid=user_data_dict.get('uuid', ''),
+            name=user_data_dict.get('name', 'Guest'),
+            interaction_count=user_data_dict.get('interaction_count', 0),
+            is_friend=user_data_dict.get('is_friend', False),
+            favorite_topics=user_data_dict.get('favorite_topics', []),
+            psychology=user_data_dict.get('psychology'),
+            friend_profile=user_data_dict.get('friend_profile')
+        )
+        with get_db_session() as session:
+            history = get_conversation_history(session, user_data.uuid)
+
+        # もちこ口調で最終整形（専門家回答をそのまま返す場合が多い）
+        result_text = generate_ai_response_safe(
+            user_data, query, history,
+            reference_info=f"【専門サイト検索結果: {site_info.get('name', '')}】\n{search_result}",
+            is_detailed=True,
+            is_task_report=True
+        )
+
+    except Exception as e:
+        logger.error(f"❌ 専門検索バックグラウンドエラー: {e}")
+
+    with get_db_session() as session:
+        task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+        if task:
+            task.result = result_text
+            task.status = 'completed'
+            task.completed_at = datetime.utcnow()
+
 # ==============================================================================
 # 音声ファイル (VOICEVOX - tts.quest API版)
 # ==============================================================================
@@ -3271,6 +3570,35 @@ def chat_lsl():
             # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
+
+            # ★ 追加: 専門サイト検索トピック検出
+            # Blender / CGニュース / 脳科学のキーワードを検知し、
+            # 対象サイト内限定検索（site:演算子）をバックグラウンドで実行
+            detected_site = detect_specialized_topic(message)
+            if not ai_text and detected_site and is_explicit_search_request(message):
+                tid = f"specialized_{user_uuid}_{int(time.time())}"
+                specialized_qdata = {
+                    'query': message,
+                    'specialized_site': detected_site,
+                    'user_data': {
+                        'uuid': user_data.uuid,
+                        'name': user_data.name,
+                        'interaction_count': user_data.interaction_count,
+                        'is_friend': user_data.is_friend,
+                        'favorite_topics': user_data.favorite_topics,
+                        'psychology': user_data.psychology,
+                        'friend_profile': user_data.friend_profile
+                    }
+                }
+                session.add(BackgroundTask(
+                    task_id=tid,
+                    user_uuid=user_uuid,
+                    task_type='specialized_search',
+                    query=json.dumps(specialized_qdata, ensure_ascii=False)
+                ))
+                background_executor.submit(background_specialized_search, tid, specialized_qdata)
+                ai_text = f"{detected_site['name']}の中を調べてくるじゃん！少し待ってて！"
+                is_task_started = True
 
             if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
@@ -3740,7 +4068,7 @@ def check_and_migrate_db():
                 logger.info("ℹ️ friend_profiles テーブルは Base.metadata.create_all で作成されます")
 
             # ★ v33.7.0: secondlife_news / anime_info_cache
-            for tbl in ['secondlife_news', 'anime_info_cache']:
+            for tbl in ['secondlife_news', 'anime_info_cache', 'specialized_news']:  # ★ 追加
                 try:
                     t = conn.begin()
                     conn.execute(text(f"SELECT id FROM {tbl} LIMIT 1"))
