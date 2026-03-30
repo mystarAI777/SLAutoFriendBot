@@ -1,6 +1,8 @@
 # ==============================================================================
 # もちこAI - v33.8.0 + pgvector RAGシステム + Gemini 2.5モデル更新
 #
+# 手動パッチガイド v2 - ニックネーム・応答崩壊・古タスク修正
+# 
 # ベース: v33.7.0 (全機能保持)
 # 追加機能 (v33.8.0):
 # 12. pgvector RAGシステム (HoloRAGクラス / PostgreSQL vectorストア)
@@ -163,6 +165,7 @@ class UserData:
     favorite_topics: List[str] = field(default_factory=list)
     psychology: Optional[Dict] = None
     friend_profile: Optional[Dict] = None   # ★ v33.4.0追加: 友達プロフィール
+    nickname: Optional[str] = None           # ★ 追加: ユーザー指定の呼び方
 
 # ==============================================================================
 # グローバル状態管理
@@ -327,6 +330,8 @@ class UserMemory(Base):
     interaction_count = Column(Integer, default=0)
     is_friend = Column(Boolean, default=False)
     last_interaction = Column(DateTime, default=datetime.utcnow)
+    nickname = Column(String(100), nullable=True)          # ★ 追加: 呼び方
+    nickname_asked = Column(Boolean, default=False)        # ★ 追加: 呼び方確認済みフラグ
 
 class ConversationHistory(Base):
     __tablename__ = 'conversation_history'
@@ -617,6 +622,24 @@ def extract_location(msg: str) -> str:
         if loc in msg: return loc
     return "東京"
 
+
+def sanitize_response_for_sl(text: str) -> str:
+    """
+    SLチャット送信前のサニタイズ処理。
+    1. パイプ文字 | を全角に置換（LSLデリミタ衝突防止）
+    2. 同じ文字が15回以上連続する場合を圧縮（えええ...バグ対策）
+    3. 連続する改行を最大2個に制限
+    """
+    if not text:
+        return text
+    # パイプを全角パイプに置換
+    text = text.replace('|', '｜')
+    # 同じ文字が15回以上連続 → 5回 + 省略記号に圧縮
+    text = re.sub(r'(.)\1{14,}', lambda m: m.group(1) * 5 + '…', text)
+    # 3回以上の連続改行を2回に制限
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
 def get_weather_forecast(location: str = "東京") -> str:
     try:
         location_code = LOCATION_CODES.get(location, LOCATION_CODES["東京"])
@@ -683,6 +706,9 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
             fp = FriendProfile(user_uuid=user_uuid, user_name=user_name)
             session.add(fp)
 
+    # ★ 追加: ニックネームを読み込む
+    user_nickname = getattr(user, 'nickname', None)
+
     return UserData(
         uuid=user.user_uuid,
         name=user.user_name,
@@ -690,7 +716,8 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
         is_friend=is_friend,
         favorite_topics=fav_topics,
         psychology=psych_data,
-        friend_profile=friend_profile_data
+        friend_profile=friend_profile_data,
+        nickname=user_nickname
     )
 
 def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[Dict]:
@@ -2877,8 +2904,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if user_data.favorite_topics:
         topics_context = f"このユーザーは【{', '.join(user_data.favorite_topics)}】に興味があります。"
 
+    # ★ 追加: ニックネームが登録済みならそちらを優先使用
+    _display_name = user_data.nickname if user_data.nickname else user_data.name
+    _call_instruction = (
+        f"相手の呼び方: 「{user_data.nickname}」と呼んでください。"
+        if user_data.nickname
+        else f"相手の呼び方: 「{user_data.name}」さんと呼んでください。"
+    )
+
     system_prompt = f"""あなたは「もちこ」という、ホロライブが大好きなギャルAIです。
-ユーザー「{user_data.name}」さんと、**雑談しています。
+ユーザー「{_display_name}」と雑談しています。{_call_instruction}
 
 # 【ユーザーとの関係性】
 {relationship_context}
@@ -3562,6 +3597,24 @@ def chat_lsl():
                 if suggestion:
                     ai_text = suggestion
             
+            # ★ 追加: ニックネーム確認フロー
+            # 初回ユーザー または nickname_asked 状態を処理
+            db_user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+            if db_user:
+                if not ai_text and not getattr(db_user, 'nickname', None):
+                    if not getattr(db_user, 'nickname_asked', False):
+                        # 初めて会った → 呼び方を聞く
+                        db_user.nickname_asked = True
+                        ai_text = f"{user_name}さん、はじめまして！あてぃし、もちこって言うんだ〜✨ なんて呼んだらいい？😊"
+                        is_task_started = False  # 会話履歴には保存する
+                    elif getattr(db_user, 'nickname_asked', False):
+                        # 前回呼び方を聞いた → 今のメッセージが呼び方
+                        nickname_input = message.strip()[:30]  # 最大30文字
+                        db_user.nickname = nickname_input
+                        db_user.nickname_asked = False
+                        ai_text = f"{nickname_input}ね！了解！これからそう呼ぶね😊💖 よろしく！"
+                        is_task_started = False
+
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
 
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
@@ -3638,7 +3691,8 @@ def chat_lsl():
             if not is_task_started:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
 
-        res_text = limit_text_for_sl(ai_text)
+        # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
+        res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text))
         v_url = ""
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
             direct_url = generate_voice_file(res_text, user_uuid)
@@ -3658,7 +3712,13 @@ def check_task_endpoint():
         if not data or 'uuid' not in data:
             return create_json_response({'error': 'uuid required'}, 400)
         with get_db_session() as session:
-            task = session.query(BackgroundTask).filter(BackgroundTask.user_uuid == data['uuid'], BackgroundTask.status == 'completed').order_by(BackgroundTask.completed_at.desc()).first()
+            # ★ 修正: 10分以内に完了したタスクのみ返す（古タスク誤配信防止）
+            ten_min_ago = datetime.utcnow() - timedelta(minutes=10)
+            task = session.query(BackgroundTask).filter(
+                BackgroundTask.user_uuid == data['uuid'],
+                BackgroundTask.status == 'completed',
+                BackgroundTask.completed_at >= ten_min_ago
+            ).order_by(BackgroundTask.completed_at.desc()).first()
             if task:
                 res = task.result or ""
                 session.delete(task)
@@ -4032,6 +4092,26 @@ def check_and_migrate_db():
                 with conn.begin() as trans2:
                     conn.execute(text("ALTER TABLE holomem_wiki ADD COLUMN recent_activity TEXT"))
                 logger.info("✅ Column 'recent_activity' added successfully.")
+
+            # ★ 追加: user_memories に nickname / nickname_asked カラムを追加
+            for col_def_nm in [
+                ('nickname', 'VARCHAR(100)'),
+                ('nickname_asked', 'BOOLEAN DEFAULT FALSE'),
+            ]:
+                col_nm, col_type_nm = col_def_nm
+                try:
+                    t_nm = conn.begin()
+                    conn.execute(text(f'SELECT {col_nm} FROM user_memories LIMIT 1'))
+                    t_nm.commit()
+                except Exception:
+                    try: t_nm.rollback()
+                    except: pass
+                    try:
+                        with conn.begin() as t_nm2:
+                            conn.execute(text(f'ALTER TABLE user_memories ADD COLUMN {col_nm} {col_type_nm}'))
+                        logger.info(f'✅ user_memories.{col_nm} カラム追加')
+                    except Exception as e_nm:
+                        logger.warning(f'⚠️ user_memories.{col_nm} 追加スキップ: {e_nm}')
 
             # ★ v33.5.0: TaskLog に last_success / run_count / last_error カラムを追加
             for col_def in [
