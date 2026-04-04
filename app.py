@@ -120,15 +120,26 @@ GEMINI_MODELS = [
     "gemini-1.5-flash-8b",
 ]
 # ==========================================
-# Groqで使用するモデルの優先順位 (2026年実務最適化版)
+# Groqで使用するモデルの優先順位 (v33.8.2 更新)
+# 参考: https://console.groq.com/docs/models
 # ==========================================
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",        # メイン火力：汎用性・日本語能力・コードの総合力No.1
-    "deepseek-r1-distill-llama-70b",  # 推論特化：複雑なロジックや長考が必要な時用
-    "deepseek-r1-distill-qwen-32b",   # Qwen系エース：コードと論理推論のバランス型
-    "qwen-2.5-32b",                   # 多言語ベース：Qwen独自の素直な応答が必要な時
-    "llama-3.1-8b-instant"            # 高速・軽量：Botの日常会話や補助タスクの常用
+    "llama-3.3-70b-versatile",              # 汎用メイン: 日本語・推論・コードのバランス最強
+    "llama-4-maverick-17b-128e-instruct",   # Llama4最新: 128k超長文コンテキスト対応・高速
+    "compound-beta",                        # 複合推論特化: RAG・マルチステップ検索に最適
+    "llama-3.1-8b-instant",                 # 超高速軽量: 日常チャット・短文応答の常用
+    "deepseek-r1-distill-llama-70b",        # 推論特化フォールバック (上記が全滅した場合)
 ]
+
+# 用途別モデル選択マップ
+# compound-beta はツール呼び出し・マルチステップが得意だが応答が遅い
+# llama-4-maverick は長文コンテキスト + 高速のバランスが良い
+GROQ_TASK_MODELS = {
+    'chat':     ['llama-3.1-8b-instant', 'llama-4-maverick-17b-128e-instruct', 'llama-3.3-70b-versatile'],
+    'search':   ['compound-beta', 'llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct'],
+    'analysis': ['llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct', 'deepseek-r1-distill-llama-70b'],
+    'default':  GROQ_MODELS,
+}
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -275,9 +286,26 @@ class GroqModelManager:
     def get_available_models(self) -> List[str]:
         with self._lock: return [m for m in self._models if self.is_available(m)]
 
+    def get_models_for_task(self, task_type: str = 'default') -> List[str]:
+        """用途別に最適なモデルリストを返す (利用可能なもののみ)"""
+        candidates = GROQ_TASK_MODELS.get(task_type, GROQ_TASK_MODELS['default'])
+        with self._lock:
+            available = [m for m in candidates if self.is_available(m)]
+            if not available:
+                # 全滅した場合は全利用可能モデルにフォールバック
+                available = [m for m in self._models if self.is_available(m)]
+            return available
+
 global_state = GlobalState()
 gemini_model_manager = GeminiModelManager()
-groq_model_manager = GroqModelManager(GROQ_MODELS)
+# ★ v33.8.2: GROQ_TASK_MODELS に含まれる全ユニークモデルも管理対象に追加
+_all_groq_models = list(dict.fromkeys(
+    GROQ_MODELS + [
+        m for models in GROQ_TASK_MODELS.values() if isinstance(models, list)
+        for m in models
+    ]
+))
+groq_model_manager = GroqModelManager(_all_groq_models)
 background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client: Optional[Groq] = None
 gemini_model, engine, Session = None, None, None
@@ -1796,7 +1824,8 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
             logger.warning(f"専門検索Geminiエラー: {e}")
 
     if not response and groq_client:
-        response = call_groq(prompt, query, [], 800)
+        # ★ v33.8.2: 専門検索は compound-beta が得意
+        response = call_groq(prompt, query, [], 800, task_type='search')
 
     if not response:
         response = (
@@ -2779,19 +2808,29 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
     
     return None
 
-def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800) -> Optional[str]:
+def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800, task_type: str = 'default') -> Optional[str]:
+    """Groq API呼び出し。task_type で用途別モデルを選択する。
+    task_type: 'chat' | 'search' | 'analysis' | 'default'
+    """
     if not groq_client: return None
     messages = [{"role": "system", "content": system_prompt}]
     for h in history[-5:]:
         messages.append({"role": h['role'], "content": h['content']})
     messages.append({"role": "user", "content": message})
-    for model in groq_model_manager.get_available_models():
+    # ★ v33.8.2: 用途別モデルリストを取得
+    model_list = groq_model_manager.get_models_for_task(task_type)
+    for model in model_list:
         try:
+            logger.info(f"🦙 Groq呼び出し [{task_type}]: {model}")
             response = groq_client.chat.completions.create(model=model, messages=messages, temperature=0.6, max_tokens=max_tokens)
             return response.choices[0].message.content.strip()
         except Exception as e:
-            if "Rate limit" in str(e):
+            err = str(e)
+            if "Rate limit" in err or "429" in err:
                 groq_model_manager.mark_limited(model, 5)
+                logger.warning(f"⚠️ Groq制限 ({model}): {err[:80]}")
+            else:
+                logger.warning(f"⚠️ Groqエラー ({model}): {err[:80]}")
     return None
 
 # ==============================================================================
@@ -2906,10 +2945,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     # ★ 追加: ニックネームが登録済みならそちらを優先使用
     _display_name = user_data.nickname if user_data.nickname else user_data.name
+    # ★ 修正v33.8.1: 呼び方指示を強化してAIが勝手なニックネームを生成しないようにする
     _call_instruction = (
-        f"相手の呼び方: 「{user_data.nickname}」と呼んでください。"
+        f"【厳守】相手は必ず「{user_data.nickname}」とだけ呼んでください。それ以外のニックネームや呼び方を勝手に作ることは絶対に禁止です。"
         if user_data.nickname
-        else f"相手の呼び方: 「{user_data.name}」さんと呼んでください。"
+        else f"【厳守】相手は「{user_data.name}」と呼んでください。勝手にニックネームを作ることは禁止です。"
     )
 
     system_prompt = f"""あなたは「もちこ」という、ホロライブが大好きなギャルAIです。
@@ -2971,7 +3011,9 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     response = call_gemini(system_prompt, normalized_message, history)
     if not response:
-        response = call_groq(system_prompt, normalized_message, history, 1200 if is_detailed else 800)
+        # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
+        _task_type = 'search' if is_task_report else 'chat'
+        response = call_groq(system_prompt, normalized_message, history, 1200 if is_detailed else 800, task_type=_task_type)
     
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
@@ -3042,7 +3084,7 @@ def _generate_with_timeout(
 # ==============================================================================
 # ホロメンチャット処理
 # ==============================================================================
-def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dict]) -> Optional[str]:
+def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dict], session=None) -> Optional[str]:
     normalized = knowledge_base.normalize_query(message)
     detected = holomem_manager.detect_in_message(normalized)
     
@@ -3054,7 +3096,7 @@ def process_holomem_in_chat(message: str, user_data: UserData, history: List[Dic
         for kw, resp in get_sakuramiko_special_responses().items():
             if kw in message: return resp
     
-    return generate_ai_response_safe(user_data, message, history)
+    return generate_ai_response_safe(user_data, message, history, session=session)
 
 def get_sakuramiko_special_responses() -> Dict[str, str]:
     return {
@@ -3214,7 +3256,8 @@ def background_deep_search(task_id: str, query_data: Dict):
                 interaction_count=user_data_dict.get('interaction_count', 0),
                 is_friend=user_data_dict.get('is_friend', False),
                 favorite_topics=user_data_dict.get('favorite_topics', []),
-                psychology=user_data_dict.get('psychology')
+                psychology=user_data_dict.get('psychology'),
+                nickname=user_data_dict.get('nickname'),  # ★ 修正v33.8.1
             )
             with get_db_session() as session:
                 history = get_conversation_history(session, user_data.uuid)
@@ -3255,7 +3298,8 @@ def background_specialized_search(task_id: str, query_data: Dict):
             is_friend=user_data_dict.get('is_friend', False),
             favorite_topics=user_data_dict.get('favorite_topics', []),
             psychology=user_data_dict.get('psychology'),
-            friend_profile=user_data_dict.get('friend_profile')
+            friend_profile=user_data_dict.get('friend_profile'),
+            nickname=user_data_dict.get('nickname'),  # ★ 修正v33.8.1
         )
         with get_db_session() as session:
             history = get_conversation_history(session, user_data.uuid)
@@ -3640,7 +3684,8 @@ def chat_lsl():
                         'is_friend': user_data.is_friend,
                         'favorite_topics': user_data.favorite_topics,
                         'psychology': user_data.psychology,
-                        'friend_profile': user_data.friend_profile
+                        'friend_profile': user_data.friend_profile,
+                        'nickname': user_data.nickname,  # ★ 修正v33.8.1: nicknameを追加
                     }
                 }
                 session.add(BackgroundTask(
@@ -3664,7 +3709,8 @@ def chat_lsl():
                         'is_friend': user_data.is_friend,
                         'favorite_topics': user_data.favorite_topics,
                         'psychology': user_data.psychology,
-                        'friend_profile': user_data.friend_profile
+                        'friend_profile': user_data.friend_profile,
+                        'nickname': user_data.nickname,  # ★ 修正v33.8.1: nicknameを追加
                     }
                 }
                 session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
@@ -3723,7 +3769,9 @@ def check_task_endpoint():
                 res = task.result or ""
                 session.delete(task)
                 session.add(ConversationHistory(user_uuid=data['uuid'], role='assistant', content=res))
-                return create_json_response({'status': 'completed', 'response': f"{limit_text_for_sl(res)}|"})
+                # ★ 修正v33.8.1: sanitize_response_for_sl を追加（パイプ混入でLSL分割が壊れる問題を防ぐ）
+                safe_res = limit_text_for_sl(sanitize_response_for_sl(res))
+                return create_json_response({'status': 'completed', 'response': f"{safe_res}|"})
         return create_json_response({'status': 'no_tasks'})
     except:
         return create_json_response({'error': 'internal error'}, 500)
