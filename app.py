@@ -39,6 +39,15 @@
 # 5. 記憶の蓄積と参照 (過去の感想を会話に反映)
 # 6. データベース容量管理システム
 # ==============================================================================
+# ==============================================================================
+# app.py パッチ v2 — フレーズ分割 + 並列音声生成 + /next_voice ポーリング
+#
+# ■ app.py への変更は4箇所
+#   1. 定数ブロックに2行追加
+#   2. generate_voice_file() をまるごと置き換え
+#   3. /next_voice エンドポイントを追加（/play の直後あたりに追記）
+#   4. /chat_lsl の音声生成呼び出し部分を1行変更
+# ==============================================================================
 
 # ===== 標準ライブラリ =====
 import sys
@@ -343,6 +352,18 @@ DATABASE_URL = get_secret('DATABASE_URL') or 'sqlite:///./mochiko_ultimate.db'
 GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
+
+# ============================================================
+# 変更1: 定数ブロックに追加（VOICEVOX_URL_FROM_ENV の下あたり）
+# ============================================================
+
+SUSHIKI_API_KEY = get_secret('VOICEVOX_API_KEY') or "D_78935397H9612"
+
+# ユーザーごとの音声キュー: { user_uuid: deque([url1, url2, ...]) }
+_voice_queues: Dict[str, Any] = {}
+_voice_queues_lock = Lock()
+
+
 # GitHub Actions から /wake を叩く際の認証キー
 # Render の Environment Variables と GitHub の Secrets に同じ値を設定する
 WAKE_API_KEY = get_secret('WAKE_API_KEY')
@@ -3322,67 +3343,109 @@ def background_specialized_search(task_id: str, query_data: Dict):
             task.status = 'completed'
             task.completed_at = datetime.utcnow()
 
-# ==============================================================================
-# 音声ファイル (VOICEVOX - tts.quest API版)
-# ==============================================================================
-def find_active_voicevox_url() -> Optional[str]:
-    global_state.voicevox_enabled = True
-    return "https://api.tts.quest"
+# ============================================================
+# 変更2: generate_voice_file() をまるごと置き換え
+# （元の 3332〜3385行あたり）
+# ============================================================
+
+def _split_phrases(text: str) -> List[str]:
+    """
+    テキストを自然なフレーズ単位に分割する。
+    句点・感嘆符・疑問符・改行で分割し、空文字と1文字以下を除外。
+    """
+    parts = re.split(r'[。！？\n]', text)
+    result = []
+    for p in parts:
+        p = p.strip()
+        if len(p) >= 2:
+            result.append(p)
+    # 分割できなかった場合はそのまま
+    if not result and text.strip():
+        result = [text.strip()]
+    return result
+
+
+def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]:
+    """
+    1フレーズをsu-shiki APIで音声生成してURLを返す。
+    並列実行される。
+    """
+    try:
+        api_url = "https://deprecatedapis.tts.quest/v2/voicevox/audio/"
+        params = {
+            "text":            phrase,
+            "speaker":         20,       # もち子さん
+            "key":             SUSHIKI_API_KEY,
+            "speed":           1.4,
+            "pitch":           0.05,
+            "intonationScale": 1.5,
+        }
+        res = requests.get(api_url, params=params, timeout=30)
+        if res.status_code != 200:
+            logger.error(f"❌ su-shiki失敗[{idx}]: HTTP{res.status_code}")
+            return None
+        if "audio" not in res.headers.get("Content-Type", ""):
+            logger.error(f"❌ 音声バイナリではない[{idx}]: {res.text[:80]}")
+            return None
+
+        ts = int(time.time() * 1000)
+        filename = f"voice_{user_uuid[:8]}_{ts}_{idx}.mp3"
+        filepath = os.path.join(VOICE_DIR, filename)
+        with open(filepath, 'wb') as f:
+            f.write(res.content)
+
+        play_url = f"{SERVER_URL}/play/{filename}"
+        logger.info(f"✅ フレーズ[{idx}]生成完了: '{phrase[:15]}...' → {filename}")
+        return play_url
+
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ タイムアウト[{idx}]: '{phrase[:20]}'")
+        return None
+    except Exception as e:
+        logger.error(f"❌ 音声生成エラー[{idx}]: {e}")
+        return None
+
 
 def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
-    """tts.quest APIを使用して音声を生成"""
-    try:
-        api_url = "https://api.tts.quest/v3/voicevox/synthesis"
-        timestamp = str(int(time.time() * 1000))
-        params = {
-            "text": text,
-            "speaker": 20,
-            "key": "",
-            "speedScale": 1.50,      # ✨ speed ではなく speedScale
-            "pitchScale": 0.05,      # ✨ pitch ではなく pitchScale
-            "intonationScale": 1.50, # ✨ intonation ではなく intonationScale
-            "volumeScale": 1.50,     # ✨ volume ではなく volumeScale
-            "v": "3",
-            "_t": timestamp
-        }
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-
-                
-        logger.info(f"🎙️ 音声生成(Speed:1.5): {text[:20]}...")
-        res = requests.get(api_url, params=params, headers=headers, timeout=60)
-        
-        try:
-            data = res.json()
-        except:
-            logger.error(f"❌ API応答が不正: {res.text[:100]}")
-            return None
-        
-        download_url = ""
-        if data.get("success", False):
-            if "mp3DownloadUrl" in data and data["mp3DownloadUrl"]:
-                download_url = data["mp3DownloadUrl"]
-            elif "audioStatusUrl" in data:
-                status_url = data["audioStatusUrl"]
-                for _ in range(20):
-                    time.sleep(1)
-                    try:
-                        status_res = requests.get(status_url, headers=headers, timeout=10)
-                        status_data = status_res.json()
-                        if status_data.get("isFinished", False):
-                            download_url = status_data.get("mp3DownloadUrl", "")
-                            break
-                    except: continue
-        
-        if download_url:
-            logger.info(f"✅ 音声URL取得: {download_url}")
-            return download_url
-        else:
-            logger.error(f"❌ URL取得失敗: {data}")
-            return None
-
-    except Exception as e:
-        logger.error(f"❌ 音声生成エラー: {e}")
+    """
+    テキストをフレーズ分割し、並列で音声生成。
+    生成できたものからユーザーのキューに積む。
+    最初のフレーズのURLを返す（LSLへの即時レスポンス用）。
+    残りのフレーズはLSLが /next_voice でポーリングして受け取る。
+    """
+    phrases = _split_phrases(text)
+    if not phrases:
         return None
+
+    logger.info(f"🎙️ {len(phrases)}フレーズに分割: {phrases}")
+
+    # キューを初期化（古いものをクリア）
+    from collections import deque
+    with _voice_queues_lock:
+        _voice_queues[user_uuid] = deque()
+
+    # フレーズ数が1つならシンプルに生成して返す
+    if len(phrases) == 1:
+        url = _generate_one_phrase(phrases[0], user_uuid, 0)
+        return url
+
+    # 複数フレーズ: 並列生成してできた順にキューへ積む
+    # まず最初のフレーズを同期生成（即レスポンス用）
+    first_url = _generate_one_phrase(phrases[0], user_uuid, 0)
+
+    # 残りのフレーズをバックグラウンドで順番に生成してキューに積む
+    def generate_remaining():
+        for i, phrase in enumerate(phrases[1:], start=1):
+            url = _generate_one_phrase(phrase, user_uuid, i)
+            if url:
+                with _voice_queues_lock:
+                    if user_uuid in _voice_queues:
+                        _voice_queues[user_uuid].append(url)
+                        logger.info(f"📥 キュー追加[{i}]: {url}")
+
+    background_executor.submit(generate_remaining)
+
+    return first_url  # 最初のURLを即レスポンスとして返す
 
 def cleanup_old_voice_files():
     try:
@@ -4082,6 +4145,43 @@ def admin_anime_cache():
     except Exception as e:
         return create_json_response({'error': str(e)}, 500)
 
+# ============================================================
+# 変更3: /next_voice エンドポイントを追加
+# /play エンドポイントの直後（3783行あたり）に追記
+# ============================================================
+
+@app.route('/next_voice', methods=['GET', 'POST'])
+def next_voice():
+    """
+    LSLがポーリングするエンドポイント。
+    キューに音声URLが積まれていれば返す。なければ空文字を返す。
+    LSL側は受け取ったURLを再生し、空なら何もしない。
+    """
+    try:
+        # GET/POST 両対応
+        if request.method == 'POST':
+            data = request.json or {}
+        else:
+            data = request.args
+
+        user_uuid = sanitize_user_input(data.get('uuid', ''))
+        if not user_uuid:
+            return Response("", 200)
+
+        with _voice_queues_lock:
+            q = _voice_queues.get(user_uuid)
+            if q and len(q) > 0:
+                url = q.popleft()
+                logger.info(f"📤 next_voice返却: {url}")
+                return Response(url, 200, mimetype='text/plain; charset=utf-8')
+
+        return Response("", 200)
+
+    except Exception as e:
+        logger.error(f"❌ next_voice エラー: {e}")
+        return Response("", 200)
+
+
 # ==============================================================================
 # 初期化
 # ==============================================================================
@@ -4294,7 +4394,7 @@ def initialize_app():
     except Exception as e:
         logger.error(f"❌ Gemini設定エラー: {e}")
     
-    if find_active_voicevox_url():
+
         global_state.voicevox_enabled = True
         logger.info("✅ VOICEVOX (tts.quest) 検出")
     
