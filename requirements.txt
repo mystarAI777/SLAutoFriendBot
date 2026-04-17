@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------
-# Mochiko AI Bot - requirements.txt (Revised for compatibility)
+# Mochiko AI Bot - requirements.txt (Final Optimized for v33.8.0)
 # -----------------------------------------------------------------
 
 # Core Web Framework
@@ -10,12 +10,12 @@ gunicorn==21.2.0
 # Database
 SQLAlchemy==2.0.25
 psycopg2-binary==2.9.9
+pgvector==0.2.5
 
 # AI and API Clients
-# groqとhttpxの互換性のあるバージョンを指定
 groq==0.9.0
 httpx==0.27.0
-google-generativeai==0.8.0
+google-generativeai>=0.8.3
 importlib-metadata==7.0.1
 
 # Web Scraping & HTTP
