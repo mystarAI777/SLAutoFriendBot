@@ -39,15 +39,6 @@
 # 5. 記憶の蓄積と参照 (過去の感想を会話に反映)
 # 6. データベース容量管理システム
 # ==============================================================================
-# ==============================================================================
-# app.py パッチ v2 — フレーズ分割 + 並列音声生成 + /next_voice ポーリング
-#
-# ■ app.py への変更は4箇所
-#   1. 定数ブロックに2行追加
-#   2. generate_voice_file() をまるごと置き換え
-#   3. /next_voice エンドポイントを追加（/play の直後あたりに追記）
-#   4. /chat_lsl の音声生成呼び出し部分を1行変更
-# ==============================================================================
 
 # ===== 標準ライブラリ =====
 import sys
@@ -72,7 +63,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 from functools import wraps, lru_cache
 from threading import Lock, RLock
 from concurrent.futures import ThreadPoolExecutor
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
@@ -319,6 +310,159 @@ background_executor = ThreadPoolExecutor(max_workers=5)
 groq_client: Optional[Groq] = None
 gemini_model, engine, Session = None, None, None
 
+
+# Gemini File API用の知識ドキュメントパス（MochikoKnowledgeFileクラスで使用）
+MOCHIKO_KNOWLEDGE_PATH = "/tmp/mochiko_knowledge.txt"
+
+
+# ==============================================================================
+# ★ Gemini File API: もちこ知識ベース自動管理
+# ==============================================================================
+class MochikoKnowledgeFile:
+    """
+    DBの蓄積データから知識ドキュメントを自動生成し
+    Gemini File APIにアップロードして管理するクラス。
+    24時間ごとに自動再生成・再アップロード。
+    """
+    def __init__(self):
+        self._lock = RLock()
+        self._file_obj = None
+        self._uploaded_at: Optional[datetime] = None
+
+    def get_file_obj(self) -> Optional[Any]:
+        """generate_content に渡すファイルオブジェクトを返す"""
+        with self._lock:
+            return self._file_obj
+
+    def refresh(self):
+        """DBから知識ドキュメントを生成してGemini File APIにアップロード"""
+        try:
+            logger.info("📝 知識ドキュメント生成開始...")
+            content = self._build_document()
+            if not content:
+                logger.warning("⚠️ 知識ドキュメントの内容が空")
+                return
+
+            with open(MOCHIKO_KNOWLEDGE_PATH, 'w', encoding='utf-8') as f:
+                f.write(content)
+            logger.info(f"✅ 知識ドキュメント生成完了: {len(content)}文字")
+
+            with self._lock:
+                # 古いファイルを削除
+                if self._file_obj:
+                    try:
+                        genai.delete_file(self._file_obj.name)
+                        logger.info("🗑️ 古い知識ファイルを削除")
+                    except Exception:
+                        pass
+
+                uploaded = genai.upload_file(
+                    MOCHIKO_KNOWLEDGE_PATH,
+                    mime_type="text/plain",
+                    display_name="mochiko_knowledge"
+                )
+                self._file_obj = uploaded
+                self._uploaded_at = datetime.utcnow()
+                logger.info(f"✅ Gemini File APIアップロード完了: {uploaded.name}")
+
+        except Exception as e:
+            logger.error(f"❌ 知識ドキュメント更新失敗: {e}")
+
+    def _build_document(self) -> str:
+        """DBから知識ドキュメントを組み立てる"""
+        lines = []
+        lines.append(f"# もちこ 知識ベース（自動生成）")
+        lines.append(f"# 生成日時: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        lines.append("")
+
+        try:
+            with get_db_session() as session:
+                # ① 友達プロフィール
+                friends = session.query(FriendProfile).all()
+                if friends:
+                    lines.append("## 友達リスト")
+                    for f in friends:
+                        lines.append(f"- {f.user_name}")
+                        if f.fav_holomem:
+                            lines.append(f"  好きなホロメン: {f.fav_holomem}")
+                        if f.hobbies:
+                            lines.append(f"  趣味: {f.hobbies}")
+                        if f.fav_games:
+                            lines.append(f"  好きなゲーム: {f.fav_games}")
+                        if f.fav_anime:
+                            lines.append(f"  好きなアニメ: {f.fav_anime}")
+                        if f.memo:
+                            lines.append(f"  メモ: {f.memo[:100]}")
+                    lines.append("")
+
+                # ② よく話題になるキーワード
+                from sqlalchemy import func as sqlfunc
+                top_keywords = (
+                    session.query(
+                        UserInterestLog.category,
+                        UserInterestLog.keyword,
+                        sqlfunc.sum(UserInterestLog.mention_count).label('total')
+                    )
+                    .filter(UserInterestLog.sentiment == 'positive')
+                    .group_by(UserInterestLog.category, UserInterestLog.keyword)
+                    .order_by(sqlfunc.sum(UserInterestLog.mention_count).desc())
+                    .limit(30)
+                    .all()
+                )
+                if top_keywords:
+                    lines.append("## よく話題になるキーワード（人気順）")
+                    by_cat: Dict[str, List[str]] = {}
+                    for cat, kw, total in top_keywords:
+                        by_cat.setdefault(cat, []).append(f"{kw}({total}回)")
+                    for cat, kws in by_cat.items():
+                        lines.append(f"- {cat}: {', '.join(kws)}")
+                    lines.append("")
+
+                # ③ もちこのホロメン感想まとめ
+                feelings = session.query(HolomemFeeling).limit(20).all()
+                if feelings:
+                    lines.append("## もちこのホロメンへの感想")
+                    for feel in feelings:
+                        if hasattr(feel, 'summary_feeling') and feel.summary_feeling:
+                            lines.append(f"- {feel.member_name} (推し度{feel.love_level}/100): {feel.summary_feeling[:150]}")
+                    lines.append("")
+
+                # ④ 統計
+                user_count = session.query(UserMemory).count()
+                msg_count = session.query(ConversationHistory).count()
+                lines.append("## 活動統計")
+                lines.append(f"- 累計ユーザー数: {user_count}人")
+                lines.append(f"- 累計会話数: {msg_count}件")
+                lines.append("")
+
+                # ⑤ 最近のホロライブニュース（タイトル＋本文）
+                recent_news = (
+                    session.query(HololiveNews)
+                    .order_by(HololiveNews.created_at.desc())
+                    .limit(15)
+                    .all()
+                )
+                if recent_news:
+                    lines.append("## 最近のホロライブニュース")
+                    for n in recent_news:
+                        lines.append(f"### {n.title}")
+                        if n.content and n.content != n.title:
+                            lines.append(n.content[:300])
+                        lines.append("")
+
+        except Exception as e:
+            logger.error(f"❌ ドキュメント生成中にDBエラー: {e}")
+
+        return "\n".join(lines)
+
+
+mochiko_knowledge_file = MochikoKnowledgeFile()
+
+
+def generate_mochiko_knowledge():
+    """TASK_SCHEDULEから呼ばれる定期更新関数"""
+    mochiko_knowledge_file.refresh()
+
 app = Flask(__name__)
 application = app
 app.config['JSON_AS_ASCII'] = False
@@ -353,10 +497,7 @@ GROQ_API_KEY = get_secret('GROQ_API_KEY')
 GEMINI_API_KEY = get_secret('GEMINI_API_KEY')
 VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 
-# ============================================================
-# 変更1: 定数ブロックに追加（VOICEVOX_URL_FROM_ENV の下あたり）
-# ============================================================
-
+# su-shiki VOICEVOX APIキー
 SUSHIKI_API_KEY = get_secret('VOICEVOX_API_KEY') or "D_78935397H9612"
 
 # ユーザーごとの音声キュー: { user_uuid: deque([url1, url2, ...]) }
@@ -1450,36 +1591,100 @@ def fetch_hololive_news():
         logger.error(f"News fetch failed: {e}")
 
 def fetch_hololive_tsuushin_news():
+    """
+    ホロライブ通信から記事タイトル＋本文を取得してDBに保存。
+    一覧ページから最新記事のURLを取得し、各記事にアクセスして本文を取得する。
+    """
     logger.info("📰 ホロライブ通信の更新チェック開始...")
-    url = "https://hololive-tsuushin.com/holonews/"
+    url = "https://hololive-tsuushin.com/category/holonews/"
     try:
         headers = {'User-Agent': random.choice(USER_AGENTS)}
         res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200: return
-        
+        if res.status_code != 200:
+            logger.warning(f"⚠️ ホロライブ通信アクセス失敗: {res.status_code}")
+            return
+
         soup = BeautifulSoup(res.content, 'html.parser')
-        articles = soup.select('article') or soup.select('.post-list-item')
-        
+
+        # 一覧ページから記事リンクとタイトルを収集
+        article_links = []
+        for a_tag in soup.select('a[href*="/holonews/"]'):
+            href = a_tag.get('href', '')
+            if not href or href == url or 'category' in href:
+                continue
+            title_text = clean_text(a_tag.get_text())
+            if title_text and len(title_text) > 5:
+                article_links.append({'url': href, 'title': title_text})
+
+        # 重複除去
+        seen_urls = set()
+        unique_links = []
+        for item in article_links:
+            if item['url'] not in seen_urls:
+                seen_urls.add(item['url'])
+                unique_links.append(item)
+
+        logger.info(f"📋 {len(unique_links)}件の記事リンクを検出")
+
         with get_db_session() as session:
             count = 0
-            for art in articles[:10]:
-                a_tag = art.find('a')
-                if not a_tag: continue
-                
-                link = a_tag.get('href')
-                title_elem = art.find(['h1', 'h2', 'h3', 'p'])
-                title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
-                
-                if title and link:
-                    if not session.query(HololiveNews).filter_by(url=link).first():
-                        session.add(HololiveNews(
-                            title=f"【まとめ】{title}",
-                            content=title,
-                            url=link,
-                            created_at=datetime.utcnow()
-                        ))
-                        count += 1
-            logger.info(f"✅ ホロライブ通信から {count} 件の新しいニュースを追加")
+            for item in unique_links[:10]:
+                link = item['url']
+                title = item['title']
+
+                # 既にDBにあればスキップ
+                if session.query(HololiveNews).filter_by(url=link).first():
+                    continue
+
+                # 各記事ページにアクセスして本文を取得
+                try:
+                    time.sleep(1.5)
+                    art_res = requests.get(
+                        link,
+                        headers={'User-Agent': random.choice(USER_AGENTS)},
+                        timeout=15
+                    )
+                    if art_res.status_code != 200:
+                        continue
+
+                    art_soup = BeautifulSoup(art_res.content, 'html.parser')
+
+                    # 本文を取得
+                    body_elem = (
+                        art_soup.select_one('article .entry-content') or
+                        art_soup.select_one('article .post-content') or
+                        art_soup.select_one('.entry-content') or
+                        art_soup.select_one('.post-content') or
+                        art_soup.select_one('article')
+                    )
+
+                    if body_elem:
+                        # 不要な要素を除去
+                        for tag in body_elem.select('script, style, nav, .ad, .share, figure'):
+                            tag.decompose()
+                        content = clean_text(body_elem.get_text(separator='\n'))
+                        content = content[:800]
+                    else:
+                        content = title
+
+                    news_hash = hashlib.md5(link.encode()).hexdigest()
+
+                    session.add(HololiveNews(
+                        title=title,
+                        content=content,
+                        url=link,
+                        news_hash=news_hash,
+                        created_at=datetime.utcnow()
+                    ))
+                    count += 1
+                    logger.info(f"✅ 記事取得: {title[:30]}... ({len(content)}文字)")
+
+                except Exception as e:
+                    logger.warning(f"⚠️ 記事取得失敗 ({link}): {e}")
+                    continue
+
+        logger.info(f"✅ ホロライブ通信から {count} 件の新しいニュースを追加（本文付き）")
+
     except Exception as e:
         logger.error(f"❌ ホロライブ通信の取得に失敗: {e}")
 
@@ -2149,6 +2354,8 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'cleanup_specialized_news': {'func': 'cleanup_old_specialized_news', 'interval_hours': 167.0},  # 週1回
     # ── ローカルファイル (起動のたびに実行して問題ない軽いもの) ──────────────
     'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
+    # ★ 追加: もちこ知識ベースをDBから自動生成してGemini File APIへアップロード
+    'update_knowledge':     {'func': 'generate_mochiko_knowledge',       'interval_hours': 23.0},  # 1日1回
 }
 
 # タスク名 → 実際の関数のマッピング (initialize_app内で設定)
@@ -2803,12 +3010,20 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
     
     try:
         full_prompt = f"{system_prompt}\n\n【会話履歴】\n"
-        for h in history[-5:]:
+        # ★ 会話履歴を直近5件→30件に拡張（Gemini 2.5 Flashの100万トークンを活用）
+        for h in history[-30:]:
             full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
         full_prompt += f"\nユーザー: {message}\nもちこ:"
-        
+
+        # ★ 知識ドキュメントがあればファイルも一緒に渡す
+        knowledge = mochiko_knowledge_file.get_file_obj()
+        if knowledge:
+            contents = [knowledge, full_prompt]
+        else:
+            contents = full_prompt
+
         response = model.generate_content(
-            full_prompt, 
+            contents,
             generation_config={"temperature": 0.8, "max_output_tokens": 1000}
         )
         
@@ -2887,12 +3102,20 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     # 2. ニュース情報の注入
     try:
-        if "ニュース" in message or "情報" in message or "ホロライブ" in message:
-            with get_db_session() as session:
-                latest_news = session.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(3).all()
+        holo_keywords = ['ニュース', '情報', 'ホロライブ', 'ホロメン', '配信', 'どう', '最近', 'なんか', 'って']
+        if any(kw in message for kw in holo_keywords):
+            with get_db_session() as session_news:
+                latest_news = session_news.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if latest_news:
-                    news_text = "\n".join([f"・{n.title}" for n in latest_news])
-                    internal_context += f"\n\n【ホロライブ最新ニュース(DB参照)】\n{news_text}"
+                    news_lines = []
+                    for n in latest_news:
+                        body_preview = n.content[:150] if n.content and n.content != n.title else ""
+                        if body_preview:
+                            news_lines.append(f"【{n.title}】\n{body_preview}")
+                        else:
+                            news_lines.append(f"【{n.title}】")
+                    news_text = "\n\n".join(news_lines)
+                    internal_context += f"\n\n【ホロライブ最新ニュース】\n{news_text}"
     except Exception as e:
         logger.error(f"News injection error: {e}")
 
@@ -4393,11 +4616,11 @@ def initialize_app():
                 logger.warning("⚠️ Gemini初期化失敗")
     except Exception as e:
         logger.error(f"❌ Gemini設定エラー: {e}")
-    
 
-        global_state.voicevox_enabled = True
-        logger.info("✅ VOICEVOX (tts.quest) 検出")
-    
+    # ★ su-shiki VOICEVOX APIを使用（speedパラメータが確実に効く）
+    global_state.voicevox_enabled = True
+    logger.info("✅ VOICEVOX (su-shiki API) 有効")
+
     logger.info("🎀 ホロメンシステム初期化...")
     if holomem_manager.load_from_db():
         logger.info(f"✅ ホロメン: {holomem_manager.get_member_count()}名ロード")
@@ -4421,7 +4644,17 @@ def initialize_app():
         # ★ v33.7.0追加
         'fetch_sl_news':        fetch_all_sl_news,
         'cleanup_anime_cache':  cleanup_anime_cache,
+        # ★ 追加: もちこ知識ベース自動生成
+        'update_knowledge':     generate_mochiko_knowledge,
     })
+
+    # ★ 追加: 起動時に知識ドキュメントをバックグラウンドで生成・アップロード
+    try:
+        if GEMINI_API_KEY:
+            background_executor.submit(generate_mochiko_knowledge)
+            logger.info("📚 知識ドキュメント生成をバックグラウンドで開始")
+    except Exception as e:
+        logger.warning(f"⚠️ 知識ドキュメント生成スキップ: {e}")
 
     # 起動時キャッチアップ: スリープ中に漏れた全タスクを補完実行
     logger.info("⏰ 起動時キャッチアップ実行中...")
