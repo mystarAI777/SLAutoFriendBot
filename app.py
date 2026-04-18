@@ -1110,7 +1110,7 @@ def scrape_hololive_stream_info() -> List[Dict]:
     
     try:
         matome_sites = [
-            "https://vtubermatome.com/",
+            "https://www.vmiru.tv/group/hololive/scheduled",
             "https://hololive-tsuushin.com/"
         ]
         
@@ -3617,7 +3617,7 @@ def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]
         with open(filepath, 'wb') as f:
             f.write(res.content)
 
-        play_url = f"{SERVER_URL}/play/{filename}"
+        play_url = f"{SERVER_URL}/play_html/{filename}"
         logger.info(f"✅ フレーズ[{idx}]生成完了: '{phrase[:15]}...' → {filename}")
         return play_url
 
@@ -4064,9 +4064,68 @@ def check_task_endpoint():
 
 @app.route('/play/<filename>', methods=['GET'])
 def play_voice(filename: str):
+    """
+    音声ファイル配信。
+    Second LifeのMedia On A Prim (CEFブラウザ) は厳密なヘッダーを要求するため、
+    Content-Type / Content-Length / CORS ヘッダーを明示的に付ける。
+    """
     if not re.match(r'^voice_[a-zA-Z0-9_-]+\.(wav|mp3)$', filename):
         return Response("Invalid filename", 400)
-    return send_from_directory(VOICE_DIR, filename)
+
+    filepath = os.path.join(VOICE_DIR, filename)
+    if not os.path.exists(filepath):
+        return Response("Not found", 404)
+
+    with open(filepath, 'rb') as f:
+        audio_data = f.read()
+
+    mime_type = 'audio/mpeg' if filename.endswith('.mp3') else 'audio/wav'
+
+    response = Response(audio_data, mimetype=mime_type)
+    response.headers['Content-Type'] = mime_type
+    response.headers['Content-Length'] = str(len(audio_data))
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    response.headers['Accept-Ranges'] = 'bytes'
+    response.headers['Cache-Control'] = 'no-cache'
+    return response
+
+
+@app.route('/play_html/<filename>', methods=['GET'])
+def play_voice_html(filename: str):
+    """
+    Second Life Media On A Prim (CEFブラウザ) 向けに、
+    MP3 を HTML5 audio タグでラップして返す。
+    CEF は MP3 直リンクでは自動再生できないため、このラッパーが必須。
+    """
+    if not re.match(r'^voice_[a-zA-Z0-9_-]+\.(wav|mp3)$', filename):
+        return Response("Invalid filename", 400)
+    audio_url = f"{SERVER_URL}/play/{filename}"
+    html = (
+        '<!DOCTYPE html>\n'
+        '<html lang="ja">\n'
+        '<head>\n'
+        '<meta charset="utf-8">\n'
+        '<title>Voice</title>\n'
+        '<style>\n'
+        'html,body{margin:0;padding:0;background:#000;width:100%;height:100%;overflow:hidden;}\n'
+        'audio{width:100%;height:100%;}\n'
+        '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        f'<audio autoplay src="{audio_url}"></audio>\n'
+        '<script>\n'
+        '// autoplay がブロックされた場合のフォールバック (画面タッチで再生)\n'
+        'document.addEventListener("click",function(){var a=document.querySelector("audio");if(a){a.play();}},{once:true});\n'
+        '</script>\n'
+        '</body>\n'
+        '</html>'
+    )
+    response = Response(html, mimetype='text/html; charset=utf-8')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 # ==============================================================================
 # 管理用エンドポイント
