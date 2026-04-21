@@ -532,6 +532,34 @@ def after_request(response):
 
 Base = declarative_base()
 
+def apply_db_patches():
+    from sqlalchemy import text
+    try:
+        # DB接続を取得して修正コマンドを実行
+        with db.engine.connect() as conn:
+            # ConversationHistory
+            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS conversation_history_id_seq;"))
+            conn.execute(text("ALTER TABLE conversation_history ALTER COLUMN id SET DEFAULT nextval('conversation_history_id_seq');"))
+            conn.execute(text("SELECT setval('conversation_history_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM conversation_history), false);"))
+            
+            # BackgroundTask
+            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS background_task_id_seq;"))
+            conn.execute(text("ALTER TABLE background_task ALTER COLUMN id SET DEFAULT nextval('background_task_id_seq');"))
+            conn.execute(text("SELECT setval('background_task_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM background_task), false);"))
+            
+            # SpecializedNews
+            conn.execute(text("ALTER TABLE specialized_news ADD COLUMN IF NOT EXISTS query_keyword TEXT;"))
+            
+            # UserInterestLogs
+            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS user_interest_logs_id_seq;"))
+            conn.execute(text("ALTER TABLE user_interest_logs ALTER COLUMN id SET DEFAULT nextval('user_interest_logs_id_seq');"))
+            conn.execute(text("SELECT setval('user_interest_logs_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM user_interest_logs), false);"))
+            
+            conn.commit()
+            print("✅ データベースの自動修復が完了しました")
+    except Exception as e:
+        print(f"⚠️ データベース修復スキップ (既に適用済み、または接続不可): {e}")
+        
 # ==============================================================================
 # 秘密情報/環境変数
 # ==============================================================================
@@ -5345,4 +5373,6 @@ def initialize_app():
 initialize_app()
 
 if __name__ == '__main__':
+    # データベース修復処理を追加
+    apply_db_patches()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
