@@ -1555,7 +1555,138 @@ def update_holomem_database():
             time.sleep(0.5)
     holomem_manager.load_from_db(force=True)
     logger.info("✅ ホロメンDB更新完了")
+    
+# ==============================================================================
+# ★ 追加: ホロライブ非公式wiki検索システム
+# ==============================================================================
 
+HOLOLIVE_WIKI_BASE = 'https://wikiwiki.jp/hololive/'
+WIKI_SYNC_TIMEOUT = 3   # 同期検索の最大待機秒数
+WIKI_BG_TIMEOUT = 15    # バックグラウンド取得の最大待機秒数
+
+
+def scrape_hololive_wiki_page(page_name: str, timeout: int = WIKI_SYNC_TIMEOUT) -> Optional[str]:
+    try:
+        url = f"{HOLOLIVE_WIKI_BASE}{quote_plus(page_name)}"
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=timeout)
+        if res.status_code != 200:
+            return None
+        soup = BeautifulSoup(res.content, 'html.parser')
+        content_area = (
+            soup.select_one('#content')
+            or soup.select_one('.ie5')
+            or soup.select_one('#page-content')
+        )
+        if not content_area:
+            return None
+        for tag in content_area.select('div.edit, .navi, script, style, .toolbar'):
+            tag.decompose()
+        text = clean_text(content_area.get_text())
+        return text[:1200] if len(text) >= 30 else None
+    except requests.exceptions.Timeout:
+        logger.debug(f"wiki取得タイムアウト: {page_name}")
+        return None
+    except Exception as e:
+        logger.debug(f"wiki取得エラー ({page_name}): {e}")
+        return None
+
+
+def search_hololive_wiki(query: str, timeout: int = WIKI_SYNC_TIMEOUT) -> Optional[str]:
+    # Step1: ページ名として直接アクセス
+    result = scrape_hololive_wiki_page(query, timeout=timeout)
+    if result:
+        logger.info(f"📖 wikiページ直接HIT: {query}")
+        return result
+    # Step2: 検索経由
+    try:
+        search_url = f"{HOLOLIVE_WIKI_BASE}?cmd=search&word={quote_plus(query)}&type=and"
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(search_url, headers=headers, timeout=timeout)
+        if res.status_code != 200:
+            return None
+        soup = BeautifulSoup(res.content, 'html.parser')
+        result_links = (
+            soup.select('ul.list1 li a')
+            or soup.select('#search_result li a')
+            or soup.select('.search-result a')
+        )
+        if not result_links:
+            return None
+        page_name = result_links[0].get_text().strip()
+        if not page_name:
+            return None
+        logger.info(f"📖 wiki検索HIT: {query} → {page_name}")
+        return scrape_hololive_wiki_page(page_name, timeout=max(1, timeout - 1))
+    except requests.exceptions.Timeout:
+        logger.debug(f"wiki検索タイムアウト: {query}")
+        return None
+    except Exception as e:
+        logger.debug(f"wiki検索エラー ({query}): {e}")
+        return None
+
+
+def save_to_hololive_glossary(term: str, description: str):
+    if not term or not description:
+        return
+    try:
+        short_desc = description[:500]
+        with get_db_session() as session:
+            existing = session.query(HololiveGlossary).filter_by(term=term).first()
+            if existing:
+                if len(description) > len(existing.description or ''):
+                    existing.description = short_desc
+                    logger.info(f"📝 glossary更新: {term}")
+            else:
+                session.add(HololiveGlossary(
+                    term=term,
+                    description=short_desc,
+                    created_at=datetime.utcnow()
+                ))
+                logger.info(f"📝 glossary新規追加: {term}")
+            knowledge_base.refresh()
+    except Exception as e:
+        logger.error(f"glossary保存エラー ({term}): {e}")
+
+
+def background_wiki_search_and_save(term: str):
+    logger.info(f"🔄 バックグラウンドwiki取得開始: {term}")
+    try:
+        text = search_hololive_wiki(term, timeout=WIKI_BG_TIMEOUT)
+        if text:
+            save_to_hololive_glossary(term, text)
+            logger.info(f"✅ バックグラウンドwiki取得完了: {term}")
+        else:
+            logger.info(f"⚠️ バックグラウンドwiki取得: 情報なし ({term})")
+    except Exception as e:
+        logger.error(f"❌ バックグラウンドwiki取得エラー ({term}): {e}")
+
+
+def get_wiki_context_for_hololive(
+    message: str,
+    detected_name: Optional[str],
+    internal_context: str
+) -> str:
+    if len(internal_context) >= 300:
+        return ''
+    holo_keywords = ['ホロライブ', 'hololive', 'ホロメン', 'vtuber', 'VTuber']
+    is_holo_context = (
+        detected_name is not None
+        or any(kw.lower() in message.lower() for kw in holo_keywords)
+        or any(kw in message for kw in ['配信', '歌枠', 'コラボ', 'ライブ', '卒業', 'デビュー'])
+    )
+    if not is_holo_context:
+        return ''
+    search_term = detected_name or message.strip()[:30]
+    wiki_text = search_hololive_wiki(search_term, timeout=WIKI_SYNC_TIMEOUT)
+    if wiki_text:
+        background_executor.submit(save_to_hololive_glossary, search_term, wiki_text)
+        return f"\n\n【ホロライブwiki情報: {search_term}】\n{wiki_text[:600]}"
+    else:
+        background_executor.submit(background_wiki_search_and_save, search_term)
+        logger.info(f"⏱️ wiki取得タイムアウト → 次回のため予約: {search_term}")
+        return ''
+        
 # ==============================================================================
 # ホロライブニュース収集
 # ==============================================================================
@@ -3077,12 +3208,13 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
-    
+# generate_ai_response() の冒頭（normalized_message 定義の直後）に追加:
+　　_wiki_detected_name: Optional[str] = None    
     # 1. ホロメン情報の注入（SNS情報 + もちこの記憶含む）
     try:
         holomem_manager.load_from_db()
-        detected_name = holomem_manager.detect_in_message(normalized_message)
-        if detected_name:
+ detected_name = holomem_manager.detect_in_message(normalized_message)
+    _wiki_detected_name = detected_name  # wiki用にスコープ外で保持
             info = get_holomem_info_cached(detected_name)
             if info:
                 profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
@@ -3149,6 +3281,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
+    # 2e. ★ 追加: ホロライブ非公式wiki補完
+    # DBに知識が薄い場合のみ wiki を同期検索（3秒タイムアウト）
+    try:
+        wiki_ctx = get_wiki_context_for_hololive(
+            message, detected_name, internal_context
+        )
+        if wiki_ctx:
+            internal_context += wiki_ctx
+    except Exception as e:
+        logger.error(f"Wiki context injection error: {e}")
     # 3. 関係性 & 友達記憶コンテキスト
     relationship_context = ""
     friend_memory_context = ""
