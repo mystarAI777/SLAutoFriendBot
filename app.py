@@ -450,6 +450,61 @@ class MochikoKnowledgeFile:
                             lines.append(n.content[:300])
                         lines.append("")
 
+                # ⑥ ★ 追加: ホロメン深掘りエピソード（Wikiから）
+                members_with_episodes = (
+                    session.query(HolomemWiki)
+                    .filter(HolomemWiki.episodes.isnot(None))
+                    .filter(HolomemWiki.status == '現役')
+                    .limit(30)
+                    .all()
+                )
+                if members_with_episodes:
+                    lines.append("## ホロメンのエピソード・特徴")
+                    for m in members_with_episodes:
+                        ep_text = (m.episodes or '')[:500]
+                        if ep_text:
+                            lines.append(f"### {m.member_name}")
+                            lines.append(ep_text)
+                            lines.append("")
+
+                # ⑦ ★ 追加: ファン用語・呼称（hololive-dictionary由来）
+                all_lingo = session.query(HolomemLingo).limit(80).all()
+                if all_lingo:
+                    lines.append("## ホロメンのファン用語・呼び方")
+                    for lg in all_lingo:
+                        try:
+                            d = json.loads(lg.data or '{}')
+                        except json.JSONDecodeError:
+                            continue
+                        parts = []
+                        if d.get('fannames'):
+                            parts.append(f"ファンネーム: {', '.join(d['fannames'][:3])}")
+                        if d.get('hashtags'):
+                            parts.append(f"タグ: {', '.join(d['hashtags'][:3])}")
+                        if d.get('aliases'):
+                            parts.append(f"呼び方: {', '.join(d['aliases'][:5])}")
+                        if parts:
+                            lines.append(f"- {lg.member_name}: " + " / ".join(parts))
+                    lines.append("")
+
+                # ⑧ ★ 追加: 直近の配信スケジュール
+                now_utc = datetime.utcnow()
+                upcoming = (
+                    session.query(LiveSchedule)
+                    .filter(LiveSchedule.scheduled_at >= now_utc - timedelta(hours=1))
+                    .filter(LiveSchedule.scheduled_at <= now_utc + timedelta(hours=24))
+                    .order_by(LiveSchedule.scheduled_at.asc())
+                    .limit(20)
+                    .all()
+                )
+                if upcoming:
+                    lines.append("## 直近24時間の配信予定（JST）")
+                    for s in upcoming:
+                        jst = s.scheduled_at + timedelta(hours=9)
+                        collab = f"(コラボ{s.collab_count}人)" if s.is_collab else ""
+                        lines.append(f"- {jst.strftime('%m/%d %H:%M')} {s.member_name} {collab}")
+                    lines.append("")
+
         except Exception as e:
             logger.error(f"❌ ドキュメント生成中にDBエラー: {e}")
 
@@ -568,6 +623,41 @@ class HolomemWiki(Base):
     mochiko_feeling = Column(Text, nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     recent_activity = Column(Text, nullable=True)
+    # ★ 追加: Wikiのエピソード・関連語・エピソード欄
+    episodes = Column(Text, nullable=True)
+
+
+class HolomemLingo(Base):
+    """
+    hololive-dictionary由来のファン用語・呼称・ハッシュタグ・SNS情報。
+    メンバーごとにまとめて保持する。
+    """
+    __tablename__ = 'holomem_lingo'
+    id = Column(Integer, primary_key=True)
+    member_name = Column(String(100), nullable=False, unique=True, index=True)
+    # 関連用語をJSON文字列で保存
+    # {"oshi_marks": ["▶"], "hashtags": ["#兎田ぺこら"], "fannames": ["野うさぎ"], "twitter": "@usadapekora", "aliases": ["ぺこら", "ぺこーら"]}
+    data = Column(Text, nullable=False, default='{}')
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LiveSchedule(Base):
+    """
+    schedule.hololive.tv からスクレイピングした配信スケジュール。
+    15分ごとに更新。過去24時間以上前のものは削除。
+    """
+    __tablename__ = 'live_schedules'
+    id = Column(Integer, primary_key=True)
+    video_id = Column(String(50), unique=True, index=True)  # YouTube video ID
+    member_name = Column(String(200), nullable=False, index=True)
+    scheduled_at = Column(DateTime, nullable=False, index=True)  # JST→UTC換算
+    status = Column(String(20), default='upcoming')  # upcoming / live / ended
+    is_collab = Column(Boolean, default=False)
+    collab_count = Column(Integer, default=1)  # コラボ人数
+    url = Column(String(300), nullable=False)
+    thumbnail = Column(String(500), nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
 
 class HololiveNews(Base):
     __tablename__ = 'hololive_news'
@@ -1110,7 +1200,7 @@ def scrape_hololive_stream_info() -> List[Dict]:
     
     try:
         matome_sites = [
-            "https://www.vmiru.tv/group/hololive/scheduled",
+            "https://holosuke.info/",
             "https://hololive-tsuushin.com/"
         ]
         
@@ -1555,138 +1645,7 @@ def update_holomem_database():
             time.sleep(0.5)
     holomem_manager.load_from_db(force=True)
     logger.info("✅ ホロメンDB更新完了")
-    
-# ==============================================================================
-# ★ 追加: ホロライブ非公式wiki検索システム
-# ==============================================================================
 
-HOLOLIVE_WIKI_BASE = 'https://wikiwiki.jp/hololive/'
-WIKI_SYNC_TIMEOUT = 3   # 同期検索の最大待機秒数
-WIKI_BG_TIMEOUT = 15    # バックグラウンド取得の最大待機秒数
-
-
-def scrape_hololive_wiki_page(page_name: str, timeout: int = WIKI_SYNC_TIMEOUT) -> Optional[str]:
-    try:
-        url = f"{HOLOLIVE_WIKI_BASE}{quote_plus(page_name)}"
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        res = requests.get(url, headers=headers, timeout=timeout)
-        if res.status_code != 200:
-            return None
-        soup = BeautifulSoup(res.content, 'html.parser')
-        content_area = (
-            soup.select_one('#content')
-            or soup.select_one('.ie5')
-            or soup.select_one('#page-content')
-        )
-        if not content_area:
-            return None
-        for tag in content_area.select('div.edit, .navi, script, style, .toolbar'):
-            tag.decompose()
-        text = clean_text(content_area.get_text())
-        return text[:1200] if len(text) >= 30 else None
-    except requests.exceptions.Timeout:
-        logger.debug(f"wiki取得タイムアウト: {page_name}")
-        return None
-    except Exception as e:
-        logger.debug(f"wiki取得エラー ({page_name}): {e}")
-        return None
-
-
-def search_hololive_wiki(query: str, timeout: int = WIKI_SYNC_TIMEOUT) -> Optional[str]:
-    # Step1: ページ名として直接アクセス
-    result = scrape_hololive_wiki_page(query, timeout=timeout)
-    if result:
-        logger.info(f"📖 wikiページ直接HIT: {query}")
-        return result
-    # Step2: 検索経由
-    try:
-        search_url = f"{HOLOLIVE_WIKI_BASE}?cmd=search&word={quote_plus(query)}&type=and"
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        res = requests.get(search_url, headers=headers, timeout=timeout)
-        if res.status_code != 200:
-            return None
-        soup = BeautifulSoup(res.content, 'html.parser')
-        result_links = (
-            soup.select('ul.list1 li a')
-            or soup.select('#search_result li a')
-            or soup.select('.search-result a')
-        )
-        if not result_links:
-            return None
-        page_name = result_links[0].get_text().strip()
-        if not page_name:
-            return None
-        logger.info(f"📖 wiki検索HIT: {query} → {page_name}")
-        return scrape_hololive_wiki_page(page_name, timeout=max(1, timeout - 1))
-    except requests.exceptions.Timeout:
-        logger.debug(f"wiki検索タイムアウト: {query}")
-        return None
-    except Exception as e:
-        logger.debug(f"wiki検索エラー ({query}): {e}")
-        return None
-
-
-def save_to_hololive_glossary(term: str, description: str):
-    if not term or not description:
-        return
-    try:
-        short_desc = description[:500]
-        with get_db_session() as session:
-            existing = session.query(HololiveGlossary).filter_by(term=term).first()
-            if existing:
-                if len(description) > len(existing.description or ''):
-                    existing.description = short_desc
-                    logger.info(f"📝 glossary更新: {term}")
-            else:
-                session.add(HololiveGlossary(
-                    term=term,
-                    description=short_desc,
-                    created_at=datetime.utcnow()
-                ))
-                logger.info(f"📝 glossary新規追加: {term}")
-            knowledge_base.refresh()
-    except Exception as e:
-        logger.error(f"glossary保存エラー ({term}): {e}")
-
-
-def background_wiki_search_and_save(term: str):
-    logger.info(f"🔄 バックグラウンドwiki取得開始: {term}")
-    try:
-        text = search_hololive_wiki(term, timeout=WIKI_BG_TIMEOUT)
-        if text:
-            save_to_hololive_glossary(term, text)
-            logger.info(f"✅ バックグラウンドwiki取得完了: {term}")
-        else:
-            logger.info(f"⚠️ バックグラウンドwiki取得: 情報なし ({term})")
-    except Exception as e:
-        logger.error(f"❌ バックグラウンドwiki取得エラー ({term}): {e}")
-
-
-def get_wiki_context_for_hololive(
-    message: str,
-    detected_name: Optional[str],
-    internal_context: str
-) -> str:
-    if len(internal_context) >= 300:
-        return ''
-    holo_keywords = ['ホロライブ', 'hololive', 'ホロメン', 'vtuber', 'VTuber']
-    is_holo_context = (
-        detected_name is not None
-        or any(kw.lower() in message.lower() for kw in holo_keywords)
-        or any(kw in message for kw in ['配信', '歌枠', 'コラボ', 'ライブ', '卒業', 'デビュー'])
-    )
-    if not is_holo_context:
-        return ''
-    search_term = detected_name or message.strip()[:30]
-    wiki_text = search_hololive_wiki(search_term, timeout=WIKI_SYNC_TIMEOUT)
-    if wiki_text:
-        background_executor.submit(save_to_hololive_glossary, search_term, wiki_text)
-        return f"\n\n【ホロライブwiki情報: {search_term}】\n{wiki_text[:600]}"
-    else:
-        background_executor.submit(background_wiki_search_and_save, search_term)
-        logger.info(f"⏱️ wiki取得タイムアウト → 次回のため予約: {search_term}")
-        return ''
-        
 # ==============================================================================
 # ホロライブニュース収集
 # ==============================================================================
@@ -1818,6 +1777,380 @@ def fetch_hololive_tsuushin_news():
 
     except Exception as e:
         logger.error(f"❌ ホロライブ通信の取得に失敗: {e}")
+
+
+# ==============================================================================
+# ★ 追加: hololive-dictionary から ファン用語・呼称を取得
+# ==============================================================================
+def fetch_hololive_dictionary():
+    """
+    GitHubの hololive-dictionary リポジトリから
+    Windows用IME辞書 (ms-ime-dict--all.txt) を取得し、
+    メンバーごとの呼称・ハッシュタグ・ファンネーム・Twitter IDを
+    holomem_lingo テーブルに保存する。
+
+    辞書フォーマット（TSV タブ区切り）:
+        キー\t変換値\t品詞\tコメント
+
+    プレフィックス規則:
+        ：キー → 推しマーク（例: ：ぺこら → ▶）
+        ＃キー → ハッシュタグ（例: ＃ぺこら → #兎田ぺこら）
+        〜キー → ファンネーム（例: 〜ぺこら → 野うさぎ）
+        ＠キー → Twitter ID（例: ＠ぺこら → @usadapekora）
+        キー → 別名・あだ名（例: ぺこーら → 兎田ぺこら）
+    """
+    logger.info("📚 hololive-dictionary 取得開始...")
+    url = "https://raw.githubusercontent.com/heppokofrontend/hololive-dictionary/main/dictionary/win/ms-ime-dict--all.txt"
+
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=30)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ hololive-dictionary 取得失敗: {res.status_code}")
+            return
+
+        # 辞書ファイルは Shift-JIS または UTF-16-LE の可能性
+        # try順: UTF-8 → UTF-16-LE → Shift-JIS
+        content = None
+        for enc in ['utf-8', 'utf-16', 'shift-jis', 'cp932']:
+            try:
+                content = res.content.decode(enc)
+                if '＠' in content or '：' in content or '＃' in content:
+                    logger.info(f"✅ 辞書エンコーディング検出: {enc}")
+                    break
+            except UnicodeDecodeError:
+                continue
+        if not content:
+            logger.warning("⚠️ 辞書ファイルのデコード失敗")
+            return
+
+        # メンバー名 → {aliases, hashtags, fannames, twitter, oshi_marks} の辞書
+        # 正式名称（"兎田ぺこら"など）を主キーにする
+        member_data: Dict[str, Dict[str, Any]] = {}
+
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('!'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+
+            key = parts[0].strip()
+            value = parts[1].strip()
+            if not key or not value:
+                continue
+
+            # プレフィックスで分類
+            if key.startswith('＠'):
+                # Twitter ID: ＠ぺこら → @usadapekora
+                alias = key[1:]
+                twitter_id = value
+                member_name = _lingo_resolve_member(alias, member_data)
+                if member_name:
+                    member_data.setdefault(member_name, {})['twitter'] = twitter_id
+            elif key.startswith('＃'):
+                # ハッシュタグ: ＃ぺこら → #兎田ぺこら
+                alias = key[1:]
+                # valueは正式メンバー名（#を除く）
+                member_name = value.lstrip('#')
+                data = member_data.setdefault(member_name, {})
+                data.setdefault('hashtags', []).append(value)
+                data.setdefault('aliases', []).append(alias)
+            elif key.startswith('〜'):
+                # ファンネーム: 〜ぺこら → 野うさぎ
+                alias = key[1:]
+                fanname = value
+                member_name = _lingo_resolve_member(alias, member_data)
+                if member_name:
+                    data = member_data.setdefault(member_name, {})
+                    if fanname not in data.setdefault('fannames', []):
+                        data['fannames'].append(fanname)
+            elif key.startswith('：'):
+                # 推しマーク
+                alias = key[1:]
+                mark = value
+                member_name = _lingo_resolve_member(alias, member_data)
+                if member_name:
+                    data = member_data.setdefault(member_name, {})
+                    if mark not in data.setdefault('oshi_marks', []):
+                        data['oshi_marks'].append(mark)
+            else:
+                # 一般の別名・あだ名: ぺこーら → 兎田ぺこら
+                if '#' not in value and '@' not in value and value.strip():
+                    member_name = value
+                    data = member_data.setdefault(member_name, {})
+                    if key not in data.setdefault('aliases', []):
+                        data['aliases'].append(key)
+
+        # DBに保存
+        saved = 0
+        with get_db_session() as session:
+            for member_name, data in member_data.items():
+                if not member_name or len(member_name) > 100:
+                    continue
+                existing = session.query(HolomemLingo).filter_by(member_name=member_name).first()
+                data_json = json.dumps(data, ensure_ascii=False)
+                if existing:
+                    existing.data = data_json
+                    existing.updated_at = datetime.utcnow()
+                else:
+                    session.add(HolomemLingo(member_name=member_name, data=data_json))
+                saved += 1
+
+        logger.info(f"✅ hololive-dictionary から {saved} メンバーの用語データを保存")
+
+    except Exception as e:
+        logger.error(f"❌ hololive-dictionary 取得エラー: {e}")
+
+
+def _lingo_resolve_member(alias: str, member_data: Dict[str, Dict]) -> Optional[str]:
+    """辞書内のaliasから正式メンバー名を引く（既知のaliasesを逆引き）"""
+    for member_name, data in member_data.items():
+        if alias in data.get('aliases', []):
+            return member_name
+    # 見つからなければ alias 自体をメンバー名として登録候補に
+    return None
+
+
+# ==============================================================================
+# ★ 追加: ホロライブ非公式Wikiの各メンバーページから「エピソード」欄を取得
+# ==============================================================================
+def fetch_holomem_episodes():
+    """
+    既存のHolomemWikiテーブルに登録されているメンバー名をもとに、
+    seesaawiki の各メンバーページをスクレイピングし、
+    「エピソード」「関連語」「口癖」などの節を抽出して
+    HolomemWiki.episodes カラムに保存する。
+
+    負荷対策: 1回の実行で最大15メンバー、1.5秒間隔
+    """
+    logger.info("📖 ホロメン エピソード情報取得開始...")
+    base_url = "https://seesaawiki.jp/hololivetv/d/"
+
+    with get_db_session() as session:
+        # 現役のメンバーで、episodesが空 or 古い（7日以上前）ものを優先
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        members = session.query(HolomemWiki).filter(
+            HolomemWiki.status == '現役'
+        ).order_by(HolomemWiki.last_updated.asc()).limit(15).all()
+        member_names = [m.member_name for m in members]
+
+    count = 0
+    for member_name in member_names:
+        try:
+            # URLエンコード（seesaawikiはEUC-JPベースだが%エンコーディングで渡せる）
+            import urllib.parse
+            page_url = base_url + urllib.parse.quote(member_name, encoding='utf-8')
+
+            time.sleep(1.5)
+            res = requests.get(
+                page_url,
+                headers={'User-Agent': random.choice(USER_AGENTS)},
+                timeout=15
+            )
+            if res.status_code != 200:
+                logger.warning(f"⚠️ {member_name} ページ取得失敗: {res.status_code}")
+                continue
+
+            # seesaawiki は EUC-JP
+            res.encoding = res.apparent_encoding or 'euc-jp'
+            soup = BeautifulSoup(res.text, 'html.parser')
+
+            # #content 内から「エピソード」「関連語」「口癖」「来歴」などの見出しを探す
+            content_div = soup.select_one('#content') or soup.select_one('.autopagerize_page_element')
+            if not content_div:
+                continue
+
+            target_keywords = ['エピソード', '関連語', '口癖', '特徴', '逸話', '関連用語', 'ネタ']
+            collected_sections: List[str] = []
+
+            for heading in content_div.find_all(['h2', 'h3', 'h4']):
+                heading_text = clean_text(heading.get_text())
+                if not any(kw in heading_text for kw in target_keywords):
+                    continue
+
+                # 見出しの次の兄弟要素から次の見出しまでを取得
+                section_text = []
+                for sibling in heading.find_next_siblings():
+                    if sibling.name in ('h2', 'h3', 'h4'):
+                        break
+                    text = clean_text(sibling.get_text(separator=' '))
+                    if text:
+                        section_text.append(text)
+                if section_text:
+                    joined = ' / '.join(section_text)[:600]
+                    collected_sections.append(f"【{heading_text}】{joined}")
+
+            if collected_sections:
+                episodes_text = '\n\n'.join(collected_sections)[:2000]
+                with get_db_session() as session:
+                    m = session.query(HolomemWiki).filter_by(member_name=member_name).first()
+                    if m:
+                        m.episodes = episodes_text
+                        m.last_updated = datetime.utcnow()
+                count += 1
+                logger.info(f"✅ {member_name} エピソード取得 ({len(episodes_text)}文字)")
+
+        except Exception as e:
+            logger.warning(f"⚠️ {member_name} エピソード取得エラー: {e}")
+            continue
+
+    logger.info(f"✅ エピソード情報更新完了: {count} メンバー")
+
+
+# ==============================================================================
+# ★ 追加: schedule.hololive.tv から配信スケジュール取得
+# ==============================================================================
+def fetch_hololive_schedule():
+    """
+    https://schedule.hololive.tv/lives/hololive から
+    ホロライブJPメンバーの配信スケジュールを取得してDB保存。
+
+    HTML構造 (2026年4月時点):
+    - h4 で日付ラベル "04/17 (金)"
+    - aタグ (href="https://www.youtube.com/watch?v=xxx")
+      内に: img(youtube.pngマーカー), 時刻文字列"HH:MM", メンバー名,
+      img(サムネイル), img(チャンネルアイコン / 複数=コラボ)
+
+    過去12時間より古いものと未来48時間より先のものは無視。
+    """
+    logger.info("📅 ホロライブスケジュール取得開始...")
+    url = "https://schedule.hololive.tv/lives/hololive"
+
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ スケジュール取得失敗: {res.status_code}")
+            return
+
+        soup = BeautifulSoup(res.content, 'html.parser')
+
+        # 日付の基準
+        # 日本時間（JST）を基準にするため、UTCからJSTへ9時間加算
+        now_jst = datetime.utcnow() + timedelta(hours=9)
+        current_year = now_jst.year
+
+        # ページ内に現れる日付情報はh4で "04/17 (金)" の形式
+        # ただし構造が流動的なのでaタグベースで処理する
+        added = 0
+        updated = 0
+        current_date = now_jst.date()  # フォールバック
+
+        # 最新の日付ラベルを辿りながら配信情報を取得
+        for element in soup.find_all(['h4', 'a']):
+            if element.name == 'h4':
+                date_text = clean_text(element.get_text())
+                # "04/17" または "04/17 (金)" の形式
+                date_match = re.match(r'(\d{1,2})/(\d{1,2})', date_text)
+                if date_match:
+                    month = int(date_match.group(1))
+                    day = int(date_match.group(2))
+                    # 年をまたぐ場合の処理（12月→1月）
+                    year = current_year
+                    if month < now_jst.month - 6:
+                        year += 1
+                    try:
+                        current_date = datetime(year, month, day).date()
+                    except ValueError:
+                        pass
+                continue
+
+            # aタグ処理
+            href = element.get('href', '')
+            if 'youtube.com/watch?v=' not in href:
+                continue
+
+            video_id_match = re.search(r'v=([a-zA-Z0-9_-]{11})', href)
+            if not video_id_match:
+                continue
+            video_id = video_id_match.group(1)
+
+            # aタグのテキストから "HH:MM" と メンバー名を抽出
+            inner_text = clean_text(element.get_text(separator='\n'))
+            time_match = re.search(r'(\d{1,2}):(\d{2})', inner_text)
+            if not time_match:
+                continue
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+
+            # メンバー名: 時刻の直後の行
+            lines = [ln.strip() for ln in inner_text.split('\n') if ln.strip()]
+            member_name = None
+            for i, ln in enumerate(lines):
+                if re.match(r'^\d{1,2}:\d{2}$', ln) and i + 1 < len(lines):
+                    member_name = lines[i + 1]
+                    break
+            if not member_name:
+                continue
+
+            # コラボ判定（チャンネルアイコン画像の数）
+            channel_imgs = element.find_all('img', src=re.compile(r'yt3\.ggpht\.com'))
+            collab_count = max(1, len(channel_imgs))
+            is_collab = collab_count > 1
+
+            # サムネイル
+            thumb_img = element.find('img', src=re.compile(r'img\.youtube\.com'))
+            thumbnail = thumb_img.get('src') if thumb_img else None
+
+            # JSTの配信時刻 → UTCに変換
+            try:
+                scheduled_jst = datetime.combine(
+                    current_date,
+                    datetime.min.time()
+                ).replace(hour=hour, minute=minute)
+            except ValueError:
+                continue
+            scheduled_utc = scheduled_jst - timedelta(hours=9)
+
+            # 過去12時間より古い、未来48時間より先はスキップ
+            diff_hours = (scheduled_utc - datetime.utcnow()).total_seconds() / 3600.0
+            if diff_hours < -12 or diff_hours > 48:
+                continue
+
+            # ステータス判定
+            # 現在時刻から-1時間〜+1時間以内: live の可能性
+            if -1 <= diff_hours <= 1:
+                status = 'live'
+            elif diff_hours > 1:
+                status = 'upcoming'
+            else:
+                status = 'ended'
+
+            # DB保存
+            with get_db_session() as session:
+                existing = session.query(LiveSchedule).filter_by(video_id=video_id).first()
+                if existing:
+                    existing.status = status
+                    existing.scheduled_at = scheduled_utc
+                    existing.fetched_at = datetime.utcnow()
+                    updated += 1
+                else:
+                    session.add(LiveSchedule(
+                        video_id=video_id,
+                        member_name=member_name[:200],
+                        scheduled_at=scheduled_utc,
+                        status=status,
+                        is_collab=is_collab,
+                        collab_count=collab_count,
+                        url=href,
+                        thumbnail=thumbnail
+                    ))
+                    added += 1
+
+        # 古いエントリを削除（過去24時間より古いもの）
+        with get_db_session() as session:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            deleted = session.query(LiveSchedule).filter(
+                LiveSchedule.scheduled_at < cutoff
+            ).delete()
+
+        logger.info(f"✅ スケジュール更新: 新規{added}件 / 更新{updated}件 / 削除{deleted}件")
+
+    except Exception as e:
+        logger.error(f"❌ スケジュール取得エラー: {e}")
+
 
 # ==============================================================================
 # ★ 追加 (v33.7.0): セカンドライフ情報収集
@@ -2487,6 +2820,10 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
     # ★ 追加: もちこ知識ベースをDBから自動生成してGemini File APIへアップロード
     'update_knowledge':     {'func': 'generate_mochiko_knowledge',       'interval_hours': 23.0},  # 1日1回
+    # ★ 追加: ホロメン解像度向上のための3情報源
+    'fetch_lingo':          {'func': 'fetch_hololive_dictionary',        'interval_hours': 167.0},  # 週1回（辞書はほぼ更新されない）
+    'fetch_episodes':       {'func': 'fetch_holomem_episodes',           'interval_hours': 47.0},   # 2日に1回（15人ずつ順番に）
+    'fetch_schedule':       {'func': 'fetch_hololive_schedule',          'interval_hours': 0.25},   # 15分ごと
 }
 
 # タスク名 → 実際の関数のマッピング (initialize_app内で設定)
@@ -3208,13 +3545,12 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
-# generate_ai_response() の冒頭（normalized_message 定義の直後）に追加:
-　　_wiki_detected_name: Optional[str] = None    
+    
     # 1. ホロメン情報の注入（SNS情報 + もちこの記憶含む）
     try:
         holomem_manager.load_from_db()
- detected_name = holomem_manager.detect_in_message(normalized_message)
-    _wiki_detected_name = detected_name  # wiki用にスコープ外で保持
+        detected_name = holomem_manager.detect_in_message(normalized_message)
+        if detected_name:
             info = get_holomem_info_cached(detected_name)
             if info:
                 profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
@@ -3251,6 +3587,91 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"News injection error: {e}")
 
+    # 2a-2. ★ 追加: 配信スケジュール注入（「今」「配信」「見てる」系キーワード）
+    try:
+        schedule_keywords = ['今', '配信', '見て', '観て', 'ライブ', '放送', 'やって', '何時', 'いつ', '予定', '今日']
+        if any(kw in message for kw in schedule_keywords):
+            with get_db_session() as session_sched:
+                now_utc = datetime.utcnow()
+                # 配信中（-1時間〜+30分）
+                live_from = now_utc - timedelta(hours=1)
+                live_to = now_utc + timedelta(minutes=30)
+                live_streams = session_sched.query(LiveSchedule).filter(
+                    LiveSchedule.scheduled_at >= live_from,
+                    LiveSchedule.scheduled_at <= live_to
+                ).order_by(LiveSchedule.scheduled_at.asc()).limit(10).all()
+
+                # 今後の配信（+30分〜+12時間）
+                upcoming_from = now_utc + timedelta(minutes=30)
+                upcoming_to = now_utc + timedelta(hours=12)
+                upcoming_streams = session_sched.query(LiveSchedule).filter(
+                    LiveSchedule.scheduled_at >= upcoming_from,
+                    LiveSchedule.scheduled_at <= upcoming_to
+                ).order_by(LiveSchedule.scheduled_at.asc()).limit(10).all()
+
+                sched_lines = []
+                if live_streams:
+                    sched_lines.append("▼配信中 or もうすぐ開始:")
+                    for s in live_streams:
+                        jst = s.scheduled_at + timedelta(hours=9)
+                        collab_mark = f"(コラボ{s.collab_count}人)" if s.is_collab else ""
+                        sched_lines.append(f"  {jst.strftime('%H:%M')} {s.member_name} {collab_mark}")
+
+                if upcoming_streams:
+                    sched_lines.append("\n▼今後12時間の配信予定:")
+                    for s in upcoming_streams:
+                        jst = s.scheduled_at + timedelta(hours=9)
+                        collab_mark = f"(コラボ{s.collab_count}人)" if s.is_collab else ""
+                        sched_lines.append(f"  {jst.strftime('%H:%M')} {s.member_name} {collab_mark}")
+
+                if sched_lines:
+                    internal_context += f"\n\n【ホロライブ配信スケジュール(JST)】\n" + "\n".join(sched_lines)
+    except Exception as e:
+        logger.error(f"Schedule injection error: {e}")
+
+    # 2a-3. ★ 追加: ホロメン個別情報（名前が会話に出たら）
+    try:
+        with get_db_session() as session_lore:
+            # メッセージにメンバー名が含まれているか判定
+            members = session_lore.query(HolomemWiki).filter(
+                HolomemWiki.status == '現役'
+            ).all()
+            matched_member = None
+            for m in members:
+                # メンバー名そのもの、または別名（tagsカラム）で判定
+                if m.member_name in message:
+                    matched_member = m
+                    break
+
+            if matched_member:
+                lore_blocks = []
+                # エピソード
+                if matched_member.episodes:
+                    lore_blocks.append(f"▼{matched_member.member_name}のエピソード:\n{matched_member.episodes[:800]}")
+                # ファン用語（lingoテーブル）
+                lingo = session_lore.query(HolomemLingo).filter_by(
+                    member_name=matched_member.member_name
+                ).first()
+                if lingo and lingo.data:
+                    try:
+                        d = json.loads(lingo.data)
+                        lingo_parts = []
+                        if d.get('fannames'):
+                            lingo_parts.append(f"ファンネーム: {', '.join(d['fannames'][:5])}")
+                        if d.get('hashtags'):
+                            lingo_parts.append(f"タグ: {', '.join(d['hashtags'][:5])}")
+                        if d.get('aliases'):
+                            lingo_parts.append(f"呼び方: {', '.join(d['aliases'][:8])}")
+                        if lingo_parts:
+                            lore_blocks.append(f"▼{matched_member.member_name}のファン用語:\n" + " / ".join(lingo_parts))
+                    except json.JSONDecodeError:
+                        pass
+
+                if lore_blocks:
+                    internal_context += f"\n\n【{matched_member.member_name}詳細情報】\n" + "\n\n".join(lore_blocks)
+    except Exception as e:
+        logger.error(f"Member lore injection error: {e}")
+
     # 2b. ★ v33.7.0: セカンドライフ情報の注入
     try:
         if is_sl_topic(message) or "セカンドライフ" in message or "SL" in message:
@@ -3281,16 +3702,6 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
 
-    # 2e. ★ 追加: ホロライブ非公式wiki補完
-    # DBに知識が薄い場合のみ wiki を同期検索（3秒タイムアウト）
-    try:
-        wiki_ctx = get_wiki_context_for_hololive(
-            message, detected_name, internal_context
-        )
-        if wiki_ctx:
-            internal_context += wiki_ctx
-    except Exception as e:
-        logger.error(f"Wiki context injection error: {e}")
     # 3. 関係性 & 友達記憶コンテキスト
     relationship_context = ""
     friend_memory_context = ""
@@ -3716,17 +4127,75 @@ def background_specialized_search(task_id: str, query_data: Dict):
 def _split_phrases(text: str) -> List[str]:
     """
     テキストを自然なフレーズ単位に分割する。
-    句点・感嘆符・疑問符・改行で分割し、空文字と1文字以下を除外。
+
+    分割ルール:
+    1. 強区切り（。！？\n）で必ず分割
+    2. 弱区切り（、）でも分割候補とする
+    3. 分割後のフレーズが8文字未満の場合は、次のフレーズと結合
+    4. ただし40文字を超える場合は結合をやめて分割
+
+    これにより:
+    - 短すぎるフレーズ（「あのね」等）は結合されて自然な単位に
+    - 長すぎるフレーズは分割されて生成時間を短縮
+    - 読点でも分割されることで最初の音が早く鳴る
     """
-    parts = re.split(r'[。！？\n]', text)
-    result = []
-    for p in parts:
-        p = p.strip()
-        if len(p) >= 2:
-            result.append(p)
-    # 分割できなかった場合はそのまま
+    MIN_CHARS = 8
+    MAX_CHARS = 40
+
+    # Step1: 強区切り＋弱区切りで細かく分割（区切り文字は保持）
+    # 正規表現で区切り文字の直後で分割
+    raw_parts = re.split(r'([。！？、\n])', text)
+
+    # 区切り文字を直前のフレーズにくっつける
+    merged_raw: List[str] = []
+    buffer = ""
+    for p in raw_parts:
+        if p in ('。', '！', '？', '、', '\n'):
+            buffer += p
+            if buffer.strip():
+                merged_raw.append(buffer.strip())
+            buffer = ""
+        else:
+            buffer += p
+    if buffer.strip():
+        merged_raw.append(buffer.strip())
+
+    # 空要素を除外
+    merged_raw = [p for p in merged_raw if p and len(p) >= 1]
+    if not merged_raw:
+        return [text.strip()] if text.strip() else []
+
+    # Step2: 短いフレーズを次と結合
+    result: List[str] = []
+    pending = ""
+    for p in merged_raw:
+        candidate = pending + p if pending else p
+
+        if len(candidate) < MIN_CHARS:
+            # まだ短い → さらに次と結合するため保留
+            pending = candidate
+        elif len(candidate) > MAX_CHARS and pending:
+            # 結合すると長すぎる → 先に pending だけ出す
+            result.append(pending)
+            pending = p
+        else:
+            # 適正サイズ → 確定
+            result.append(candidate)
+            pending = ""
+
+    # 余りがあれば直前に結合（または単独で出す）
+    if pending:
+        if result and len(result[-1]) + len(pending) <= MAX_CHARS:
+            result[-1] = result[-1] + pending
+        else:
+            result.append(pending)
+
+    # 文字数1以下のみの要素を除外
+    result = [r for r in result if len(r) >= 2]
+
     if not result and text.strip():
         result = [text.strip()]
+
     return result
 
 
@@ -4847,6 +5316,10 @@ def initialize_app():
         'cleanup_anime_cache':  cleanup_anime_cache,
         # ★ 追加: もちこ知識ベース自動生成
         'update_knowledge':     generate_mochiko_knowledge,
+        # ★ 追加: ホロメン解像度向上
+        'fetch_lingo':          fetch_hololive_dictionary,
+        'fetch_episodes':       fetch_holomem_episodes,
+        'fetch_schedule':       fetch_hololive_schedule,
     })
 
     # ★ 追加: 起動時に知識ドキュメントをバックグラウンドで生成・アップロード
