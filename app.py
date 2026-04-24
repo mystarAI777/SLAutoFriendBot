@@ -5439,13 +5439,16 @@ def fix_postgres_sequences():
 
     logger.info("🔧 DBの連番ズレを修正中...")
     # 修正後
-    tables = ['user_memories', 'conversation_history', 'user_psychology', 
-              'background_tasks', 'holomem_wiki', 'hololive_news', 
-              'holomem_nicknames', 'hololive_glossary',
-              'stream_reactions', 'holomem_feelings',
-              ’task_logs’, ’users’,'user_interest_logs', 
-              'friend_profiles',’feedback_logs’,
-              'secondlife_news', 'anime_info_cache']
+   # 修正後
+    tables = [
+        'user_memories', 'conversation_history', 'user_psychology', 
+        'background_tasks', 'holomem_wiki', 'hololive_news', 
+        'holomem_nicknames', 'hololive_glossary',
+        'stream_reactions', 'holomem_feelings',
+        'task_logs', 'users', 'user_interest_logs', 
+        'friend_profiles', 'feedback_logs',
+        'secondlife_news', 'anime_info_cache'
+    ]
     
     try:
         with engine.connect() as conn:
