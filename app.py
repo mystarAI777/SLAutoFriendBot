@@ -603,7 +603,7 @@ class UserPsychology(Base):
 
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String(255), unique=True, nullable=False)
     user_uuid = Column(String(255), nullable=False, index=True)
     task_type = Column(String(50), nullable=False)
@@ -5443,7 +5443,8 @@ def fix_postgres_sequences():
               'background_tasks', 'holomem_wiki', 'hololive_news', 
               'holomem_nicknames', 'hololive_glossary',
               'stream_reactions', 'holomem_feelings',
-              'user_interest_logs', 'friend_profiles',
+              ’task_logs’, ’users’,'user_interest_logs', 
+              'friend_profiles',’feedback_logs’,
               'secondlife_news', 'anime_info_cache']
     
     try:
