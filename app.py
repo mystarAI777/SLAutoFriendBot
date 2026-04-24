@@ -311,6 +311,63 @@ groq_client: Optional[Groq] = None
 gemini_model, engine, Session = None, None, None
 
 
+# ==============================================================================
+# ★ v33.13: 会話アクティビティ追跡 - 会話中はバックグラウンドタスクをスキップ
+# ==============================================================================
+# 設計:
+# - /chat_lsl が呼ばれたら mark_chat() で時刻を記録
+# - バックタスク実行前に is_idle() チェック
+# - 最後の会話から 120秒 (CONVERSATION_IDLE_THRESHOLD) 経過していれば実行OK
+# - それ以下なら「会話中」扱いで、重い情報収集系タスクはスキップ
+#
+# ただし以下は会話中でも実行する（会話に直接必要なため）:
+# - AI応答生成 (call_gemini, call_groq)
+# - 音声生成 (generate_voice_file)
+# - ユーザー要求のWEB検索 (background_deep_search, background_specialized_search)
+# ==============================================================================
+
+CONVERSATION_IDLE_THRESHOLD = 120  # 秒。最後の会話からこの時間経過したらアイドル扱い
+
+
+class ConversationActivityTracker:
+    """
+    会話アクティビティを追跡するシンプルな時刻記録クラス。
+    マルチユーザー対応のため、最後の会話時刻だけを保持する。
+    """
+    def __init__(self):
+        self._last_chat_time = 0.0
+        self._lock = Lock()
+
+    def mark_chat(self):
+        """会話があったことを記録（/chat_lsl の冒頭で呼ぶ）"""
+        with self._lock:
+            self._last_chat_time = time.time()
+
+    def is_idle(self, threshold: float = CONVERSATION_IDLE_THRESHOLD) -> bool:
+        """指定秒数以上会話がなければ True"""
+        with self._lock:
+            if self._last_chat_time == 0.0:
+                return True  # まだ一度も会話してない
+            return (time.time() - self._last_chat_time) > threshold
+
+    def seconds_since_last_chat(self) -> float:
+        with self._lock:
+            if self._last_chat_time == 0.0:
+                return float('inf')
+            return time.time() - self._last_chat_time
+
+
+conversation_activity = ConversationActivityTracker()
+
+
+# 会話中でもスキップしないタスク（軽い処理 or 会話と関係ない処理）
+# その他のタスクは会話中スキップ → アイドル時に実行
+NEVER_SKIP_TASKS = {
+    'cleanup_voices',          # ローカルファイル削除のみ
+    'cleanup_rate_limiter',    # メモリ操作のみ
+}
+
+
 # Gemini File API用の知識ドキュメントパス（MochikoKnowledgeFileクラスで使用）
 MOCHIKO_KNOWLEDGE_PATH = "/tmp/mochiko_knowledge.txt"
 
@@ -2966,8 +3023,23 @@ def run_managed_task(task_name: str, func, *args, **kwargs):
     """
     タスクをラップして実行結果を TaskLog に自動記録する。
     background_executor.submit() の代わりに使う。
+
+    v33.13: 会話中チェック追加
+    - NEVER_SKIP_TASKS に含まれるタスクは常に実行
+    - それ以外は会話中（最後の会話から120秒以内）はスキップ
+    - スキップしたタスクは TaskLog の last_run を更新しないので、
+      次のチェックタイミング（GitHub Actions or run_scheduler）で再実行される
     """
     def _wrapper():
+        # ★ 会話中チェック
+        if task_name not in NEVER_SKIP_TASKS:
+            if not conversation_activity.is_idle():
+                seconds = conversation_activity.seconds_since_last_chat()
+                logger.info(
+                    f"💬 タスクスキップ: {task_name} "
+                    f"(最後の会話から{seconds:.0f}秒、閾値{CONVERSATION_IDLE_THRESHOLD}秒)"
+                )
+                return  # last_run更新しないので次回再試行される
         try:
             logger.info(f"▶️  タスク開始: {task_name}")
             func(*args, **kwargs)
@@ -4578,6 +4650,21 @@ def wake_endpoint():
         'tasks': task_status
     })
 
+
+@app.route('/admin/idle', methods=['GET'])
+def admin_idle_status():
+    """会話アクティビティ状態を確認するデバッグ用エンドポイント"""
+    seconds = conversation_activity.seconds_since_last_chat()
+    is_idle = conversation_activity.is_idle()
+    return create_json_response({
+        'is_idle': is_idle,
+        'seconds_since_last_chat': seconds if seconds != float('inf') else None,
+        'idle_threshold_seconds': CONVERSATION_IDLE_THRESHOLD,
+        'never_skip_tasks': sorted(NEVER_SKIP_TASKS),
+        'note': 'is_idle=True ならバックタスクが実行可能、Falseなら会話中扱いでスキップ',
+    })
+
+
 @app.route('/admin/tasks', methods=['GET'])
 def admin_task_status():
     """
@@ -4638,6 +4725,9 @@ def admin_run_task(task_name: str):
 @app.route('/chat_lsl', methods=['POST'])
 def chat_lsl():
     try:
+        # ★ v33.13: 会話アクティビティを記録（バックタスクのスキップ判定に使う）
+        conversation_activity.mark_chat()
+
         data = request.json
         if not data or 'uuid' not in data or 'message' not in data:
             return Response("必須パラメータ不足|", 400)
@@ -5316,30 +5406,53 @@ def clear_voice():
 # ==============================================================================
 def run_scheduler():
     """
-    ★ v33.6.0 省エネスケジューラ
-
-    【設計変更の理由】
-    旧設計: 5分ごとにループ → Renderが眠れない → 無料枠を消費し続ける
-    新設計: GitHub Actionsが外部cronとして機能するため、
-            プロセス内スケジューラは「何もしない番人」として存在するだけでよい。
-
-    このスレッドは起動しているが、実際のタスク実行は /wake エンドポイントと
-    起動時の catch_up_all_tasks() に任せる。
-    スレッド自体は存在するが、Renderのアイドル判定に影響しないよう
-    非常に長いスリープ間隔にしている。
-
-    ※ 万が一 GitHub Actions が止まった場合のフォールバックとして
-      24時間ごとに catch_up_all_tasks() を実行する。
+    ★ v33.13: アイドル検出ループ
+    
+    【設計】
+    - 30秒ごとに「会話していない時間」をチェック
+    - アイドル状態（120秒以上会話なし）かつ期限切れタスクがあれば実行
+    - GitHub Actions による起動が前提だが、Renderが起きている間は
+      会話の合間にこっそり情報収集を進める
+    
+    【会話アクティブ時の動作】
+    - run_managed_task が会話中ならスキップする
+    - 会話が落ち着いた頃にこのループが拾い上げて実行する
+    
+    【フォールバック】
+    - 万が一 GitHub Actions が止まった場合の保険として、
+      アイドル時には期限切れタスクを自動実行する
     """
-    logger.info("💤 省エネスケジューラ起動 (フォールバック用: 24時間間隔)")
+    logger.info("💤 アイドル検出スケジューラ起動 (30秒ごとチェック)")
+    
+    last_full_check = 0
+    
     while True:
         try:
-            time.sleep(86400)  # 24時間待機 (Renderはとっくにスリープしている)
-            # GitHub Actionsが止まった場合のフォールバック
-            logger.info("⏰ フォールバック: catch_up_all_tasks (24h)")
-            catch_up_all_tasks()
+            time.sleep(30)
+            
+            # アイドル状態でなければスキップ
+            if not conversation_activity.is_idle():
+                continue
+            
+            # 5分ごとに期限切れタスクをチェック
+            now = time.time()
+            if now - last_full_check < 300:  # 5分未満なら次へ
+                continue
+            
+            last_full_check = now
+            
+            # アイドル時のキャッチアップ実行
+            overdue_count = sum(
+                1 for t, c in TASK_SCHEDULE.items()
+                if needs_run(t, c['interval_hours'])
+            )
+            if overdue_count > 0:
+                logger.info(f"💤 アイドル検出 → 期限切れタスク {overdue_count}件を実行")
+                catch_up_all_tasks()
+            
         except Exception as e:
-            logger.error(f"フォールバックスケジューラエラー: {e}")
+            logger.error(f"アイドル検出スケジューラエラー: {e}")
+            time.sleep(60)  # エラー時は長めに待つ
 
 def check_and_migrate_db():
     """DBスキーマの自動修復機能"""
@@ -5569,32 +5682,25 @@ def initialize_app():
     #   - 知識ドキュメント生成:   起動 90秒後
     #   - キャッチアップタスク:   起動 60秒後（ただし Gemini系は分散遅延）
 
-    def _delayed_knowledge_generation():
-        time.sleep(90)
-        try:
-            if GEMINI_API_KEY:
-                generate_mochiko_knowledge()
-                logger.info("📚 知識ドキュメント生成完了（遅延実行）")
-        except Exception as e:
-            logger.warning(f"⚠️ 知識ドキュメント生成スキップ: {e}")
-
+    # ★ v33.13: 会話アクティビティ追跡があるので、起動時の遅延は不要
+    # run_managed_task が会話中ならスキップしてくれる
+    # ただし起動直後は会話前提でスキップが発動しないので、念のため60秒だけ遅延
+    
     def _delayed_catch_up():
         time.sleep(60)
-        logger.info("⏰ 起動後60秒経過 → キャッチアップ実行開始")
+        logger.info("⏰ 起動後60秒経過 → キャッチアップ実行（会話中ならタスクは個別スキップ）")
         catch_up_all_tasks()
 
-    # バックグラウンドで遅延実行（メインスレッドをブロックしない）
-    threading.Thread(target=_delayed_knowledge_generation, daemon=True).start()
     threading.Thread(target=_delayed_catch_up, daemon=True).start()
-    logger.info("⏰ 起動時タスクは60〜90秒後に遅延実行予定（ユーザー会話を優先）")
+    logger.info("⏰ 起動後60秒で初回キャッチアップ実行（会話中はタスク個別スキップ）")
 
-    # スケジューラスレッド起動 (フォールバック用の24時間間隔)
+    # スケジューラスレッド起動 (アイドル検出ループ)
     threading.Thread(target=run_scheduler, daemon=True).start()
 
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.11 起動時遅延実行版)")
+    logger.info("🚀 初期化完了! (v33.13 会話優先スケジューラ版)")
 
 initialize_app()
 
