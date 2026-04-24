@@ -564,6 +564,10 @@ _voice_queues_lock = Lock()
 # Render の Environment Variables と GitHub の Secrets に同じ値を設定する
 WAKE_API_KEY = get_secret('WAKE_API_KEY')
 
+# Holodex API キー（無料・https://holodex.net で取得）
+# ホロライブ配信スケジュール＆過去配信履歴の取得に使用
+HOLODEX_API_KEY = get_secret('HOLODEX_API_KEY')
+
 # ==============================================================================
 # データベースモデル
 # ==============================================================================
@@ -1191,74 +1195,138 @@ def update_holomem_social_activities():
 # ==============================================================================
 def scrape_hololive_stream_info() -> List[Dict]:
     """
-    ホロライブの配信情報をネットから収集
-    - 5chまとめサイト
-    - Yahoo!リアルタイム検索
+    配信情報を収集する（v33.10で全面リニューアル）
+
+    データソース:
+    1. Holodex API (/videos?status=past&org=Hololive)
+       → 直近の過去配信タイトル・メンバー名・日時を取得
+    2. DBに蓄積されたホロライブ通信本文 (HololiveNews.content)
+       → ファンの反応・トレンドを抽出するソース
+
+    各配信に対して、通信記事からキーワードマッチで関連反応を検索する。
     """
-    logger.info("📺 配信情報収集開始...")
+    logger.info("📺 配信情報収集開始 (Holodex + 通信本文)...")
     stream_data = []
-    
+
+    # Step1: Holodex APIから過去配信を取得
+    if not HOLODEX_API_KEY:
+        logger.warning("⚠️ HOLODEX_API_KEY 未設定のため配信情報収集スキップ")
+        return stream_data
+
     try:
-        matome_sites = [
-            "https://holosuke.info/",
-            "https://hololive-tsuushin.com/"
-        ]
-        
-        for site in matome_sites:
-            try:
-                res = requests.get(site, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content, 'html.parser')
-                    articles = soup.select('article, .post')[:10]
-                    for art in articles:
-                        title_elem = art.find(['h1', 'h2', 'h3'])
-                        if title_elem:
-                            title = clean_text(title_elem.text)
-                            if any(kw in title for kw in ['配信', '切り抜き', 'ライブ', '歌枠', 'コラボ']):
-                                stream_data.append({
-                                    'title': title,
-                                    'source': 'matome',
-                                    'url': art.find('a').get('href') if art.find('a') else '',
-                                    'date': datetime.utcnow()
-                                })
-                time.sleep(2)
-            except Exception as e:
-                logger.warning(f"まとめサイト収集エラー ({site}): {e}")
+        url = "https://holodex.net/api/v2/videos"
+        headers = {"X-APIKEY": HOLODEX_API_KEY}
+        params = {
+            "org": "Hololive",
+            "status": "past",
+            "type": "stream",
+            "limit": 30,
+            "sort": "available_at",
+            "order": "desc",
+        }
+        res = requests.get(url, headers=headers, params=params, timeout=15)
+        if res.status_code == 200:
+            items = res.json()
+            if isinstance(items, dict):
+                items = items.get('items', [])
+
+            for item in items:
+                try:
+                    title = item.get('title', '')
+                    channel = item.get('channel', {})
+                    member_name = channel.get('name', '') or channel.get('english_name', '')
+                    available_at = item.get('available_at') or item.get('start_actual')
+
+                    if not title or not member_name:
+                        continue
+
+                    stream_date = datetime.utcnow()
+                    if available_at:
+                        try:
+                            stream_date = datetime.fromisoformat(
+                                available_at.replace('Z', '+00:00')
+                            ).replace(tzinfo=None)
+                        except Exception:
+                            pass
+
+                    stream_data.append({
+                        'title': title,
+                        'member_name': member_name,
+                        'source': 'holodex',
+                        'url': f"https://www.youtube.com/watch?v={item.get('id', '')}",
+                        'date': stream_date,
+                        'duration': item.get('duration', 0),
+                    })
+                except Exception as e:
+                    logger.debug(f"Holodex item処理エラー: {e}")
+        else:
+            logger.warning(f"⚠️ Holodex過去配信取得失敗: {res.status_code}")
     except Exception as e:
-        logger.error(f"配信情報収集エラー: {e}")
-    
+        logger.error(f"Holodex配信取得エラー: {e}")
+
+    logger.info(f"📺 収集完了: {len(stream_data)}件の過去配信")
     return stream_data
 
-def analyze_stream_reactions(member_name: str, stream_title: str) -> Dict:
-    """配信への反応を分析 (Yahoo!リアルタイム検索から)"""
+
+def extract_reactions_from_news(member_name: str, stream_title: str) -> Dict:
+    """
+    DBに蓄積されたホロライブ通信の記事本文から、
+    この配信に関連する反応・感想キーワードを抽出する。
+
+    反応源として外部スクレイピングを使わず、
+    既にDBにある記事本文（800文字まで取得済み）から抽出するので、
+    外部依存がなく安定している。
+    """
     reactions = {
         'positive_keywords': [],
         'highlight_moments': [],
-        'fan_comments': []
+        'fan_comments': [],
     }
-    
+
     try:
-        query = f"{member_name} {stream_title[:20]}"
-        url = "https://search.yahoo.co.jp/realtime/search"
-        params = {'p': query, 'ei': 'UTF-8'}
-        
-        res = requests.get(url, params=params, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content, 'html.parser')
-            tweets = soup.select('.cnt.cf')[:10]
-            for tweet in tweets:
-                txt = tweet.select_one('.kw')
-                if txt:
-                    content = clean_text(txt.text)
-                    if any(kw in content for kw in ['神', '最高', '面白', '笑った', '感動', '泣いた', 'エモい']):
-                        reactions['positive_keywords'].append(content[:50])
-                    if any(kw in content for kw in ['シーン', '場面', 'ここ', 'タイムスタンプ', '爆笑']):
-                        reactions['highlight_moments'].append(content[:50])
-    
+        with get_db_session() as session:
+            # 対象メンバーに言及している最近の記事を検索
+            recent_news = session.query(HololiveNews).filter(
+                HololiveNews.content.contains(member_name),
+                HololiveNews.created_at >= datetime.utcnow() - timedelta(days=30)
+            ).order_by(HololiveNews.created_at.desc()).limit(10).all()
+
+            positive_kws = ['神', '最高', '面白', '笑', '感動', '泣', 'エモい',
+                           'やばい', '可愛', 'カワイイ', '推せる', '尊い', '優勝']
+            highlight_kws = ['シーン', 'ここ', '場面', '爆笑', 'クライマックス', '神回']
+
+            for news in recent_news:
+                body = (news.content or '')[:800]
+                # 本文を一文ずつ分割してキーワードヒット判定
+                sentences = re.split(r'[。！？\n]', body)
+                for sent in sentences:
+                    sent = sent.strip()
+                    if not sent or len(sent) < 10 or len(sent) > 120:
+                        continue
+                    if any(kw in sent for kw in positive_kws):
+                        reactions['positive_keywords'].append(sent[:80])
+                    if any(kw in sent for kw in highlight_kws):
+                        reactions['highlight_moments'].append(sent[:80])
+
+                # 多くなりすぎないよう上限
+                if len(reactions['positive_keywords']) >= 8:
+                    break
+
     except Exception as e:
-        logger.error(f"反応分析エラー: {e}")
-    
+        logger.debug(f"反応抽出エラー ({member_name}): {e}")
+
     return reactions
+
+
+
+def analyze_stream_reactions(member_name: str, stream_title: str) -> Dict:
+    """
+    配信への反応を分析。
+    v33.10 から Yahoo リアルタイム検索ではなく、
+    DBに蓄積済みのホロライブ通信本文から反応を抽出する（外部依存削減）。
+    """
+    # 新方式: DB内のニュース本文から抽出
+    return extract_reactions_from_news(member_name, stream_title)
 
 # ==============================================================================
 # ★ 追加 (v33.3.0): もちこの感想生成エンジン
@@ -1431,7 +1499,8 @@ def summarize_member_feelings():
                     feeling.last_summary_update = datetime.utcnow()
                     logger.info(f"✅ {feeling.member_name}の想いを要約 (解像度: 高)")
                 
-                time.sleep(2)
+                # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
+                time.sleep(8)
                 
     except Exception as e:
         logger.error(f"❌ 要約処理エラー: {e}")
@@ -1457,12 +1526,17 @@ def get_database_size_stats() -> Dict:
     return stats
 
 def process_daily_streams():
-    """1日1回実行: 配信情報を収集してもちこの感想を記録 (容量制限: 1日最大5件)"""
+    """1日1回実行: 配信情報を収集してもちこの感想を記録 (容量制限: 1日最大3件)
+
+    v33.11: Gemini API のRate Limit対策
+    - 1日の処理上限を5 → 3 に削減
+    - 各処理の間隔を 3秒 → 8秒 に延長
+    """
     logger.info("🎬 日次配信処理開始...")
-    
+
     streams = scrape_hololive_stream_info()
     processed_count = 0
-    max_daily_streams = 5
+    max_daily_streams = 3  # ★ v33.11: 5 → 3 に削減
     
     with get_db_session() as session:
         for stream_info in streams[:10]:
@@ -1471,10 +1545,18 @@ def process_daily_streams():
             
             try:
                 title = stream_info['title']
-                detected_member = holomem_manager.detect_in_message(title)
+                # ★ v33.10: Holodex経由なら member_name が既に渡ってくる
+                #         無ければフォールバックでタイトルから検出
+                detected_member = stream_info.get('member_name') or ''
+                if not detected_member:
+                    detected_member = holomem_manager.detect_in_message(title) or ''
+                # 検出メンバーが知らない人なら hololive DB で確認
+                if detected_member and not holomem_manager.detect_in_message(detected_member):
+                    # Holodex でホロメン名は取れているが、内部DBに無い場合はそのまま採用
+                    pass
                 if not detected_member:
                     continue
-                
+
                 logger.info(f"📺 処理中: {detected_member} - {title[:30]}...")
                 
                 reactions = analyze_stream_reactions(detected_member, title)
@@ -1512,7 +1594,8 @@ def process_daily_streams():
                     
                     logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
                 
-                time.sleep(3)
+                # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
+                time.sleep(8)
                 
             except Exception as e:
                 logger.error(f"配信処理エラー: {e}")
@@ -2000,156 +2083,134 @@ def fetch_holomem_episodes():
 
 
 # ==============================================================================
-# ★ 追加: schedule.hololive.tv から配信スケジュール取得
+# ★ v33.10: Holodex API から配信スケジュール取得 (旧 schedule.hololive.tv スクレイピングから移行)
 # ==============================================================================
 def fetch_hololive_schedule():
     """
-    https://schedule.hololive.tv/lives/hololive から
-    ホロライブJPメンバーの配信スケジュールを取得してDB保存。
+    Holodex API v2 (https://holodex.net/api/v2/) から
+    ホロライブの配信スケジュール（ライブ中＋予定）を取得してDB保存。
 
-    HTML構造 (2026年4月時点):
-    - h4 で日付ラベル "04/17 (金)"
-    - aタグ (href="https://www.youtube.com/watch?v=xxx")
-      内に: img(youtube.pngマーカー), 時刻文字列"HH:MM", メンバー名,
-      img(サムネイル), img(チャンネルアイコン / 複数=コラボ)
+    利点:
+    - 公式APIなのでHTML構造変化に耐性がある
+    - JSON形式なのでパースが確実
+    - ライブ/予定/過去すべて取得可能
 
-    過去12時間より古いものと未来48時間より先のものは無視。
+    必要な環境変数:
+    - HOLODEX_API_KEY: https://holodex.net でアカウント作成して無料取得
     """
-    logger.info("📅 ホロライブスケジュール取得開始...")
-    url = "https://schedule.hololive.tv/lives/hololive"
+    if not HOLODEX_API_KEY:
+        logger.warning("⚠️ HOLODEX_API_KEY が未設定。Render環境変数に追加してください")
+        return
+
+    logger.info("📅 Holodex API からスケジュール取得開始...")
+    url = "https://holodex.net/api/v2/live"
+    headers = {"X-APIKEY": HOLODEX_API_KEY}
+    params = {
+        "org": "Hololive",
+        "status": "live,upcoming",
+        "max_upcoming_hours": 48,
+        "limit": 50,
+        "sort": "start_scheduled",
+        "order": "asc",
+        "type": "stream",
+    }
 
     try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        res = requests.get(url, headers=headers, timeout=15)
+        res = requests.get(url, headers=headers, params=params, timeout=15)
         if res.status_code != 200:
-            logger.warning(f"⚠️ スケジュール取得失敗: {res.status_code}")
+            logger.warning(f"⚠️ Holodex API 取得失敗: {res.status_code} - {res.text[:200]}")
             return
 
-        soup = BeautifulSoup(res.content, 'html.parser')
+        items = res.json()
+        if not isinstance(items, list):
+            logger.warning(f"⚠️ Holodex 予期しないレスポンス形式: {type(items)}")
+            return
 
-        # 日付の基準
-        # 日本時間（JST）を基準にするため、UTCからJSTへ9時間加算
-        now_jst = datetime.utcnow() + timedelta(hours=9)
-        current_year = now_jst.year
-
-        # ページ内に現れる日付情報はh4で "04/17 (金)" の形式
-        # ただし構造が流動的なのでaタグベースで処理する
+        now_utc = datetime.utcnow()
         added = 0
         updated = 0
-        current_date = now_jst.date()  # フォールバック
+        deleted = 0
 
-        # 最新の日付ラベルを辿りながら配信情報を取得
-        for element in soup.find_all(['h4', 'a']):
-            if element.name == 'h4':
-                date_text = clean_text(element.get_text())
-                # "04/17" または "04/17 (金)" の形式
-                date_match = re.match(r'(\d{1,2})/(\d{1,2})', date_text)
-                if date_match:
-                    month = int(date_match.group(1))
-                    day = int(date_match.group(2))
-                    # 年をまたぐ場合の処理（12月→1月）
-                    year = current_year
-                    if month < now_jst.month - 6:
-                        year += 1
-                    try:
-                        current_date = datetime(year, month, day).date()
-                    except ValueError:
-                        pass
-                continue
-
-            # aタグ処理
-            href = element.get('href', '')
-            if 'youtube.com/watch?v=' not in href:
-                continue
-
-            video_id_match = re.search(r'v=([a-zA-Z0-9_-]{11})', href)
-            if not video_id_match:
-                continue
-            video_id = video_id_match.group(1)
-
-            # aタグのテキストから "HH:MM" と メンバー名を抽出
-            inner_text = clean_text(element.get_text(separator='\n'))
-            time_match = re.search(r'(\d{1,2}):(\d{2})', inner_text)
-            if not time_match:
-                continue
-            hour = int(time_match.group(1))
-            minute = int(time_match.group(2))
-
-            # メンバー名: 時刻の直後の行
-            lines = [ln.strip() for ln in inner_text.split('\n') if ln.strip()]
-            member_name = None
-            for i, ln in enumerate(lines):
-                if re.match(r'^\d{1,2}:\d{2}$', ln) and i + 1 < len(lines):
-                    member_name = lines[i + 1]
-                    break
-            if not member_name:
-                continue
-
-            # コラボ判定（チャンネルアイコン画像の数）
-            channel_imgs = element.find_all('img', src=re.compile(r'yt3\.ggpht\.com'))
-            collab_count = max(1, len(channel_imgs))
-            is_collab = collab_count > 1
-
-            # サムネイル
-            thumb_img = element.find('img', src=re.compile(r'img\.youtube\.com'))
-            thumbnail = thumb_img.get('src') if thumb_img else None
-
-            # JSTの配信時刻 → UTCに変換
+        for item in items:
             try:
-                scheduled_jst = datetime.combine(
-                    current_date,
-                    datetime.min.time()
-                ).replace(hour=hour, minute=minute)
-            except ValueError:
+                video_id = item.get('id')
+                if not video_id:
+                    continue
+
+                channel = item.get('channel', {})
+                member_name = channel.get('name', '')[:200]
+                # 日本語名を優先、無ければ英語名
+                if not member_name:
+                    member_name = channel.get('english_name', 'unknown')[:200]
+
+                # 開始予定時刻 (ISO8601 → datetime)
+                start_iso = item.get('start_scheduled') or item.get('available_at')
+                if not start_iso:
+                    continue
+                scheduled_utc = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+                scheduled_utc = scheduled_utc.replace(tzinfo=None)  # naive UTCに変換
+
+                # ステータス
+                api_status = item.get('status', 'upcoming')
+                status_map = {'live': 'live', 'upcoming': 'upcoming', 'past': 'ended', 'missing': 'ended'}
+                status = status_map.get(api_status, 'upcoming')
+
+                # コラボ判定 (mentions があれば他メンバーとのコラボ)
+                mentions = item.get('mentions', []) or []
+                collab_count = 1 + len(mentions)
+                is_collab = collab_count > 1
+
+                # URL
+                youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+
+                # サムネ (YouTubeの自動生成サムネを使用)
+                thumbnail = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+
+                # DB保存（個別トランザクション。失敗してもループ継続）
+                try:
+                    with get_db_session() as session:
+                        existing = session.query(LiveSchedule).filter_by(video_id=video_id).first()
+                        if existing:
+                            existing.status = status
+                            existing.scheduled_at = scheduled_utc
+                            existing.fetched_at = datetime.utcnow()
+                            updated += 1
+                        else:
+                            session.add(LiveSchedule(
+                                video_id=video_id,
+                                member_name=member_name,
+                                scheduled_at=scheduled_utc,
+                                status=status,
+                                is_collab=is_collab,
+                                collab_count=collab_count,
+                                url=youtube_url,
+                                thumbnail=thumbnail
+                            ))
+                            added += 1
+                except Exception as db_err:
+                    logger.debug(f"LiveSchedule保存エラー ({video_id}): {db_err}")
+
+            except Exception as item_err:
+                logger.debug(f"item処理エラー: {item_err}")
                 continue
-            scheduled_utc = scheduled_jst - timedelta(hours=9)
-
-            # 過去12時間より古い、未来48時間より先はスキップ
-            diff_hours = (scheduled_utc - datetime.utcnow()).total_seconds() / 3600.0
-            if diff_hours < -12 or diff_hours > 48:
-                continue
-
-            # ステータス判定
-            # 現在時刻から-1時間〜+1時間以内: live の可能性
-            if -1 <= diff_hours <= 1:
-                status = 'live'
-            elif diff_hours > 1:
-                status = 'upcoming'
-            else:
-                status = 'ended'
-
-            # DB保存
-            with get_db_session() as session:
-                existing = session.query(LiveSchedule).filter_by(video_id=video_id).first()
-                if existing:
-                    existing.status = status
-                    existing.scheduled_at = scheduled_utc
-                    existing.fetched_at = datetime.utcnow()
-                    updated += 1
-                else:
-                    session.add(LiveSchedule(
-                        video_id=video_id,
-                        member_name=member_name[:200],
-                        scheduled_at=scheduled_utc,
-                        status=status,
-                        is_collab=is_collab,
-                        collab_count=collab_count,
-                        url=href,
-                        thumbnail=thumbnail
-                    ))
-                    added += 1
 
         # 古いエントリを削除（過去24時間より古いもの）
-        with get_db_session() as session:
-            cutoff = datetime.utcnow() - timedelta(hours=24)
-            deleted = session.query(LiveSchedule).filter(
-                LiveSchedule.scheduled_at < cutoff
-            ).delete()
+        try:
+            with get_db_session() as session:
+                cutoff = datetime.utcnow() - timedelta(hours=24)
+                deleted = session.query(LiveSchedule).filter(
+                    LiveSchedule.scheduled_at < cutoff
+                ).delete()
+        except Exception as del_err:
+            logger.debug(f"古いスケジュール削除エラー: {del_err}")
 
-        logger.info(f"✅ スケジュール更新: 新規{added}件 / 更新{updated}件 / 削除{deleted}件")
+        logger.info(f"✅ スケジュール更新 (Holodex): 新規{added}件 / 更新{updated}件 / 削除{deleted}件")
 
+    except requests.exceptions.Timeout:
+        logger.warning("⚠️ Holodex API タイムアウト")
     except Exception as e:
         logger.error(f"❌ スケジュール取得エラー: {e}")
+
 
 
 # ==============================================================================
@@ -2829,22 +2890,55 @@ TASK_SCHEDULE: Dict[str, Dict] = {
 # タスク名 → 実際の関数のマッピング (initialize_app内で設定)
 _task_func_map: Dict[str, Any] = {}
 
+# ★ v33.11: Gemini API を大量に使う「重いタスク」を識別してスタガー実行する
+# これらのタスクは短時間で大量のAPIコールを発生させるため、
+# 他のタスクや会話処理と競合して 429/500 を引き起こす。
+HEAVY_GEMINI_TASKS = {
+    'process_streams',        # 配信感想生成: 各配信ごとに Gemini 呼び出し
+    'summarize_feelings',     # ホロメン想いの要約: メンバー毎に Gemini 呼び出し
+    'update_knowledge',       # 知識ドキュメント生成: Gemini File API 使用
+}
+
+
 def catch_up_all_tasks():
     """
     全タスクを経過時間チェックして、期限切れのものだけ実行する。
     /wake エンドポイントと run_scheduler() の両方から呼ばれる。
     スリープ復帰後にまとめて漏れを補完するのがメインの目的。
+
+    v33.11: Gemini重量タスクは他のタスクから遅らせて分散起動する（会話優先）
     """
+    light_tasks = []
+    heavy_tasks = []
+
     for task_name, config in TASK_SCHEDULE.items():
         try:
             if needs_run(task_name, config['interval_hours']):
                 func = _task_func_map.get(task_name)
-                if func:
-                    run_managed_task(task_name, func)
-                else:
+                if not func:
                     logger.warning(f"⚠️ タスク関数未登録: {task_name}")
+                    continue
+                if task_name in HEAVY_GEMINI_TASKS:
+                    heavy_tasks.append((task_name, func))
+                else:
+                    light_tasks.append((task_name, func))
         except Exception as e:
             logger.error(f"catch_up_all_tasks エラー ({task_name}): {e}")
+
+    # 軽いタスクは即時並列実行
+    for task_name, func in light_tasks:
+        run_managed_task(task_name, func)
+
+    # 重いタスクは30秒間隔でスタガー起動（同時に Gemini を叩かないため）
+    if heavy_tasks:
+        def _stagger_heavy():
+            for i, (task_name, func) in enumerate(heavy_tasks):
+                if i > 0:
+                    time.sleep(30)  # 30秒空けて次のタスクへ
+                logger.info(f"⏳ 重量タスク遅延起動: {task_name} (stagger #{i+1}/{len(heavy_tasks)})")
+                run_managed_task(task_name, func)
+        threading.Thread(target=_stagger_heavy, daemon=True).start()
+        logger.info(f"📅 重量タスク {len(heavy_tasks)}件 をスタガー起動で予約")
 
 
 
@@ -3753,9 +3847,50 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
         else f"【厳守】相手は「{user_data.name}」と呼んでください。勝手にニックネームを作ることは禁止です。"
     )
 
+    # ★ ニックネーム使用を強制: コンテキスト内のフルネーム露出も一括でニックネームに置換
+    # （過去の会話履歴や memo 等にフルネームが残っていてもAIが引きずられない）
+    _name_replace_map = {}
+    if user_data.nickname and user_data.name and user_data.name != user_data.nickname:
+        full = user_data.name
+        nick = user_data.nickname
+        # フルネーム(苗字 名前) / ファーストネームのみ を全て ニックネーム に寄せる
+        _name_replace_map[full] = nick
+        if " " in full:
+            first_part = full.split(" ")[0]
+            last_part = full.split(" ")[-1]
+            if first_part and first_part != nick:
+                _name_replace_map[first_part] = nick
+            if last_part and last_part != nick and last_part != first_part:
+                _name_replace_map[last_part] = nick
+
+    def _apply_nickname(text: str) -> str:
+        if not text or not _name_replace_map:
+            return text
+        for src, dst in _name_replace_map.items():
+            text = text.replace(src, dst)
+        return text
+
+    # コンテキスト類を置換
+    relationship_context = _apply_nickname(relationship_context)
+    friend_memory_context = _apply_nickname(friend_memory_context)
+    internal_context = _apply_nickname(internal_context)
+
+    # 強制指示ブロック（プロンプト最上位）
+    _nickname_header = ""
+    if user_data.nickname:
+        _nickname_header = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚨【絶対遵守ルール・最優先】🚨\n"
+            f"このユーザーを呼ぶときは必ず「{user_data.nickname}」と呼びます。\n"
+            f"- 「{user_data.name}」のようなフルネームでは絶対に呼ばないでください。\n"
+            f"- 参考情報の中にフルネームが出てきても、呼びかけには使わないでください。\n"
+            f"- 新しい愛称を勝手に作らないでください（「{user_data.nickname}ちゃん」「{user_data.nickname}さん」はOK）。\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
     system_prompt = f"""あなたは「もちこ」という、ホロライブが大好きなギャルAIです。
 ユーザー「{_display_name}」と雑談しています。{_call_instruction}
-
+{_nickname_header}
 # 【ユーザーとの関係性】
 {relationship_context}
 
@@ -3810,11 +3945,25 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     if is_task_report:
         system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。ユーザーへの報告として、【外部検索結果】の内容を分かりやすく要約して伝えてください。文字数は600文字以内に収めてください。"
 
-    response = call_gemini(system_prompt, normalized_message, history)
+    # ★ 会話履歴からもフルネームを除去（AIが過去発言を真似してフルネーム呼ばないように）
+    if _name_replace_map:
+        cleaned_history = []
+        for h in history:
+            cleaned_history.append({
+                'role': h['role'],
+                'content': _apply_nickname(h.get('content', ''))
+            })
+        history_for_ai = cleaned_history
+        # 現在メッセージも置換
+        normalized_message = _apply_nickname(normalized_message)
+    else:
+        history_for_ai = history
+
+    response = call_gemini(system_prompt, normalized_message, history_for_ai)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
         _task_type = 'search' if is_task_report else 'chat'
-        response = call_groq(system_prompt, normalized_message, history, 1200 if is_detailed else 800, task_type=_task_type)
+        response = call_groq(system_prompt, normalized_message, history_for_ai, 1200 if is_detailed else 800, task_type=_task_type)
     
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
@@ -4133,28 +4282,25 @@ def _split_phrases(text: str) -> List[str]:
     テキストを自然なフレーズ単位に分割する。
 
     分割ルール:
-    1. 強区切り（。！？\n）で必ず分割
-    2. 弱区切り（、）でも分割候補とする
-    3. 分割後のフレーズが8文字未満の場合は、次のフレーズと結合
-    4. ただし40文字を超える場合は結合をやめて分割
+    1. 強区切り（。！？\n）でのみ分割（読点では分割しない）
+    2. 分割後のフレーズが18文字未満の場合は、次のフレーズと結合
+    3. ただし60文字を超える場合は結合をやめて分割
 
     これにより:
-    - 短すぎるフレーズ（「あのね」等）は結合されて自然な単位に
-    - 長すぎるフレーズは分割されて生成時間を短縮
-    - 読点でも分割されることで最初の音が早く鳴る
+    - 短いフレーズが大量発生することを防ぐ（SL MoAPのキュー破綻回避）
+    - 1回の応答で7〜8フレーズ程度に抑える
     """
-    MIN_CHARS = 8
-    MAX_CHARS = 40
+    MIN_CHARS = 18
+    MAX_CHARS = 60
 
-    # Step1: 強区切り＋弱区切りで細かく分割（区切り文字は保持）
-    # 正規表現で区切り文字の直後で分割
-    raw_parts = re.split(r'([。！？、\n])', text)
+    # Step1: 強区切りのみで分割（読点では分割しない）
+    raw_parts = re.split(r'([。！？\n])', text)
 
     # 区切り文字を直前のフレーズにくっつける
     merged_raw: List[str] = []
     buffer = ""
     for p in raw_parts:
-        if p in ('。', '！', '？', '、', '\n'):
+        if p in ('。', '！', '？', '\n'):
             buffer += p
             if buffer.strip():
                 merged_raw.append(buffer.strip())
@@ -4978,6 +5124,55 @@ def refresh_friend_profile_endpoint(user_uuid: str):
         background_executor.submit(auto_update_friend_profile, Session(), user_uuid, user.user_name)
     return create_json_response({'message': 'プロフィール再生成タスクを開始しました'})
 
+
+@app.route('/admin/friends/profile/<user_uuid>/clear_memo', methods=['POST'])
+def clear_friend_memo_endpoint(user_uuid: str):
+    """friend_profile.memo のみをクリア（ニックネーム保持したまま過去のフルネーム混入を消す）"""
+    with get_db_session() as session:
+        fp = session.query(FriendProfile).filter_by(user_uuid=user_uuid).first()
+        if not fp:
+            return create_json_response({'error': 'FriendProfile not found'}, 404)
+        old_memo = fp.memo
+        fp.memo = None
+        fp.last_updated = datetime.utcnow()
+    return create_json_response({
+        'success': True,
+        'cleared_memo': old_memo[:200] if old_memo else None,
+        'message': 'memo をクリアしました'
+    })
+
+
+@app.route('/admin/user/<user_uuid>/nickname', methods=['GET', 'PUT', 'DELETE'])
+def admin_user_nickname(user_uuid: str):
+    """ユーザーのニックネームを参照・変更・削除する"""
+    with get_db_session() as session:
+        user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+        if not user:
+            return create_json_response({'error': 'User not found'}, 404)
+
+        if request.method == 'GET':
+            return create_json_response({
+                'user_uuid': user.user_uuid,
+                'user_name': user.user_name,
+                'nickname': getattr(user, 'nickname', None),
+                'nickname_asked': getattr(user, 'nickname_asked', False),
+            })
+
+        if request.method == 'PUT':
+            data = request.json or {}
+            new_nick = (data.get('nickname') or '').strip()[:30]
+            if not new_nick:
+                return create_json_response({'error': 'nickname is empty'}, 400)
+            user.nickname = new_nick
+            user.nickname_asked = False
+            return create_json_response({'success': True, 'new_nickname': new_nick})
+
+        if request.method == 'DELETE':
+            user.nickname = None
+            user.nickname_asked = False
+            return create_json_response({'success': True, 'message': 'ニックネームを削除しました'})
+
+
 # ==============================================================================
 # ★ v33.7.0: SLニュース & アニメキャッシュ 管理エンドポイント
 # ==============================================================================
@@ -5355,27 +5550,45 @@ def initialize_app():
         'fetch_lingo':          fetch_hololive_dictionary,
         'fetch_episodes':       fetch_holomem_episodes,
         'fetch_schedule':       fetch_hololive_schedule,
+        # ★ v33.10 追加: 未登録だったクリーンアップ
+        'cleanup_specialized_news': cleanup_old_specialized_news,
     })
 
-    # ★ 追加: 起動時に知識ドキュメントをバックグラウンドで生成・アップロード
-    try:
-        if GEMINI_API_KEY:
-            background_executor.submit(generate_mochiko_knowledge)
-            logger.info("📚 知識ドキュメント生成をバックグラウンドで開始")
-    except Exception as e:
-        logger.warning(f"⚠️ 知識ドキュメント生成スキップ: {e}")
+    # ★ v33.11 変更: 起動時に Gemini API を使う処理をすぐに走らせない
+    # 理由: 起動直後は LSL からの /chat_lsl リクエストを最優先で処理したい。
+    #       Gemini/Groq のクォータ(RPM=15)を重いタスクで食いつぶすと
+    #       ユーザー会話が 500 エラーになる。
+    #
+    # 遅延実行ポリシー:
+    #   - 知識ドキュメント生成:   起動 90秒後
+    #   - キャッチアップタスク:   起動 60秒後（ただし Gemini系は分散遅延）
 
-    # 起動時キャッチアップ: スリープ中に漏れた全タスクを補完実行
-    logger.info("⏰ 起動時キャッチアップ実行中...")
-    catch_up_all_tasks()
+    def _delayed_knowledge_generation():
+        time.sleep(90)
+        try:
+            if GEMINI_API_KEY:
+                generate_mochiko_knowledge()
+                logger.info("📚 知識ドキュメント生成完了（遅延実行）")
+        except Exception as e:
+            logger.warning(f"⚠️ 知識ドキュメント生成スキップ: {e}")
 
-    # スケジューラスレッド起動 (5分ごとに catch_up_all_tasks を呼ぶ)
+    def _delayed_catch_up():
+        time.sleep(60)
+        logger.info("⏰ 起動後60秒経過 → キャッチアップ実行開始")
+        catch_up_all_tasks()
+
+    # バックグラウンドで遅延実行（メインスレッドをブロックしない）
+    threading.Thread(target=_delayed_knowledge_generation, daemon=True).start()
+    threading.Thread(target=_delayed_catch_up, daemon=True).start()
+    logger.info("⏰ 起動時タスクは60〜90秒後に遅延実行予定（ユーザー会話を優先）")
+
+    # スケジューラスレッド起動 (フォールバック用の24時間間隔)
     threading.Thread(target=run_scheduler, daemon=True).start()
 
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.7.0)")
+    logger.info("🚀 初期化完了! (v33.11 起動時遅延実行版)")
 
 initialize_app()
 
