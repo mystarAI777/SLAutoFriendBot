@@ -532,34 +532,6 @@ def after_request(response):
 
 Base = declarative_base()
 
-def apply_db_patches():
-    from sqlalchemy import text
-    try:
-        # DB接続を取得して修正コマンドを実行
-        with db.engine.connect() as conn:
-            # ConversationHistory
-            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS conversation_history_id_seq;"))
-            conn.execute(text("ALTER TABLE conversation_history ALTER COLUMN id SET DEFAULT nextval('conversation_history_id_seq');"))
-            conn.execute(text("SELECT setval('conversation_history_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM conversation_history), false);"))
-            
-            # BackgroundTask
-            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS background_task_id_seq;"))
-            conn.execute(text("ALTER TABLE background_task ALTER COLUMN id SET DEFAULT nextval('background_task_id_seq');"))
-            conn.execute(text("SELECT setval('background_task_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM background_task), false);"))
-            
-            # SpecializedNews
-            conn.execute(text("ALTER TABLE specialized_news ADD COLUMN IF NOT EXISTS query_keyword TEXT;"))
-            
-            # UserInterestLogs
-            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS user_interest_logs_id_seq;"))
-            conn.execute(text("ALTER TABLE user_interest_logs ALTER COLUMN id SET DEFAULT nextval('user_interest_logs_id_seq');"))
-            conn.execute(text("SELECT setval('user_interest_logs_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM user_interest_logs), false);"))
-            
-            conn.commit()
-            print("✅ データベースの自動修復が完了しました")
-    except Exception as e:
-        print(f"⚠️ データベース修復スキップ (既に適用済み、または接続不可): {e}")
-        
 # ==============================================================================
 # 秘密情報/環境変数
 # ==============================================================================
@@ -3387,7 +3359,9 @@ def get_friend_context(user_data: UserData, session) -> str:
     if not user_data.is_friend:
         return ""
 
-    context_parts = [f"━━━━【{user_data.name}さんとの友達記憶】━━━━"]
+    # ★ ニックネームがあればそちらを優先表示
+    _display = user_data.nickname if user_data.nickname else user_data.name
+    context_parts = [f"━━━━【{_display}さんとの友達記憶】━━━━"]
 
     # 1. FriendProfile から詳細
     fp = user_data.friend_profile
@@ -3733,9 +3707,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     # 3. 関係性 & 友達記憶コンテキスト
     relationship_context = ""
     friend_memory_context = ""
+    # ★ ニックネーム優先で関係性コンテキストを組み立て（フルネーム露出防止）
+    _relation_name = user_data.nickname if user_data.nickname else user_data.name
     if user_data.is_friend:
         relationship_context = (
-            f"【重要】{user_data.name}さんはあなたの大切な友達です（友達会話{user_data.friend_profile.get('total_friend_messages', 0) if user_data.friend_profile else 0}回目）。"
+            f"【重要】{_relation_name}さんはあなたの大切な友達です（友達会話{user_data.friend_profile.get('total_friend_messages', 0) if user_data.friend_profile else 0}回目）。"
             f"フレンドリーに、まるで仲の良い友達と話すように接してください。"
         )
         # 友達の詳細記憶をコンテキストに注入
@@ -3745,7 +3721,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
             # sessionがない場合でもprofileだけで組み立て
             friend_memory_context = get_friend_context(user_data, None)
     elif user_data.interaction_count >= 3:
-        relationship_context = f"【重要】{user_data.name}さんとは{user_data.interaction_count}回目の会話です。少しずつ打ち解けてきています。"
+        relationship_context = f"【重要】{_relation_name}さんとは{user_data.interaction_count}回目の会話です。少しずつ打ち解けてきています。"
 
     # 4. 心理分析に基づくトーン調整
     personality_context = ""
@@ -5103,6 +5079,37 @@ def next_voice():
         return Response("", 200)
 
 
+@app.route('/clear_voice', methods=['GET', 'POST'])
+def clear_voice():
+    """
+    LSL側からユーザーの音声キューを強制クリアするエンドポイント。
+    会話終了時・開始時に呼ばれ、前回の残骸音声を確実に消去する。
+    """
+    try:
+        if request.method == 'POST':
+            data = request.json or {}
+        else:
+            data = request.args
+
+        user_uuid = sanitize_user_input(data.get('uuid', ''))
+        if not user_uuid:
+            return Response("no_uuid", 400)
+
+        cleared_count = 0
+        with _voice_queues_lock:
+            q = _voice_queues.get(user_uuid)
+            if q:
+                cleared_count = len(q)
+                q.clear()
+
+        logger.info(f"🗑️ 音声キュークリア: uuid={user_uuid[:8]}, {cleared_count}件削除")
+        return Response(f"cleared:{cleared_count}", 200, mimetype='text/plain')
+
+    except Exception as e:
+        logger.error(f"❌ clear_voice エラー: {e}")
+        return Response("error", 500)
+
+
 # ==============================================================================
 # 初期化
 # ==============================================================================
@@ -5373,6 +5380,4 @@ def initialize_app():
 initialize_app()
 
 if __name__ == '__main__':
-    # データベース修復処理を追加
-    apply_db_patches()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
