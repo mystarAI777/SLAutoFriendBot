@@ -603,7 +603,7 @@ class UserPsychology(Base):
 
 class BackgroundTask(Base):
     __tablename__ = 'background_tasks'
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True)
     task_id = Column(String(255), unique=True, nullable=False)
     user_uuid = Column(String(255), nullable=False, index=True)
     task_type = Column(String(50), nullable=False)
@@ -3588,7 +3588,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 1000}
+            generation_config={"temperature": 0.8, "max_output_tokens": 400}  # v33.12: 1000 → 400 (150-200文字応答に最適化)
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -3921,11 +3921,13 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 7. **【セカンドライフ最新情報】がある場合、SLユーザーと話しているので積極的に活用してください。**
 8. **【アニメ情報】がある場合、それを使ってアニメの話を盛り上げてください。知らなかった作品でも、検索して得た情報から「あー、それ知ってる！〇〇なやつでしょ？」と自然に反応してください。**
 
-# 【出力のルール（重要）】
-1. セカンドライフのチャット欄で見やすいよう、1回の回答は「300〜400文字程度」に凝縮して届けて。
-2. 決してそっけなくせず、絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調はそのまま維持して。
-3. ニュースなどの情報が多い時は、箇条書きを活用してスッキリ整理して伝えてね。
-4. 文章が途中で切れるとカッコ悪いから、必ず最後まで言い切る形で完結させて！
+# 【出力のルール（超重要）】
+1. 1回の回答は「**150〜200文字程度**」に厳密に収めてください（400字はNG、長すぎると会話が止まります）。
+2. **1メッセージに1トピックまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
+3. **相手に2つ以上の質問を同時にしない**。質問するなら1個だけ。
+4. 絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調は維持してください。
+5. 箇条書きは使わない。自然な会話文で返してください。
+6. 文章が途中で切れるとカッコ悪いから、必ず最後まで言い切る形で完結させてください。
 
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
@@ -3962,8 +3964,10 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     response = call_gemini(system_prompt, normalized_message, history_for_ai)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
+        # ★ v33.12: 通常会話は 400 tokens に絞る（150-200文字応答）
         _task_type = 'search' if is_task_report else 'chat'
-        response = call_groq(system_prompt, normalized_message, history_for_ai, 1200 if is_detailed else 800, task_type=_task_type)
+        _max_tokens = 800 if is_task_report else 400  # 検索レポートは長め、通常は短め
+        response = call_groq(system_prompt, normalized_message, history_for_ai, _max_tokens, task_type=_task_type)
     
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
@@ -4283,15 +4287,17 @@ def _split_phrases(text: str) -> List[str]:
 
     分割ルール:
     1. 強区切り（。！？\n）でのみ分割（読点では分割しない）
-    2. 分割後のフレーズが18文字未満の場合は、次のフレーズと結合
-    3. ただし60文字を超える場合は結合をやめて分割
+    2. 分割後のフレーズが30文字未満の場合は、次のフレーズと結合
+    3. ただし90文字を超える場合は結合をやめて分割
 
-    これにより:
-    - 短いフレーズが大量発生することを防ぐ（SL MoAPのキュー破綻回避）
-    - 1回の応答で7〜8フレーズ程度に抑える
+    v33.12 で閾値を 18/60 → 30/90 に拡大:
+    - 1回の応答あたり音声生成数を半分以下に削減
+    - SL MoAP再生の重なりを解消
+    - 1回あたりのVOICEVOX API呼び出しは増えるが
+      同時並列生成数が減るので全体スループット向上
     """
-    MIN_CHARS = 18
-    MAX_CHARS = 60
+    MIN_CHARS = 30
+    MAX_CHARS = 90
 
     # Step1: 強区切りのみで分割（読点では分割しない）
     raw_parts = re.split(r'([。！？\n])', text)
@@ -5439,16 +5445,12 @@ def fix_postgres_sequences():
 
     logger.info("🔧 DBの連番ズレを修正中...")
     # 修正後
-   # 修正後
-    tables = [
-        'user_memories', 'conversation_history', 'user_psychology', 
-        'background_tasks', 'holomem_wiki', 'hololive_news', 
-        'holomem_nicknames', 'hololive_glossary',
-        'stream_reactions', 'holomem_feelings',
-        'task_logs', 'users', 'user_interest_logs', 
-        'friend_profiles', 'feedback_logs',
-        'secondlife_news', 'anime_info_cache'
-    ]
+    tables = ['user_memories', 'conversation_history', 'user_psychology', 
+              'background_tasks', 'holomem_wiki', 'hololive_news', 
+              'holomem_nicknames', 'hololive_glossary',
+              'stream_reactions', 'holomem_feelings',
+              'user_interest_logs', 'friend_profiles',
+              'secondlife_news', 'anime_info_cache']
     
     try:
         with engine.connect() as conn:
