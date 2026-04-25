@@ -94,6 +94,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ★ v33.14: gunicorn と werkzeug の DEBUGログを抑制
+# /health 連打の DEBUG ログがログを埋め尽くす問題への対処
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('gunicorn').setLevel(logging.WARNING)
+logging.getLogger('gunicorn.error').setLevel(logging.WARNING)
+logging.getLogger('gunicorn.access').setLevel(logging.WARNING)
+
 # ==============================================================================
 # 定数設定 & モデル設定
 # ==============================================================================
@@ -4570,15 +4577,29 @@ def initialize_knowledge_db():
 # ==============================================================================
 @app.route('/health', methods=['GET'])
 def health_check():
+    """
+    ★ v33.14: 超軽量化
+    Renderのヘルスチェック等で5秒に1回叩かれる可能性があるため、
+    DBアクセスや model_manager の再評価をしない。
+    詳細ステータスは /health/detail を使う。
+    """
+    return Response('{"status":"ok"}', mimetype='application/json', status=200)
+
+
+@app.route('/health/detail', methods=['GET'])
+def health_check_detail():
+    """詳細ヘルスチェック（管理画面用）"""
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.8.0+pgvector_rag',
+        'version': 'v33.14',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
         'groq': groq_client is not None,
-        'holomem_count': holomem_manager.get_member_count()
+        'holomem_count': holomem_manager.get_member_count(),
+        'is_idle': conversation_activity.is_idle(),
+        'seconds_since_last_chat': conversation_activity.seconds_since_last_chat() if conversation_activity.seconds_since_last_chat() != float('inf') else None,
     })
 
 def check_wake_auth() -> bool:
@@ -4663,6 +4684,24 @@ def admin_idle_status():
         'never_skip_tasks': sorted(NEVER_SKIP_TASKS),
         'note': 'is_idle=True ならバックタスクが実行可能、Falseなら会話中扱いでスキップ',
     })
+
+
+@app.route('/admin/fix_sequences', methods=['POST', 'GET'])
+def admin_fix_sequences():
+    """
+    PostgreSQL シーケンスを手動修正する緊急用エンドポイント。
+    NULL identity key エラーが頻発した時にブラウザ or curl で叩く。
+    """
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        fix_postgres_sequences(quiet=False)
+        return create_json_response({
+            'success': True,
+            'message': 'シーケンス修正完了。Renderログで詳細を確認してください'
+        })
+    except Exception as e:
+        return create_json_response({'success': False, 'error': str(e)}, 500)
 
 
 @app.route('/admin/tasks', methods=['GET'])
@@ -4891,6 +4930,18 @@ def chat_lsl():
         return Response(f"{res_text}|{v_url}", mimetype='text/plain; charset=utf-8', status=200)
     
     except Exception as e:
+        err_str = str(e)
+        # ★ v33.14: NULL identity key エラーを検出したら自動でシーケンス修正
+        if "NULL identity key" in err_str or "FlushError" in str(type(e).__name__):
+            logger.error(f"⚠️ DB シーケンス破損検出 → 自動修復実行")
+            try:
+                fix_postgres_sequences(quiet=True)
+                logger.info("✅ シーケンス自動修復完了。次回リクエストで復活見込み")
+            except Exception as fix_err:
+                logger.error(f"❌ シーケンス修復失敗: {fix_err}")
+            # ユーザーには優しいメッセージを返す
+            return Response("ごめん、ちょっとサーバーが調子悪いみたい…もう一度話しかけてみて！|", mimetype='text/plain; charset=utf-8', status=200)
+        
         logger.critical(f"🔥 エラー: {e}", exc_info=True)
         return Response("システムエラー…|", 500)
 
@@ -5552,31 +5603,55 @@ def check_and_migrate_db():
     except Exception as e:
         logger.error(f"⚠️ Migration check failed: {e}")
 
-def fix_postgres_sequences():
+def fix_postgres_sequences(quiet: bool = False):
+    """
+    PostgreSQL の SERIAL シーケンスを実テーブルの MAX(id) と同期する。
+    
+    v33.14: 強化
+    - 起動時だけでなく、エラー検出時にも呼べるように quiet パラメータ追加
+    - 全テーブルを網羅（task_logs はprimary key=task_nameなのでスキップ）
+    - 各テーブル個別にトランザクション分離（1テーブル失敗で他が止まらないように）
+    """
     if 'sqlite' in str(DATABASE_URL):
         return
 
-    logger.info("🔧 DBの連番ズレを修正中...")
-    # 修正後
-    tables = ['user_memories', 'conversation_history', 'user_psychology', 
-              'background_tasks', 'holomem_wiki', 'hololive_news', 
-              'holomem_nicknames', 'hololive_glossary',
-              'stream_reactions', 'holomem_feelings',
-              'user_interest_logs', 'friend_profiles',
-              'secondlife_news', 'anime_info_cache']
+    if not quiet:
+        logger.info("🔧 DBの連番ズレを修正中...")
     
-    try:
-        with engine.connect() as conn:
-            with conn.begin():
-                for table in tables:
-                    try:
-                        sql = text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), COALESCE((SELECT MAX(id) + 1 FROM {table}), 1), false);")
-                        conn.execute(sql)
+    # SERIAL primary key を持つ全テーブル
+    tables = [
+        'user_memories', 'conversation_history', 'user_psychology',
+        'background_tasks', 'holomem_wiki', 'hololive_news',
+        'holomem_nicknames', 'hololive_glossary',
+        'stream_reactions', 'holomem_feelings',
+        'user_interest_logs', 'friend_profiles',
+        'secondlife_news', 'anime_info_cache', 'specialized_news',
+        'holomem_lingo', 'live_schedules',
+        # task_logs は primary key=task_name(VARCHAR) なので除外
+    ]
+
+    fixed = 0
+    failed = 0
+    for table in tables:
+        try:
+            # ★ 各テーブルを独立トランザクションで処理（1つ失敗しても他に影響しない）
+            with engine.connect() as conn:
+                with conn.begin():
+                    sql = text(
+                        f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                        f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
+                    )
+                    conn.execute(sql)
+                    fixed += 1
+                    if not quiet:
                         logger.info(f"  ✅ {table}: シーケンス修正完了")
-                    except Exception as e:
-                        logger.debug(f"  ⚠️ {table}スキップ: {e}")
-    except Exception as e:
-        logger.error(f"❌ シーケンス修正エラー: {e}")
+        except Exception as e:
+            failed += 1
+            if not quiet:
+                logger.warning(f"  ⚠️ {table}スキップ: {str(e)[:80]}")
+    
+    if not quiet:
+        logger.info(f"🔧 シーケンス修正: {fixed}件成功 / {failed}件失敗")
 
 
 def setup_stream_processing_schedule():
