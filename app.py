@@ -1096,14 +1096,108 @@ chat_rate_limiter = RateLimiter(max_requests=10, time_window=timedelta(minutes=1
 
 @contextmanager
 def get_db_session():
+    """
+    DBセッションを取得。
+    
+    v33.17: シーケンス破損自動修復機能を内蔵
+    - commit時のFlushError(NULL identity key)を検出して自動修復
+    - rollback後にfix_postgres_sequencesを呼ぶ
+    - 修復後はそのリクエスト分の変更は失われるが、次回から復活
+    - 上位の except ブロックには伝播しない（クラッシュ防止）
+    """
     if not Session: raise Exception("Session not initialized")
     session = Session()
-    try: yield session; session.commit()
-    except Exception as e: session.rollback(); raise
-    finally: session.close()
+    try:
+        yield session
+        try:
+            session.commit()
+        except Exception as commit_err:
+            err_str = str(commit_err)
+            err_type = type(commit_err).__name__
+            if "NULL identity key" in err_str or "FlushError" in err_type or "IntegrityError" in err_type:
+                logger.warning(f"⚠️ commit時にDB整合性エラー → 自動修復実行: {err_type}")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                # シーケンス修復（バックグラウンドで他のスレッドが使ってても大丈夫）
+                try:
+                    fix_postgres_sequences(quiet=True)
+                    logger.info("✅ シーケンス自動修復完了（このセッションの変更は失われた）")
+                except Exception as fix_err:
+                    logger.error(f"❌ シーケンス修復失敗: {fix_err}")
+                # commit失敗は上位に伝播させない（クラッシュ防止）
+            else:
+                # 想定外のエラーは上位へ
+                raise
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 def create_json_response(data: Any, status: int = 200) -> Response:
     return Response(json.dumps(data, ensure_ascii=False), mimetype='application/json; charset=utf-8', status=status)
+
+
+# ==============================================================================
+# ★ v33.17: クラッシュセーフな session.add ヘルパー
+# ==============================================================================
+def _safe_add_with_retry(session, instance, label: str = "record") -> bool:
+    """
+    session.add() を行い、即座にflushして個別に検証する。
+    シーケンス破損なら自動修復してリトライ。
+    
+    返り値:
+        True: 追加成功
+        False: 追加失敗（呼び出し元で握りつぶしOK）
+    
+    使い方:
+        if _safe_add_with_retry(session, ConversationHistory(...), "user_history"):
+            logger.info("会話履歴保存OK")
+        # 失敗してもクラッシュしないので会話は続行
+    """
+    try:
+        session.add(instance)
+        session.flush()
+        return True
+    except Exception as e:
+        err_str = str(e)
+        err_type = type(e).__name__
+        if "NULL identity key" in err_str or "FlushError" in err_type or "IntegrityError" in err_type:
+            logger.warning(f"⚠️ {label} 追加でシーケンス破損 → 修復&リトライ")
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            try:
+                fix_postgres_sequences(quiet=True)
+                # リトライ
+                session.add(instance)
+                session.flush()
+                logger.info(f"✅ {label} リトライ成功")
+                return True
+            except Exception as e2:
+                logger.error(f"❌ {label} リトライも失敗: {e2}")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                return False
+        else:
+            logger.error(f"❌ {label} 追加失敗（想定外）: {e}")
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            return False
+
 
 def clean_text(text: str) -> str:
     if not text: return ""
@@ -1133,11 +1227,71 @@ def is_explicit_search_request(msg: str) -> bool:
         return True
     noun_triggers = ['ニュース', 'news', 'NEWS', '情報', '日程', 'スケジュール', '天気', '予報']
     if any(kw in msg for kw in noun_triggers):
-        if len(msg) < 20: return True
-        if msg.endswith('?') or msg.endswith('？'): return True
-        return False
+        # ★ v33.16b: 「ホロライブのニュース」「最新情報」のような短い問い合わせは
+        # DBコンテキスト（HololiveNews等）で十分答えられるため、外部検索しない。
+        # 「〇〇のニュース教えて」「〇〇について調べて」など明示的な調査依頼のみ検索。
+        if any(kw in msg for kw in ['調べて', '検索', '教えて', '詳しく', '最新']):
+            return True
+        if msg.endswith('?') or msg.endswith('？'):
+            return True
+        return False  # 短くてもニュース単語だけなら検索しない
     if 'おすすめ' in msg or 'オススメ' in msg: return True
     return False
+
+
+# ==============================================================================
+# ★ v33.17: DB先答え判定（外部検索を回避してDB蓄積データから即答）
+# ==============================================================================
+def is_db_answerable_news(msg: str) -> bool:
+    """
+    DBに蓄積されたニュース・配信情報で答えられる質問か判定。
+    判定に当てはまれば外部検索せずDBから即答する。
+    """
+    msg = msg.strip()
+    # 「調べて」「最新」「教えて」など明示的な検索依頼は外部検索に任せる
+    if any(kw in msg for kw in ['調べて', '検索', '最新', '詳しく', '教えて', '探して']):
+        return False
+    # 疑問符付きで20文字超は明示的な質問なので外部検索へ
+    if (msg.endswith('?') or msg.endswith('？')) and len(msg) > 20:
+        return False
+    # ホロライブ系キーワード + 情報系単語
+    holo_kws = ['ホロライブ', 'ホロメン', 'ホロ', 'hololive']
+    info_kws = ['ニュース', '情報', '最近', 'なんか']
+    if any(h in msg for h in holo_kws) and any(i in msg for i in info_kws):
+        return True
+    return False
+
+
+def get_hololive_news_summary() -> Optional[str]:
+    """
+    DBから最新ホロライブニュースを取得してもちこ口調で返す。
+    """
+    try:
+        with get_db_session() as session:
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            news = session.query(HololiveNews).filter(
+                HololiveNews.created_at >= cutoff
+            ).order_by(HololiveNews.created_at.desc()).limit(5).all()
+            
+            if not news:
+                # 7日以内になければ全期間から最新5件
+                news = session.query(HololiveNews).order_by(
+                    HololiveNews.created_at.desc()
+                ).limit(5).all()
+            
+            if not news:
+                return None
+            
+            lines = ["最近のホロライブニュースじゃん〜！✨\n"]
+            for i, n in enumerate(news, 1):
+                title = n.title[:70] if n.title else ""
+                lines.append(f"{i}. {title}")
+            lines.append("\n気になるのあったら教えて〜！詳しく調べるじゃん！")
+            return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"ニュース要約取得失敗: {e}")
+        return None
+
 
 def extract_location(msg: str) -> str:
     for loc in LOCATION_CODES.keys():
@@ -1776,67 +1930,72 @@ def process_daily_streams():
     processed_count = 0
     max_daily_streams = 3  # ★ v33.11: 5 → 3 に削減
     
-    with get_db_session() as session:
-        for stream_info in streams[:10]:
-            if processed_count >= max_daily_streams:
-                break
-            
-            try:
-                title = stream_info['title']
-                # ★ v33.10: Holodex経由なら member_name が既に渡ってくる
-                #         無ければフォールバックでタイトルから検出
-                detected_member = stream_info.get('member_name') or ''
-                if not detected_member:
-                    detected_member = holomem_manager.detect_in_message(title) or ''
-                # 検出メンバーが知らない人なら hololive DB で確認
-                if detected_member and not holomem_manager.detect_in_message(detected_member):
-                    # Holodex でホロメン名は取れているが、内部DBに無い場合はそのまま採用
-                    pass
-                if not detected_member:
-                    continue
+    # ★ v33.17: 外側のwithを廃止。各イテレーションが個別トランザクションで動く
+    for stream_info in streams[:10]:
+        if processed_count >= max_daily_streams:
+            break
+        
+        try:
+            title = stream_info['title']
+            # ★ v33.10: Holodex経由なら member_name が既に渡ってくる
+            #         無ければフォールバックでタイトルから検出
+            detected_member = stream_info.get('member_name') or ''
+            if not detected_member:
+                detected_member = holomem_manager.detect_in_message(title) or ''
+            # 検出メンバーが知らない人なら hololive DB で確認
+            if detected_member and not holomem_manager.detect_in_message(detected_member):
+                # Holodex でホロメン名は取れているが、内部DBに無い場合はそのまま採用
+                pass
+            if not detected_member:
+                continue
 
-                logger.info(f"📺 処理中: {detected_member} - {title[:30]}...")
-                
-                reactions = analyze_stream_reactions(detected_member, title)
-                mochiko_reaction = generate_mochiko_reaction(detected_member, title, reactions)
-                
-                existing = session.query(StreamReaction).filter_by(
-                    member_name=detected_member,
-                    stream_title=title[:300]
-                ).first()
-                
-                if not existing:
-                    new_reaction = StreamReaction(
+            logger.info(f"📺 処理中: {detected_member} - {title[:30]}...")
+            
+            reactions = analyze_stream_reactions(detected_member, title)
+            mochiko_reaction = generate_mochiko_reaction(detected_member, title, reactions)
+            
+            # ★ v33.17: 各配信を個別トランザクションで処理（1件失敗しても他に影響しない）
+            try:
+                with get_db_session() as inner_session:
+                    existing = inner_session.query(StreamReaction).filter_by(
                         member_name=detected_member,
-                        stream_title=title[:300],
-                        stream_date=stream_info['date'],
-                        mochiko_feeling=mochiko_reaction['feeling'][:300],
-                        emotion_tags=mochiko_reaction['emotion_tags'][:50]
-                    )
-                    session.add(new_reaction)
-                    processed_count += 1
+                        stream_title=title[:300]
+                    ).first()
                     
-                    feeling = session.query(HolomemFeeling).filter_by(member_name=detected_member).first()
-                    if not feeling:
-                        feeling = HolomemFeeling(member_name=detected_member)
-                        session.add(feeling)
-                    
-                    feeling.total_watch_count += 1
-                    feeling.last_watched = datetime.utcnow()
-                    feeling.last_emotion = mochiko_reaction['emotion_tags'].split(',')[0] if mochiko_reaction['emotion_tags'] else None
-                    
-                    if '興奮' in (mochiko_reaction['emotion_tags'] or ''):
-                        feeling.love_level = min(100, feeling.love_level + 5)
-                    elif '感動' in (mochiko_reaction['emotion_tags'] or ''):
-                        feeling.love_level = min(100, feeling.love_level + 3)
-                    
-                    logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
-                
-                # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
-                time.sleep(8)
-                
-            except Exception as e:
-                logger.error(f"配信処理エラー: {e}")
+                    if not existing:
+                        new_reaction = StreamReaction(
+                            member_name=detected_member,
+                            stream_title=title[:300],
+                            stream_date=stream_info['date'],
+                            mochiko_feeling=mochiko_reaction['feeling'][:300],
+                            emotion_tags=mochiko_reaction['emotion_tags'][:50]
+                        )
+                        if _safe_add_with_retry(inner_session, new_reaction, label="stream_reaction"):
+                            processed_count += 1
+                            
+                            feeling = inner_session.query(HolomemFeeling).filter_by(member_name=detected_member).first()
+                            if not feeling:
+                                feeling = HolomemFeeling(member_name=detected_member)
+                                _safe_add_with_retry(inner_session, feeling, label="holomem_feeling")
+                            
+                            feeling.total_watch_count += 1
+                            feeling.last_watched = datetime.utcnow()
+                            feeling.last_emotion = mochiko_reaction['emotion_tags'].split(',')[0] if mochiko_reaction['emotion_tags'] else None
+                            
+                            if '興奮' in (mochiko_reaction['emotion_tags'] or ''):
+                                feeling.love_level = min(100, feeling.love_level + 5)
+                            elif '感動' in (mochiko_reaction['emotion_tags'] or ''):
+                                feeling.love_level = min(100, feeling.love_level + 3)
+                            
+                            logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
+            except Exception as inner_err:
+                logger.warning(f"⚠️ 配信処理スキップ ({detected_member}): {inner_err}")
+            
+            # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
+            time.sleep(8)
+            
+        except Exception as e:
+            logger.error(f"配信処理エラー: {e}")
     
     logger.info(f"✅ 日次配信処理完了 ({processed_count}件処理)")
     cleanup_old_stream_reactions()
@@ -1937,33 +2096,37 @@ def update_holomem_database():
         members.append(gm)
 
     if not members: return
-    with get_db_session() as session:
-        for m in members:
-            name = m['member_name']
-            existing = session.query(HolomemWiki).filter_by(member_name=name).first()
-            
-            detail = fetch_member_detail_from_wiki(name)
-            if detail:
-                status = m.get('status', detail.get('status', '現役'))
-                grad_date = m.get('graduation_date', detail.get('graduation_date'))
+    # ★ v33.17: 各メンバーを個別トランザクションで処理
+    for m in members:
+        name = m['member_name']
+        try:
+            with get_db_session() as session:
+                existing = session.query(HolomemWiki).filter_by(member_name=name).first()
                 
-                if existing:
-                    existing.status = status
-                    existing.graduation_date = grad_date
-                    existing.last_updated = datetime.utcnow()
-                else:
-                    new_member = HolomemWiki(
-                        member_name=name,
-                        description=detail.get('description'),
-                        generation=detail.get('generation'),
-                        debut_date=detail.get('debut_date'),
-                        tags=name,
-                        status=status,
-                        graduation_date=grad_date,
-                        last_updated=datetime.utcnow()
-                    )
-                    session.add(new_member)
-            time.sleep(0.5)
+                detail = fetch_member_detail_from_wiki(name)
+                if detail:
+                    status = m.get('status', detail.get('status', '現役'))
+                    grad_date = m.get('graduation_date', detail.get('graduation_date'))
+                    
+                    if existing:
+                        existing.status = status
+                        existing.graduation_date = grad_date
+                        existing.last_updated = datetime.utcnow()
+                    else:
+                        new_member = HolomemWiki(
+                            member_name=name,
+                            description=detail.get('description'),
+                            generation=detail.get('generation'),
+                            debut_date=detail.get('debut_date'),
+                            tags=name,
+                            status=status,
+                            graduation_date=grad_date,
+                            last_updated=datetime.utcnow()
+                        )
+                        _safe_add_with_retry(session, new_member, label=f"holomem({name})")
+        except Exception as e:
+            logger.warning(f"⚠️ {name} 更新スキップ: {e}")
+        time.sleep(0.5)
     holomem_manager.load_from_db(force=True)
     logger.info("✅ ホロメンDB更新完了")
 
@@ -1980,23 +2143,31 @@ def fetch_hololive_news():
         
         articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
         
-        with get_db_session() as session:
-            for art in articles[:10]:
-                a_tag = art.find('a')
-                if not a_tag: continue
-                
-                link = a_tag.get('href')
-                title_elem = art.find(['h3', 'p', 'dt'])
-                title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
-                
-                if title and link:
-                    if not session.query(HololiveNews).filter_by(url=link).first():
-                        session.add(HololiveNews(
-                            title=title,
-                            content=title,
-                            url=link,
-                            created_at=datetime.utcnow()
-                        ))
+        # ★ v33.17: 個別トランザクション化（1件失敗で全部消えるのを防ぐ）
+        for art in articles[:10]:
+            a_tag = art.find('a')
+            if not a_tag: continue
+            
+            link = a_tag.get('href')
+            title_elem = art.find(['h3', 'p', 'dt'])
+            title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
+            
+            if title and link:
+                try:
+                    with get_db_session() as session:
+                        if not session.query(HololiveNews).filter_by(url=link).first():
+                            _safe_add_with_retry(
+                                session,
+                                HololiveNews(
+                                    title=title,
+                                    content=title,
+                                    url=link,
+                                    created_at=datetime.utcnow()
+                                ),
+                                label=f"hololive_news({title[:20]})"
+                            )
+                except Exception as e:
+                    logger.warning(f"⚠️ ニュース1件スキップ: {e}")
         logger.info("✅ ニュースDB更新完了")
     except Exception as e:
         logger.error(f"News fetch failed: {e}")
@@ -2037,62 +2208,72 @@ def fetch_hololive_tsuushin_news():
 
         logger.info(f"📋 {len(unique_links)}件の記事リンクを検出")
 
-        with get_db_session() as session:
-            count = 0
-            for item in unique_links[:10]:
-                link = item['url']
-                title = item['title']
+        # ★ v33.17: 個別トランザクション化
+        count = 0
+        for item in unique_links[:10]:
+            link = item['url']
+            title = item['title']
 
-                # 既にDBにあればスキップ
-                if session.query(HololiveNews).filter_by(url=link).first():
-                    continue
-
-                # 各記事ページにアクセスして本文を取得
-                try:
-                    time.sleep(1.5)
-                    art_res = requests.get(
-                        link,
-                        headers={'User-Agent': random.choice(USER_AGENTS)},
-                        timeout=15
-                    )
-                    if art_res.status_code != 200:
+            # 既にDBにあればスキップ（個別セッションで確認）
+            try:
+                with get_db_session() as check_session:
+                    if check_session.query(HololiveNews).filter_by(url=link).first():
                         continue
+            except Exception:
+                continue
 
-                    art_soup = BeautifulSoup(art_res.content, 'html.parser')
-
-                    # 本文を取得
-                    body_elem = (
-                        art_soup.select_one('article .entry-content') or
-                        art_soup.select_one('article .post-content') or
-                        art_soup.select_one('.entry-content') or
-                        art_soup.select_one('.post-content') or
-                        art_soup.select_one('article')
-                    )
-
-                    if body_elem:
-                        # 不要な要素を除去
-                        for tag in body_elem.select('script, style, nav, .ad, .share, figure'):
-                            tag.decompose()
-                        content = clean_text(body_elem.get_text(separator='\n'))
-                        content = content[:800]
-                    else:
-                        content = title
-
-                    news_hash = hashlib.md5(link.encode()).hexdigest()
-
-                    session.add(HololiveNews(
-                        title=title,
-                        content=content,
-                        url=link,
-                        news_hash=news_hash,
-                        created_at=datetime.utcnow()
-                    ))
-                    count += 1
-                    logger.info(f"✅ 記事取得: {title[:30]}... ({len(content)}文字)")
-
-                except Exception as e:
-                    logger.warning(f"⚠️ 記事取得失敗 ({link}): {e}")
+            # 各記事ページにアクセスして本文を取得
+            try:
+                time.sleep(1.5)
+                art_res = requests.get(
+                    link,
+                    headers={'User-Agent': random.choice(USER_AGENTS)},
+                    timeout=15
+                )
+                if art_res.status_code != 200:
                     continue
+
+                art_soup = BeautifulSoup(art_res.content, 'html.parser')
+
+                # 本文を取得
+                body_elem = (
+                    art_soup.select_one('article .entry-content') or
+                    art_soup.select_one('article .post-content') or
+                    art_soup.select_one('.entry-content') or
+                    art_soup.select_one('.post-content') or
+                    art_soup.select_one('article')
+                )
+
+                if body_elem:
+                    # 不要な要素を除去
+                    for tag in body_elem.select('script, style, nav, .ad, .share, figure'):
+                        tag.decompose()
+                    content = clean_text(body_elem.get_text(separator='\n'))
+                    content = content[:800]
+                else:
+                    content = title
+
+                news_hash = hashlib.md5(link.encode()).hexdigest()
+
+                # 個別トランザクションで保存
+                with get_db_session() as session:
+                    if _safe_add_with_retry(
+                        session,
+                        HololiveNews(
+                            title=title,
+                            content=content,
+                            url=link,
+                            news_hash=news_hash,
+                            created_at=datetime.utcnow()
+                        ),
+                        label=f"tsuushin_news({title[:20]})"
+                    ):
+                        count += 1
+                        logger.info(f"✅ 記事取得: {title[:30]}... ({len(content)}文字)")
+
+            except Exception as e:
+                logger.warning(f"⚠️ 記事取得失敗 ({link}): {e}")
+                continue
 
         logger.info(f"✅ ホロライブ通信から {count} 件の新しいニュースを追加（本文付き）")
 
@@ -4786,7 +4967,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.15',
+        'version': 'v33.17',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -5052,7 +5233,12 @@ def chat_lsl():
                         ai_text = f"{nickname_input}ね！了解！これからそう呼ぶね😊💖 よろしく！"
                         is_task_started = False
 
-            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            # ★ v33.17: 会話履歴の追加を安全化（失敗してもクラッシュしない）
+            _safe_add_with_retry(
+                session,
+                ConversationHistory(user_uuid=user_uuid, role='user', content=message),
+                label="user_history"
+            )
 
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
            
@@ -5060,6 +5246,14 @@ def chat_lsl():
             # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
+
+            # ★ v33.17: DB先答え判定（外部検索を回避してDB蓄積データから即答）
+            # 「ホロライブのニュース」「ホロライブの最近の情報」などはDBに蓄積データがある
+            if not ai_text and is_db_answerable_news(message):
+                summary = get_hololive_news_summary()
+                if summary:
+                    ai_text = summary
+                    logger.info(f"📰 DB先答え: ホロライブニュース要約を返却")
 
             # ★ 追加: 専門サイト検索トピック検出
             # Blender / CGニュース / 脳科学のキーワードを検知し、
@@ -5081,16 +5275,25 @@ def chat_lsl():
                         'nickname': user_data.nickname,  # ★ 修正v33.8.1: nicknameを追加
                     }
                 }
-                session.add(BackgroundTask(
-                    task_id=tid,
-                    user_uuid=user_uuid,
-                    task_type='specialized_search',
-                    query=json.dumps(specialized_qdata, ensure_ascii=False)
-                ))
-                # ★ v33.16: 検索は search_executor に移動
-                search_executor.submit(background_specialized_search, tid, specialized_qdata)
-                ai_text = f"{detected_site['name']}の中を調べてくるじゃん！少し待ってて！"
-                is_task_started = True
+                # ★ v33.17: BackgroundTask追加を安全化
+                added = _safe_add_with_retry(
+                    session,
+                    BackgroundTask(
+                        task_id=tid,
+                        user_uuid=user_uuid,
+                        task_type='specialized_search',
+                        query=json.dumps(specialized_qdata, ensure_ascii=False)
+                    ),
+                    label="bg_task(specialized)"
+                )
+                if added:
+                    # ★ v33.16: 検索は search_executor に移動
+                    search_executor.submit(background_specialized_search, tid, specialized_qdata)
+                    ai_text = f"{detected_site['name']}の中を調べてくるじゃん！少し待ってて！"
+                    is_task_started = True
+                else:
+                    # DB登録失敗時のフォールバック: 通常会話AIに任せる
+                    logger.warning("⚠️ 専門検索タスク登録失敗 → 通常会話で応答")
 
             if not ai_text and is_explicit_search_request(message):
                 tid = f"search_{user_uuid}_{int(time.time())}"
@@ -5107,11 +5310,20 @@ def chat_lsl():
                         'nickname': user_data.nickname,  # ★ 修正v33.8.1: nicknameを追加
                     }
                 }
-                session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
-                # ★ v33.16: 検索は search_executor に移動
-                search_executor.submit(background_deep_search, tid, qdata)
-                ai_text = "オッケー！ちょっとググってくるから待ってて！"
-                is_task_started = True
+                # ★ v33.17: BackgroundTask追加を安全化
+                added = _safe_add_with_retry(
+                    session,
+                    BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)),
+                    label="bg_task(search)"
+                )
+                if added:
+                    # ★ v33.16: 検索は search_executor に移動
+                    search_executor.submit(background_deep_search, tid, qdata)
+                    ai_text = "オッケー！ちょっとググってくるから待ってて！"
+                    is_task_started = True
+                else:
+                    # DB登録失敗時のフォールバック: 通常会話AIに任せる
+                    logger.warning("⚠️ 検索タスク登録失敗 → 通常会話で応答")
 
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
@@ -5130,7 +5342,12 @@ def chat_lsl():
                 ai_text = _generate_with_timeout(user_data, message, history, session, user_uuid)
             
             if not is_task_started:
-                session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+                # ★ v33.17: assistant履歴も安全化（失敗してもクラッシュしない）
+                _safe_add_with_retry(
+                    session,
+                    ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text),
+                    label="assistant_history"
+                )
 
         # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
         res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text))
@@ -5149,10 +5366,24 @@ def chat_lsl():
             logger.error(f"⚠️ DB シーケンス破損検出 → 自動修復実行")
             try:
                 fix_postgres_sequences(quiet=True)
-                logger.info("✅ シーケンス自動修復完了。次回リクエストで復活見込み")
+                logger.info("✅ シーケンス自動修復完了。DB回復後にフォールバック応答を試みます")
             except Exception as fix_err:
                 logger.error(f"❌ シーケンス修復失敗: {fix_err}")
-            # ユーザーには優しいメッセージを返す
+                return Response("ごめん、ちょっとサーバーが調子悪いみたい…もう一度話しかけてみて！|", mimetype='text/plain; charset=utf-8', status=200)
+            # ★ v33.16b: 修復後にDBなしでAI応答だけ試みる（ユーザーを待たせない）
+            try:
+                _msg = sanitize_user_input(data.get('message', '')) if data else ''
+                _name = sanitize_user_input(data.get('name', 'Guest')) if data else 'Guest'
+                _uuid = sanitize_user_input(data.get('uuid', '')) if data else ''
+                if _msg and (_uuid or _name):
+                    _fallback_ud = UserData(uuid=_uuid, name=_name, interaction_count=1, is_friend=False)
+                    _fallback_resp = call_groq(
+                        f"あなたはもちこというギャルAIです。一人称はあてぃし。短く150文字以内で返してください。",
+                        _msg, [], 300, task_type='chat'
+                    ) or "ちょっとサーバー側でゴタゴタあったじゃん…もう一回話しかけてみて！"
+                    return Response(f"{limit_text_for_sl(sanitize_response_for_sl(_fallback_resp))}|", mimetype='text/plain; charset=utf-8', status=200)
+            except Exception as _fallback_err:
+                logger.error(f"フォールバック応答失敗: {_fallback_err}")
             return Response("ごめん、ちょっとサーバーが調子悪いみたい…もう一度話しかけてみて！|", mimetype='text/plain; charset=utf-8', status=200)
         
         logger.critical(f"🔥 エラー: {e}", exc_info=True)
@@ -5166,16 +5397,25 @@ def check_task_endpoint():
             return create_json_response({'error': 'uuid required'}, 400)
         with get_db_session() as session:
             # ★ 修正: 10分以内に完了したタスクのみ返す（古タスク誤配信防止）
+            # ★ v33.17: proactive_message は chat_lsl 側で取り出すので check_task では除外
             ten_min_ago = datetime.utcnow() - timedelta(minutes=10)
             task = session.query(BackgroundTask).filter(
                 BackgroundTask.user_uuid == data['uuid'],
                 BackgroundTask.status == 'completed',
+                BackgroundTask.task_type.in_(['search', 'specialized_search', 'timeout_recovery']),
                 BackgroundTask.completed_at >= ten_min_ago
             ).order_by(BackgroundTask.completed_at.desc()).first()
             if task:
                 res = task.result or ""
-                session.delete(task)
-                session.add(ConversationHistory(user_uuid=data['uuid'], role='assistant', content=res))
+                try:
+                    session.delete(task)
+                    session.add(ConversationHistory(user_uuid=data['uuid'], role='assistant', content=res))
+                except Exception as _ct_err:
+                    logger.warning(f"⚠️ check_task DB操作スキップ: {_ct_err}")
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
                 # ★ 修正v33.8.1: sanitize_response_for_sl を追加（パイプ混入でLSL分割が壊れる問題を防ぐ）
                 safe_res = limit_text_for_sl(sanitize_response_for_sl(res))
                 return create_json_response({'status': 'completed', 'response': f"{safe_res}|"})
@@ -5992,7 +6232,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.15 完全会話優先版)")
+    logger.info("🚀 初期化完了! (v33.17 クラッシュ耐性版)")
 
 initialize_app()
 
