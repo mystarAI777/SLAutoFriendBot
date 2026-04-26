@@ -195,7 +195,7 @@ jobs:
           fi
 
           # /health で最終確認
-          HEALTH=$(curl -s --max-time 8 "$RENDER_APP_URL/health" 2>/dev/null || echo "{}")
+          HEALTH=$(curl -s --max-time 8 "$RENDER_APP_URL/health/detail" 2>/dev/null || echo "{}")
           python3 -c "
           import json
           try:
