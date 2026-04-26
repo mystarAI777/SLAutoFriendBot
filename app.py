@@ -313,7 +313,16 @@ _all_groq_models = list(dict.fromkeys(
     ]
 ))
 groq_model_manager = GroqModelManager(_all_groq_models)
-background_executor = ThreadPoolExecutor(max_workers=5)
+
+# ★ v33.15: スレッドプールを「会話・音声用」と「バックタスク用」に分離
+# 理由: max_workers=5 だと会話タスクとバックタスクが同じプールで奪い合いになり、
+#       バックタスクが詰まると会話の音声生成も遅延する。
+#
+# - background_executor: 会話関連の即時処理用（音声生成・検索開始など）
+# - task_executor:        バックグラウンドの重いタスク用（情報収集・分析など）
+background_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix='chat')
+task_executor       = ThreadPoolExecutor(max_workers=2, thread_name_prefix='task')
+
 groq_client: Optional[Groq] = None
 gemini_model, engine, Session = None, None, None
 
@@ -373,6 +382,168 @@ NEVER_SKIP_TASKS = {
     'cleanup_voices',          # ローカルファイル削除のみ
     'cleanup_rate_limiter',    # メモリ操作のみ
 }
+
+
+# ==============================================================================
+# ★ v33.15: 会話中の遅延タスクキュー
+# ==============================================================================
+# /chat_lsl 内で発生するGemini消費の重いタスクを、会話中は実行せずに
+# キューに溜めておき、アイドル時に間隔を空けて1個ずつ処理する。
+#
+# 対象タスク:
+#   - analyze_user_psychology       (Gemini: 性格分析)
+#   - auto_update_friend_profile    (Gemini: 友達プロフィール更新)
+#   - generate_proactive_friend_message (Gemini: 話題振り生成)
+#   - get_anime_info_from_cache_or_search (Web検索)
+#
+# 設計:
+#   - 同じ user_uuid + task_type は重複登録しない（最新の値で上書き）
+#   - キューはメモリ内（再起動で消える）
+#   - アイドルスケジューラが30秒ごとにキューを見る
+#   - 処理間隔は5秒（Gemini Rate Limit 15RPM=4秒に1回 を超えない）
+# ==============================================================================
+
+class DeferredTaskQueue:
+    """会話中に発生したGemini消費タスクを保留するキュー"""
+
+    DEFERRED_TASK_INTERVAL = 5.0  # タスク処理間隔（秒）
+
+    def __init__(self):
+        self._queue: List[Dict] = []
+        self._lock = Lock()
+        self._processing = False
+
+    def add(self, task_type: str, user_uuid: str, user_name: str, **kwargs):
+        """
+        タスクを追加。同じ user_uuid + task_type は上書きされる
+        （古いタスクの更新を待つより最新の状態で1回処理する方が効率的）
+        """
+        with self._lock:
+            # 既存の同じタスクを削除（最新だけ残す）
+            self._queue = [
+                t for t in self._queue
+                if not (t['type'] == task_type and t['user_uuid'] == user_uuid)
+            ]
+            self._queue.append({
+                'type': task_type,
+                'user_uuid': user_uuid,
+                'user_name': user_name,
+                'queued_at': datetime.utcnow(),
+                'extra': kwargs,
+            })
+            logger.info(f"📥 遅延タスク追加: {task_type} for {user_name} (キュー残: {len(self._queue)})")
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+    def pop_one(self) -> Optional[Dict]:
+        with self._lock:
+            if self._queue:
+                return self._queue.pop(0)
+            return None
+
+    def get_status(self) -> List[Dict]:
+        """管理画面表示用"""
+        with self._lock:
+            return [
+                {
+                    'type': t['type'],
+                    'user_name': t['user_name'],
+                    'queued_at': t['queued_at'].isoformat(),
+                    'waited_seconds': int((datetime.utcnow() - t['queued_at']).total_seconds()),
+                }
+                for t in self._queue
+            ]
+
+
+deferred_queue = DeferredTaskQueue()
+
+
+def process_deferred_task(task: Dict):
+    """1個の遅延タスクを処理する。例外は握りつぶしてキュー処理を止めない"""
+    try:
+        task_type = task['type']
+        user_uuid = task['user_uuid']
+        user_name = task['user_name']
+        extra = task.get('extra', {})
+
+        logger.info(f"💤 アイドル時タスク実行: {task_type} for {user_name}")
+
+        if task_type == 'analyze_psychology':
+            with get_db_session() as session:
+                analyze_user_psychology(session, user_uuid, user_name)
+
+        elif task_type == 'update_friend_profile':
+            with get_db_session() as session:
+                auto_update_friend_profile(session, user_uuid, user_name)
+
+        elif task_type == 'proactive_message':
+            # 次回会話時に使えるよう、話題振りメッセージを生成して
+            # background_tasks テーブルに保存しておく
+            # （chat_lsl で見つけたら冒頭で使う）
+            with get_db_session() as session:
+                user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
+                if user:
+                    user_data = UserData(
+                        uuid=user.user_uuid,
+                        name=user.user_name,
+                        interaction_count=user.interaction_count,
+                        is_friend=getattr(user, 'is_friend', False),
+                        nickname=getattr(user, 'nickname', None),
+                    )
+                    suggestion = generate_proactive_friend_message(user_data, session)
+                    if suggestion:
+                        # 次の chat_lsl で拾えるよう、背景タスクとして保存
+                        tid = f"proactive_{user_uuid}_{int(time.time())}"
+                        session.add(BackgroundTask(
+                            task_id=tid,
+                            user_uuid=user_uuid,
+                            task_type='proactive_message',
+                            query='',
+                            result=suggestion,
+                            status='completed',
+                            completed_at=datetime.utcnow(),
+                        ))
+                        logger.info(f"📨 話題振り保存: {suggestion[:40]}...")
+
+        elif task_type == 'fetch_anime':
+            title = extra.get('title', '')
+            if title:
+                get_anime_info_from_cache_or_search(title)
+
+        else:
+            logger.warning(f"⚠️ 未知の遅延タスクタイプ: {task_type}")
+
+    except Exception as e:
+        logger.error(f"遅延タスク処理エラー ({task.get('type','?')}): {e}")
+
+
+def process_deferred_queue_loop():
+    """
+    アイドル時に遅延タスクを1つずつ処理するループ。
+    別スレッドで常駐する。
+    """
+    logger.info("📨 遅延タスク処理ループ起動")
+    while True:
+        try:
+            time.sleep(DeferredTaskQueue.DEFERRED_TASK_INTERVAL)
+
+            # 会話中はスキップ
+            if not conversation_activity.is_idle():
+                continue
+
+            # キューが空ならスキップ
+            task = deferred_queue.pop_one()
+            if not task:
+                continue
+
+            # 処理（さらに会話が来ても次回ループで止まる）
+            process_deferred_task(task)
+
+        except Exception as e:
+            logger.error(f"遅延タスクループエラー: {e}")
+            time.sleep(10)
 
 
 # Gemini File API用の知識ドキュメントパス（MochikoKnowledgeFileクラスで使用）
@@ -2855,9 +3026,10 @@ def build_anime_context(message: str) -> str:
             if cached_info:
                 context_parts.append(f"【アニメ情報: {title}】\n{cached_info}")
             else:
-                # キャッシュMISS → バックグラウンドで取得予約 (今回は使わない)
-                background_executor.submit(get_anime_info_from_cache_or_search, title)
-                logger.info(f"🎬 アニメ情報をバックグラウンドで取得予約: {title}")
+                # ★ v33.15: 会話中はGemini/検索を消費したくないので遅延キューへ
+                # (アイドル時に Web検索→キャッシュ保存 → 次回のアニメ言及で使える)
+                deferred_queue.add('fetch_anime', user_uuid='_system_', user_name='system', title=title)
+                logger.info(f"🎬 アニメ情報を遅延キューに登録: {title}")
         except Exception as e:
             logger.error(f"アニメコンテキスト構築エラー ({title}): {e}")
 
@@ -3056,7 +3228,8 @@ def run_managed_task(task_name: str, func, *args, **kwargs):
             error_msg = traceback.format_exc()
             record_task_run(task_name, success=False, error_msg=str(e))
             logger.error(f"❌ タスク失敗 ({task_name}): {e}")
-    background_executor.submit(_wrapper)
+    # ★ v33.15: バックタスクは task_executor を使う（会話用プールを邪魔しない）
+    task_executor.submit(_wrapper)
 
 
 def get_task_last_run(task_name: str) -> Optional[datetime]:
@@ -4592,7 +4765,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.14',
+        'version': 'v33.15',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -4600,6 +4773,7 @@ def health_check_detail():
         'holomem_count': holomem_manager.get_member_count(),
         'is_idle': conversation_activity.is_idle(),
         'seconds_since_last_chat': conversation_activity.seconds_since_last_chat() if conversation_activity.seconds_since_last_chat() != float('inf') else None,
+        'deferred_queue_size': deferred_queue.size(),
     })
 
 def check_wake_auth() -> bool:
@@ -4649,7 +4823,7 @@ def wake_endpoint():
     logger.info(f"🔔 /wake 受信 from: {caller}")
 
     # スリープ中に漏れたタスクをバックグラウンドで補完
-    background_executor.submit(catch_up_all_tasks)
+    task_executor.submit(catch_up_all_tasks)
 
     # タスクの状態サマリーを返す
     task_status = {}
@@ -4682,6 +4856,8 @@ def admin_idle_status():
         'seconds_since_last_chat': seconds if seconds != float('inf') else None,
         'idle_threshold_seconds': CONVERSATION_IDLE_THRESHOLD,
         'never_skip_tasks': sorted(NEVER_SKIP_TASKS),
+        'deferred_queue_size': deferred_queue.size(),
+        'deferred_queue': deferred_queue.get_status(),
         'note': 'is_idle=True ならバックタスクが実行可能、Falseなら会話中扱いでスキップ',
     })
 
@@ -4778,7 +4954,7 @@ def chat_lsl():
 
         if message.strip() == "スケジュール実施":
             # 全タスクのキャッチアップを実行
-            background_executor.submit(catch_up_all_tasks)
+            task_executor.submit(catch_up_all_tasks)
             return Response("了解！全バックグラウンドタスクのキャッチアップを開始したよ！終わるまでちょっと待っててね。|", 200)
         
         if not chat_rate_limiter.is_allowed(user_uuid):
@@ -4797,13 +4973,16 @@ def chat_lsl():
             history = get_conversation_history(session, user_uuid)
 
             # ★ v33.4.0: 毎回のメッセージから興味キーワードを抽出・蓄積
+            # （これは Gemini 不使用・DB操作のみで軽いので同期実行）
             extract_and_save_interests(session, user_uuid, message)
 
-            # 心理分析 (一定間隔)
+            # ★ v33.15: 心理分析は会話中に走らせない（Gemini消費が大きい）
+            # → 遅延キューに積んで、アイドル時に処理
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0 and user_data.interaction_count >= MIN_MESSAGES_FOR_ANALYSIS:
-                background_executor.submit(analyze_user_psychology, Session(), user_uuid, user_name)
+                deferred_queue.add('analyze_psychology', user_uuid, user_name)
             
             # トピック分析 (一定間隔)
+            # （これは DB集計のみで Gemini 不使用なので同期実行）
             if user_data.interaction_count % ANALYSIS_INTERVAL == 0:
                 topics = analyze_user_topics(session, user_uuid)
                 if topics:
@@ -4811,17 +4990,28 @@ def chat_lsl():
                     if psych:
                         psych.favorite_topics = ','.join(topics)
 
-            # ★ v33.4.0: 友達プロフィール自動更新 (10回ごと)
+            # ★ v33.15: 友達プロフィール自動更新も会話中に走らせない（Gemini消費大）
             if user_data.is_friend and user_data.interaction_count % 10 == 0:
-                background_executor.submit(
-                    auto_update_friend_profile, Session(), user_uuid, user_name
-                )
+                deferred_queue.add('update_friend_profile', user_uuid, user_name)
 
-            # 話題提案 (一定間隔) — 友達なら能動的な話題振り
+            # ★ v33.15: 話題提案も遅延キューへ
+            # ただし、過去のアイドル時に生成した「話題振りメッセージ」が
+            # background_tasks テーブルに残っていれば、それを今すぐ使う
             if user_data.interaction_count > 0 and user_data.interaction_count % TOPIC_SUGGESTION_INTERVAL == 0:
-                suggestion = generate_proactive_friend_message(user_data, session)
-                if suggestion:
-                    ai_text = suggestion
+                # 既に生成済みの話題振りがあるか探す
+                existing = session.query(BackgroundTask).filter_by(
+                    user_uuid=user_uuid,
+                    task_type='proactive_message',
+                    status='completed'
+                ).order_by(BackgroundTask.completed_at.desc()).first()
+
+                if existing and existing.result:
+                    ai_text = existing.result
+                    session.delete(existing)  # 使い切ったら削除
+                    logger.info(f"📨 保存済み話題振りを使用: {ai_text[:40]}...")
+
+                # 次回用に新しい話題振りを生成予約（遅延キュー）
+                deferred_queue.add('proactive_message', user_uuid, user_name)
             
             # ★ 追加: ニックネーム確認フロー
             # 初回ユーザー または nickname_asked 状態を処理
@@ -5060,7 +5250,7 @@ def update_holomem(id: int):
 
 @app.route('/admin/holomem/refresh', methods=['POST'])
 def refresh_holomem():
-    background_executor.submit(update_holomem_database)
+    task_executor.submit(update_holomem_database)
     return create_json_response({'message': 'DB更新タスク開始'})
 
 @app.route('/admin/psychology/<user_uuid>', methods=['GET'])
@@ -5720,7 +5910,7 @@ def initialize_app():
         logger.info(f"✅ ホロメン: {holomem_manager.get_member_count()}名ロード")
     if holomem_manager.get_member_count() == 0:
         logger.info("📡 DBが空のため初回収集実行")
-        background_executor.submit(update_holomem_database)
+        task_executor.submit(update_holomem_database)
     
     # ★ v33.5.0: タスク関数マップを登録 (catch_up_all_tasks が参照する)
     # ※ 旧来の無条件即時実行 (fetch_hololive_news等) は廃止し、
@@ -5772,10 +5962,14 @@ def initialize_app():
     # スケジューラスレッド起動 (アイドル検出ループ)
     threading.Thread(target=run_scheduler, daemon=True).start()
 
+    # ★ v33.15: 遅延タスク処理ループ（会話中に積まれたタスクをアイドル時に処理）
+    threading.Thread(target=process_deferred_queue_loop, daemon=True).start()
+    logger.info("📨 遅延タスク処理ループ起動")
+
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.13 会話優先スケジューラ版)")
+    logger.info("🚀 初期化完了! (v33.15 完全会話優先版)")
 
 initialize_app()
 
