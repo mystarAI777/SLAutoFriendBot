@@ -322,6 +322,9 @@ groq_model_manager = GroqModelManager(_all_groq_models)
 # - task_executor:        バックグラウンドの重いタスク用（情報収集・分析など）
 background_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix='chat')
 task_executor       = ThreadPoolExecutor(max_workers=2, thread_name_prefix='task')
+# ★ v33.16: 検索専用プール (background_executor との競合を解消)
+# Web検索・専門サイト検索はここで実行し、音声生成・AI応答と分離する
+search_executor     = ThreadPoolExecutor(max_workers=3, thread_name_prefix='search')
 
 groq_client: Optional[Groq] = None
 gemini_model, engine, Session = None, None, None
@@ -3826,8 +3829,8 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
     
     try:
         full_prompt = f"{system_prompt}\n\n【会話履歴】\n"
-        # ★ 会話履歴を直近5件→30件に拡張（Gemini 2.5 Flashの100万トークンを活用）
-        for h in history[-30:]:
+        # ★ v33.16: 会話履歴を10件に削減（30件はGemini 15RPM上限を圧迫するため）
+        for h in history[-10:]:
             full_prompt += f"{'ユーザー' if h['role'] == 'user' else 'もちこ'}: {h['content']}\n"
         full_prompt += f"\nユーザー: {message}\nもちこ:"
 
@@ -3921,16 +3924,17 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
         holo_keywords = ['ニュース', '情報', 'ホロライブ', 'ホロメン', '配信', 'どう', '最近', 'なんか', 'って']
         if any(kw in message for kw in holo_keywords):
             with get_db_session() as session_news:
-                latest_news = session_news.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
+                # ★ v33.16: 3件+80文字に削減（コンテキスト肥大化防止）
+                latest_news = session_news.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(3).all()
                 if latest_news:
                     news_lines = []
                     for n in latest_news:
-                        body_preview = n.content[:150] if n.content and n.content != n.title else ""
+                        body_preview = n.content[:80] if n.content and n.content != n.title else ""
                         if body_preview:
-                            news_lines.append(f"【{n.title}】\n{body_preview}")
+                            news_lines.append(f"【{n.title}】{body_preview}")
                         else:
                             news_lines.append(f"【{n.title}】")
-                    news_text = "\n\n".join(news_lines)
+                    news_text = "\n".join(news_lines)
                     internal_context += f"\n\n【ホロライブ最新ニュース】\n{news_text}"
     except Exception as e:
         logger.error(f"News injection error: {e}")
@@ -4046,6 +4050,10 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Specialized news context injection error: {e}")
 
+
+    # ★ v33.16: コンテキスト総量を2500文字に制限（Gemini タイムアウト・RPM超過防止）
+    if len(internal_context) > 2500:
+        internal_context = internal_context[:2500] + "\n…(コンテキスト省略)"
 
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
@@ -4467,7 +4475,20 @@ def background_deep_search(task_id: str, query_data: Dict):
             )
             with get_db_session() as session:
                 history = get_conversation_history(session, user_data.uuid)
-            result_text = generate_ai_response_safe(user_data, query, history, reference_info=reference_info, is_detailed=True, is_task_report=True)
+            # ★ v33.16: AI生成を試みる。失敗しても生の検索結果を直接フォーマットして返す
+            ai_result = generate_ai_response_safe(user_data, query, history, reference_info=reference_info, is_detailed=True, is_task_report=True)
+            if ai_result and "うーん" not in ai_result and "エラー" not in ai_result:
+                result_text = ai_result
+            else:
+                # AI失敗フォールバック: 生の検索結果を直接整形して返す
+                _display = user_data_dict.get('nickname') or user_data_dict.get('name', '')
+                lines = [f"おまたせ！「{query}」について調べたじゃん！\n"]
+                for i, r in enumerate(results[:3], 1):
+                    lines.append(f"{i}. {r['title']}")
+                    if r.get('snippet'):
+                        lines.append(f"   {r['snippet'][:100]}")
+                result_text = "\n".join(lines)
+                logger.info(f"📋 AI生成失敗→生結果フォールバック: {query[:30]}")
     except Exception as e:
         logger.error(f"❌ 検索エラー: {e}")
     
@@ -5066,7 +5087,8 @@ def chat_lsl():
                     task_type='specialized_search',
                     query=json.dumps(specialized_qdata, ensure_ascii=False)
                 ))
-                background_executor.submit(background_specialized_search, tid, specialized_qdata)
+                # ★ v33.16: 検索は search_executor に移動
+                search_executor.submit(background_specialized_search, tid, specialized_qdata)
                 ai_text = f"{detected_site['name']}の中を調べてくるじゃん！少し待ってて！"
                 is_task_started = True
 
@@ -5086,7 +5108,8 @@ def chat_lsl():
                     }
                 }
                 session.add(BackgroundTask(task_id=tid, user_uuid=user_uuid, task_type='search', query=json.dumps(qdata, ensure_ascii=False)))
-                background_executor.submit(background_deep_search, tid, qdata)
+                # ★ v33.16: 検索は search_executor に移動
+                search_executor.submit(background_deep_search, tid, qdata)
                 ai_text = "オッケー！ちょっとググってくるから待ってて！"
                 is_task_started = True
 
