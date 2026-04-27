@@ -4299,7 +4299,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 280}  # v33.19: 400 → 280 (120-160文字応答に最適化)
+            generation_config={"temperature": 0.8, "max_output_tokens": 500}  # v33.20.1: 280→500 日本語160文字を安全に収める
         )
         
         if hasattr(response, 'candidates') and response.candidates:
