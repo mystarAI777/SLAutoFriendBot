@@ -109,7 +109,7 @@ os.makedirs(VOICE_DIR, exist_ok=True)
 
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
-SL_SAFE_CHAR_LIMIT = 600
+SL_SAFE_CHAR_LIMIT = 500  # v33.19: 600 → 500 (応答文字数削減に合わせて引き締め)
 MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
@@ -1215,16 +1215,10 @@ def get_japan_time() -> str:
     return f"今の日本の時間は、{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 
 def is_time_request(msg: str) -> bool:
-    return any(kw in msg for kw in [
-        '今何時', '時刻', '何時', 'なんじ',
-        '今の時間', '現在の時刻', '時間教えて', '何時ですか',
-    ])
+    return any(kw in msg for kw in ['今何時', '時刻', '何時', 'なんじ'])
 
 def is_weather_request(msg: str) -> bool:
-    return any(kw in msg for kw in [
-        '今日の天気', '明日の天気', '天気予報', '天気は',
-        '天気教えて', '天気どう', 'の天気', '雨降る', '傘いる',
-    ])
+    return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
 
 def is_explicit_search_request(msg: str) -> bool:
     msg = msg.strip()
@@ -4147,7 +4141,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 800}  # v33.20: 400 → 800 (300-400文字応答に最適化)
+            generation_config={"temperature": 0.8, "max_output_tokens": 280}  # v33.19: 400 → 280 (120-160文字応答に最適化)
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -4486,7 +4480,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 8. **【アニメ情報】がある場合、それを使ってアニメの話を盛り上げてください。知らなかった作品でも、検索して得た情報から「あー、それ知ってる！〇〇なやつでしょ？」と自然に反応してください。**
 
 # 【出力のルール（超重要）】
-1. 1回の回答は「**300〜400文字程度**」を目安にしてください。必ず文章を最後まで完結させてください。
+1. 1回の回答は「**120〜160文字程度**」に厳密に収めてください（200字超はNG、長すぎると会話が止まります）。
 2. **1メッセージに1トピックまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
 3. **相手に2つ以上の質問を同時にしない**。質問するなら1個だけ。
 4. 絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調は維持してください。
@@ -4509,7 +4503,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 {reference_info if reference_info else '（なし）'}
 """
     if is_task_report:
-        system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。ユーザーへの報告として、【外部検索結果】の内容を分かりやすく要約して伝えてください。文字数は600文字以内に収めてください。"
+        system_prompt += "\n\n# 指示:\nこれは検索結果の報告です。ユーザーへの報告として、【外部検索結果】の内容を分かりやすく要約して伝えてください。文字数は420文字以内に収めてください。"
 
     # ★ 会話履歴からもフルネームを除去（AIが過去発言を真似してフルネーム呼ばないように）
     if _name_replace_map:
@@ -4528,9 +4522,9 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     response = call_gemini(system_prompt, normalized_message, history_for_ai)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
-        # ★ v33.12: 通常会話は 400 tokens に絞る（150-200文字応答）
+        # ★ v33.19: 通常会話は 280 tokens (120-160文字)、検索レポートは 560 tokens (420文字)
         _task_type = 'search' if is_task_report else 'chat'
-        _max_tokens = 800 if is_task_report else 800  # v33.20: 通常会話も800に統一
+        _max_tokens = 560 if is_task_report else 280  # 検索レポートは長め、通常は短め
         response = call_groq(system_prompt, normalized_message, history_for_ai, _max_tokens, task_type=_task_type)
     
     if not response:
@@ -4873,8 +4867,8 @@ def _split_phrases(text: str) -> List[str]:
     - 1回あたりのVOICEVOX API呼び出しは増えるが
       同時並列生成数が減るので全体スループット向上
     """
-    MIN_CHARS = 40   # v33.20: 30 → 40 (短すぎるフレーズを減らす)
-    MAX_CHARS = 120  # v33.20: 90 → 120 (300-400文字応答に合わせて拡大)
+    MIN_CHARS = 30
+    MAX_CHARS = 90
 
     # Step1: 強区切りのみで分割（読点では分割しない）
     raw_parts = re.split(r'([。！？\n])', text)
@@ -5124,7 +5118,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.20',
+        'version': 'v33.19',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -5438,21 +5432,12 @@ def chat_lsl():
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
            
             # ★ v33.7.0: SL発言なら最新SL情報をバックグラウンドでリフレッシュ予約
+            # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
 
-            # ★ v33.20: 時刻・天気は外部検索より先に判定（処理順修正）
-            # 「今日の天気は？」が is_explicit_search_request に引っかかって
-            # 外部検索に飛んでしまう問題を修正
-            if not ai_text:
-                if is_time_request(message):
-                    ai_text = get_japan_time()
-                    logger.info(f"🕐 時刻リクエスト → 即答")
-                elif is_weather_request(message):
-                    ai_text = get_weather_forecast(extract_location(message))
-                    logger.info(f"🌤 天気リクエスト → 気象API")
-
-            # ★ v33.17: DB先答え判定
+            # ★ v33.17: DB先答え判定（外部検索を回避してDB蓄積データから即答）
+            # 「ホロライブのニュース」「ホロライブの最近の情報」などはDBに蓄積データがある
             if not ai_text and is_db_answerable_news(message):
                 summary = get_hololive_news_summary()
                 if summary:
@@ -5534,6 +5519,12 @@ def chat_lsl():
                 if holomem_resp:
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
+            
+            if not ai_text:
+                if is_time_request(message):
+                    ai_text = get_japan_time()
+                elif is_weather_request(message):
+                    ai_text = get_weather_forecast(extract_location(message))
             
             # ★ v33.4.0: session を渡して友達記憶を活用
             if not ai_text:
@@ -6442,7 +6433,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.20 応答文字数2倍版)")
+    logger.info("🚀 初期化完了! (v33.19 ニュース内容検証版)")
 
 initialize_app()
 
