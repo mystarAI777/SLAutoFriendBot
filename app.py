@@ -345,6 +345,81 @@ gemini_model, engine, Session = None, None, None
 # - ユーザー要求のWEB検索 (background_deep_search, background_specialized_search)
 # ==============================================================================
 
+# ==============================================================================
+# ★ v33.20: 時間帯ベースのタスク実行ポリシー
+# ==============================================================================
+# ユーザーは主に夜にチャットするので、裏作業が会話と競合しないように
+# 時間帯（JST）で実行を許可する。
+#
+# - 'anytime'    : いつでも実行OK（軽量タスク・配信スケジュール）
+# - 'noon'       : 昼15時台（15:00-15:59 JST）のみ実行
+# - 'midnight'   : 深夜3時台（03:00-03:59 JST）のみ実行
+#
+# 1時間の窓を持たせることで、GitHub Actionsの起動タイミングが多少ズレても
+# その日のうちに必ず1回は実行される。
+# ==============================================================================
+
+# JSTで「裏作業を回しても良い時間帯」
+NOON_WINDOW_START_HOUR = 15      # 15:00 JST
+NOON_WINDOW_END_HOUR = 16        # 15:59 JST まで（< 16）
+MIDNIGHT_WINDOW_START_HOUR = 3   # 03:00 JST
+MIDNIGHT_WINDOW_END_HOUR = 4     # 03:59 JST まで（< 4）
+
+# タスク名 → 実行ポリシー
+# 'anytime' = いつでもOK / 'noon' = 昼15時台 / 'midnight' = 深夜3時台
+TASK_TIME_POLICY: Dict[str, str] = {
+    # ── 即応必須・軽量 ──────────────────────────
+    'cleanup_voices':          'anytime',   # ローカルファイル削除のみ
+    'cleanup_rate_limiter':    'anytime',   # メモリ操作のみ
+    'fetch_schedule':          'anytime',   # 15分ごと、配信中の正確性に必須
+    # ── 昼間（15時台） ─────────────────────────
+    'fetch_news':              'noon',      # ニュース取得 + ゴミ削除
+    'fetch_sl_news':           'noon',      # SL情報収集
+    'update_sns':              'noon',      # ホロメンSNS更新
+    'update_holomem':          'noon',      # ホロメンWiki更新
+    'fetch_lingo':             'noon',      # ファン用語辞書
+    'fetch_episodes':          'noon',      # ホロメンエピソード
+    # ── 深夜（3時台）・Gemini大量消費 ───────────
+    'process_streams':         'midnight',  # 配信感想生成
+    'summarize_feelings':      'midnight',  # 想い要約
+    'update_knowledge':        'midnight',  # 知識ベース生成
+    'cleanup_streams':         'midnight',  # DB整理
+    'cleanup_interests':       'midnight',
+    'cleanup_anime_cache':     'midnight',
+    'cleanup_specialized_news':'midnight',
+}
+
+
+def is_allowed_time_for_task(task_name: str) -> tuple:
+    """
+    今がそのタスクを実行してよい時間帯か判定する。
+
+    返り値: (allowed: bool, reason: str)
+        allowed=True なら実行OK、False ならスキップ
+        reason は判定理由（ログ用）
+    """
+    policy = TASK_TIME_POLICY.get(task_name, 'anytime')
+    if policy == 'anytime':
+        return True, 'anytime'
+
+    # JST 現在時刻
+    jst_now = datetime.utcnow() + timedelta(hours=9)
+    hour = jst_now.hour
+
+    if policy == 'noon':
+        if NOON_WINDOW_START_HOUR <= hour < NOON_WINDOW_END_HOUR:
+            return True, f'noon窓内(JST {hour}時)'
+        return False, f'noon窓外(JST {hour}時, 許可: {NOON_WINDOW_START_HOUR}-{NOON_WINDOW_END_HOUR-1}時)'
+
+    if policy == 'midnight':
+        if MIDNIGHT_WINDOW_START_HOUR <= hour < MIDNIGHT_WINDOW_END_HOUR:
+            return True, f'midnight窓内(JST {hour}時)'
+        return False, f'midnight窓外(JST {hour}時, 許可: {MIDNIGHT_WINDOW_START_HOUR}-{MIDNIGHT_WINDOW_END_HOUR-1}時)'
+
+    # 未知のポリシーは安全側に倒して anytime 扱い
+    return True, f'unknown policy={policy}'
+
+
 CONVERSATION_IDLE_THRESHOLD = 120  # 秒。最後の会話からこの時間経過したらアイドル扱い
 
 
@@ -2161,6 +2236,16 @@ NEWS_NOISE_PATTERNS = [
     r'^まとめ$',
     r'カテゴリ別',
     r'タグ一覧',
+    # ★ v33.20: 「【まとめ】」系プレフィックスを徹底除外
+    r'^【まとめ】',           # 【まとめ】で始まるタイトル全般
+    r'^\[まとめ\]',         # [まとめ] 半角バージョン
+    r'^＜まとめ＞',           # ＜まとめ＞ パターン
+    r'^<まとめ>',             # <まとめ> 半角山かっこ
+    r'まとめ｜毎日更新',      # 「ホロライブまとめ｜毎日更新」完全一致系
+    r'まとめ\|毎日更新',     # 半角パイプ版
+    r'^ホロライブ速報$',      # トップページタイトル系
+    r'最新記事一覧',
+    r'人気記事ランキング',
 ]
 
 # ニュース価値のあるキーワード（含まれていれば短文でも採用）
@@ -2223,6 +2308,60 @@ def is_valid_news(title: str, content: str) -> tuple:
         return False, "本文短く価値キーワード無し"
     
     return True, "OK"
+
+
+def cleanup_garbage_news():
+    """
+    ★ v33.20: 既存DBから【まとめ】系・ノイズタイトルを一括削除する。
+
+    is_valid_news() の検証ロジックを既存の HololiveNews レコードに対して適用し、
+    弾かれたものを削除する。
+    ニュース取得タスク時に毎回呼ばれる。
+
+    削除条件:
+    - NEWS_NOISE_PATTERNS のいずれかにマッチ
+    - 本文と全く同じタイトル & 価値キーワード無し（中身のないリンクだけのもの）
+    """
+    deleted = 0
+    rejected_samples = []
+    try:
+        with get_db_session() as session:
+            all_news = session.query(HololiveNews).all()
+            for news in all_news:
+                title = (news.title or '').strip()
+                content = (news.content or '').strip()
+
+                # ノイズパターンに該当するか
+                is_noise = False
+                matched_pattern = ""
+                for pattern in NEWS_NOISE_PATTERNS:
+                    if re.search(pattern, title, re.IGNORECASE):
+                        is_noise = True
+                        matched_pattern = pattern
+                        break
+
+                # ノイズでなくても「本文=タイトルかつ価値キーワード無し」なら削除
+                if not is_noise:
+                    if content == title:
+                        if not any(kw in title for kw in NEWS_VALUE_KEYWORDS):
+                            is_noise = True
+                            matched_pattern = "本文=タイトル+価値KW無し"
+
+                if is_noise:
+                    if len(rejected_samples) < 10:
+                        rejected_samples.append(f"{title[:50]} [{matched_pattern}]")
+                    session.delete(news)
+                    deleted += 1
+
+        if deleted > 0:
+            logger.info(f"🗑️ ゴミニュース {deleted}件を削除")
+            for sample in rejected_samples:
+                logger.info(f"   削除例: {sample}")
+        else:
+            logger.info("🗑️ ゴミニュース削除: 対象なし")
+    except Exception as e:
+        logger.error(f"❌ cleanup_garbage_news エラー: {e}")
+    return deleted
 
 
 def fetch_hololive_news():
@@ -3351,9 +3490,18 @@ def cleanup_anime_cache():
 
 
 def wrapped_news_fetch():
-    """ニュース収集タスク (run_managed_task から呼ばれる)"""
+    """
+    ニュース収集タスク (run_managed_task から呼ばれる)
+
+    ★ v33.20: 取得後にゴミ削除も同時実行
+    順序:
+    1. 公式サイトからニュース取得
+    2. ホロライブ通信から記事取得
+    3. 既存DBの【まとめ】系・ノイズタイトルを一括削除
+    """
     fetch_hololive_news()
     fetch_hololive_tsuushin_news()
+    cleanup_garbage_news()  # ★ v33.20追加
 
 def wrapped_holomem_update():
     """ホロメンDB更新タスク (run_managed_task から呼ばれる)"""
@@ -3505,12 +3653,22 @@ def run_managed_task(task_name: str, func, *args, **kwargs):
     background_executor.submit() の代わりに使う。
 
     v33.13: 会話中チェック追加
-    - NEVER_SKIP_TASKS に含まれるタスクは常に実行
-    - それ以外は会話中（最後の会話から120秒以内）はスキップ
-    - スキップしたタスクは TaskLog の last_run を更新しないので、
-      次のチェックタイミング（GitHub Actions or run_scheduler）で再実行される
+    v33.20: 時間帯チェック追加（JST 15時台 / 3時台のみ実行）
+
+    スキップ条件:
+    1. 時間帯ポリシーに違反（TASK_TIME_POLICY で 'noon' / 'midnight' 指定のもの）
+    2. 会話中（最後の会話から120秒以内、NEVER_SKIP_TASKS は除外）
+
+    スキップしたタスクは TaskLog の last_run を更新しないので、
+    次のチェックタイミングで再実行される。
     """
     def _wrapper():
+        # ★ v33.20: 時間帯チェック
+        allowed, reason = is_allowed_time_for_task(task_name)
+        if not allowed:
+            logger.info(f"⏰ タスク時間帯外スキップ: {task_name} ({reason})")
+            return  # last_run更新しない
+
         # ★ 会話中チェック
         if task_name not in NEVER_SKIP_TASKS:
             if not conversation_activity.is_idle():
@@ -3521,7 +3679,7 @@ def run_managed_task(task_name: str, func, *args, **kwargs):
                 )
                 return  # last_run更新しないので次回再試行される
         try:
-            logger.info(f"▶️  タスク開始: {task_name}")
+            logger.info(f"▶️  タスク開始: {task_name} (時間帯: {reason})")
             func(*args, **kwargs)
             record_task_run(task_name, success=True)
             logger.info(f"✅ タスク完了: {task_name}")
@@ -5118,7 +5276,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.19',
+        'version': 'v33.20',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -6433,7 +6591,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.19 ニュース内容検証版)")
+    logger.info("🚀 初期化完了! (v33.20 時間帯制御&ゴミ自動削除版)")
 
 initialize_app()
 
