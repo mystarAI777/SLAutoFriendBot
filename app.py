@@ -2133,6 +2133,98 @@ def update_holomem_database():
 # ==============================================================================
 # ホロライブニュース収集
 # ==============================================================================
+# ==============================================================================
+# ★ v33.19: ニュース内容検証（中身のないお知らせ・更新通知を弾く）
+# ==============================================================================
+# タイトルだけで明らかにゴミと判断できるパターン
+NEWS_NOISE_PATTERNS = [
+    r'^サイト',              # 「サイトリニューアル」「サイト更新」
+    r'メンテナンス',
+    r'^お知らせ$',           # 「お知らせ」だけのタイトル
+    r'更新のお知らせ',
+    r'リニューアル',
+    r'不具合',
+    r'復旧',
+    r'障害',
+    r'^Loading',
+    r'^Error',
+    r'^404',
+    r'^Page not found',
+    r'^ページ',              # 「ページ更新」「ページ移動」
+    r'^読み込み',
+    r'プライバシーポリシー',
+    r'利用規約',
+    r'クッキー',
+    # ★ v33.19: まとめサイトの定型タイトルを除外
+    r'毎日更新',              # 「ホロライブまとめ｜毎日更新」のようなトップページ系
+    r'^ホロライブまとめ$',
+    r'^まとめ$',
+    r'カテゴリ別',
+    r'タグ一覧',
+]
+
+# ニュース価値のあるキーワード（含まれていれば短文でも採用）
+NEWS_VALUE_KEYWORDS = [
+    'デビュー', '配信', 'ライブ', 'コンサート', 'グッズ',
+    '発売', 'コラボ', 'イベント', '新作', '出演',
+    '新衣装', '誕生日', '記念', 'ツアー', '楽曲',
+    'リリース', 'CD', 'DVD', 'BD', '映画',
+    '卒業', '加入', '所属', 'オーディション',
+    'カバー', '放送', '生配信', 'プレミア',
+    'グランドオープン', '受賞', 'ランキング',
+    '新章', '新シリーズ', 'コミック', 'アニメ化',
+]
+
+
+def is_valid_news(title: str, content: str) -> tuple:
+    """
+    ニュースとして価値のある内容か検証する。
+    
+    返り値: (is_valid: bool, reject_reason: str)
+        is_valid=True なら採用、Falseなら却下（reject_reasonに理由）
+    """
+    # タイトル基本チェック
+    if not title:
+        return False, "タイトル空"
+    title = title.strip()
+    if len(title) < 5:
+        return False, f"タイトル短すぎ({len(title)}文字)"
+    
+    # 明らかなゴミタイトル（ノイズパターン）
+    for pattern in NEWS_NOISE_PATTERNS:
+        if re.search(pattern, title, re.IGNORECASE):
+            return False, f"ノイズタイトル(pattern={pattern})"
+    
+    # 本文の前処理
+    content = (content or "").strip()
+    
+    # 本文がタイトルと同一 → 中身なし（fetch_hololive_news がこのパターン）
+    if content == title:
+        return False, "本文=タイトル(中身なし)"
+    
+    # 本文が極端に短い
+    if len(content) < 30:
+        return False, f"本文短すぎ({len(content)}文字)"
+    
+    # 本文の中にもノイズパターンが多く含まれていれば弾く
+    noise_hits = sum(
+        1 for pat in NEWS_NOISE_PATTERNS
+        if re.search(pat, content[:200], re.IGNORECASE)
+    )
+    if noise_hits >= 3:
+        return False, f"本文内ノイズ多発(hits={noise_hits})"
+    
+    # ニュース価値のあるキーワードが含まれているか
+    combined = title + " " + content
+    has_value_kw = any(kw in combined for kw in NEWS_VALUE_KEYWORDS)
+    
+    # 本文が100文字未満かつ価値キーワードなし → 弾く
+    if len(content) < 100 and not has_value_kw:
+        return False, "本文短く価値キーワード無し"
+    
+    return True, "OK"
+
+
 def fetch_hololive_news():
     logger.info("📰 ニュースDB更新開始...")
     url = "https://hololive.hololivepro.com/news"
@@ -2153,6 +2245,24 @@ def fetch_hololive_news():
             title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
             
             if title and link:
+                # ★ v33.19: ニュース内容を検証（中身のないものを弾く）
+                # この関数はタイトルしか取れないので content=title で渡す
+                # → 「本文=タイトル」で必ず弾かれる仕様。実質、価値キーワード付きタイトルだけ通る
+                # （価値キーワードがないものはタイトルだけのリンクなので採用しない）
+                is_valid, reject_reason = is_valid_news(title, title)
+                
+                # 公式サイトはタイトルしか取れないので緩める:
+                # 「タイトル空・短すぎ・ノイズパターン」だけは弾く
+                # （本文と同一の判定はスキップする）
+                if not is_valid and "本文=タイトル" not in reject_reason and "本文短すぎ" not in reject_reason and "本文短く価値" not in reject_reason:
+                    logger.info(f"🚫 公式ニュース却下({reject_reason}): {title[:40]}")
+                    continue
+                
+                # 価値キーワード判定: タイトルだけでも価値があるなら採用
+                if not any(kw in title for kw in NEWS_VALUE_KEYWORDS):
+                    logger.info(f"🚫 公式ニュース却下(価値キーワード無し): {title[:40]}")
+                    continue
+                
                 try:
                     with get_db_session() as session:
                         if not session.query(HololiveNews).filter_by(url=link).first():
@@ -2166,6 +2276,7 @@ def fetch_hololive_news():
                                 ),
                                 label=f"hololive_news({title[:20]})"
                             )
+                            logger.info(f"✅ 公式ニュース採用: {title[:50]}")
                 except Exception as e:
                     logger.warning(f"⚠️ ニュース1件スキップ: {e}")
         logger.info("✅ ニュースDB更新完了")
@@ -2253,6 +2364,12 @@ def fetch_hololive_tsuushin_news():
                 else:
                     content = title
 
+                # ★ v33.19: ニュース価値の検証
+                is_valid, reject_reason = is_valid_news(title, content)
+                if not is_valid:
+                    logger.info(f"🚫 通信ニュース却下({reject_reason}): {title[:40]}")
+                    continue
+
                 news_hash = hashlib.md5(link.encode()).hexdigest()
 
                 # 個別トランザクションで保存
@@ -2269,7 +2386,7 @@ def fetch_hololive_tsuushin_news():
                         label=f"tsuushin_news({title[:20]})"
                     ):
                         count += 1
-                        logger.info(f"✅ 記事取得: {title[:30]}... ({len(content)}文字)")
+                        logger.info(f"✅ 通信ニュース採用: {title[:30]}... ({len(content)}文字)")
 
             except Exception as e:
                 logger.warning(f"⚠️ 記事取得失敗 ({link}): {e}")
@@ -4809,10 +4926,39 @@ def _split_phrases(text: str) -> List[str]:
     return result
 
 
-def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]:
+# ==============================================================================
+# ★ v33.18: 音声再生時間推定（LSL側で重なり防止に使う）
+# ==============================================================================
+def estimate_voice_duration(text: str) -> float:
     """
-    1フレーズをsu-shiki APIで音声生成してURLを返す。
+    テキスト文字数から音声再生時間を推定（秒）。
+    
+    VOICEVOX もち子さん speed=1.4 想定:
+    - 通常日本語TTSは約7〜8文字/秒
+    - speed=1.4 適用で約10〜11文字/秒
+    
+    式: duration = 文字数 / 10.0 + 0.3
+    
+    例:
+      30文字 → 3.3秒
+      50文字 → 5.3秒
+      90文字 → 9.3秒
+    """
+    if not text:
+        return 1.0
+    # 改行・空白を除外したカウント
+    char_count = len(re.sub(r'\s', '', text))
+    duration = char_count / 10.0 + 0.3
+    # 安全範囲にクランプ（最低1秒、最大15秒）
+    return max(1.0, min(15.0, duration))
+
+
+def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[tuple]:
+    """
+    1フレーズをsu-shiki APIで音声生成してURLとdurationを返す。
     並列実行される。
+    
+    返り値: (url, duration_sec) または None
     """
     try:
         api_url = "https://deprecatedapis.tts.quest/v2/voicevox/audio/"
@@ -4839,8 +4985,9 @@ def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]
             f.write(res.content)
 
         play_url = f"{SERVER_URL}/play_html/{filename}"
-        logger.info(f"✅ フレーズ[{idx}]生成完了: '{phrase[:15]}...' → {filename}")
-        return play_url
+        duration = estimate_voice_duration(phrase)
+        logger.info(f"✅ フレーズ[{idx}]生成完了: '{phrase[:15]}...' → {filename} (推定{duration:.1f}秒)")
+        return (play_url, duration)
 
     except requests.exceptions.Timeout:
         logger.error(f"❌ タイムアウト[{idx}]: '{phrase[:20]}'")
@@ -4850,12 +4997,14 @@ def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]
         return None
 
 
-def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
+def generate_voice_file(text: str, user_uuid: str) -> Optional[tuple]:
     """
     テキストをフレーズ分割し、並列で音声生成。
     生成できたものからユーザーのキューに積む。
-    最初のフレーズのURLを返す（LSLへの即時レスポンス用）。
-    残りのフレーズはLSLが /next_voice でポーリングして受け取る。
+    
+    返り値: (url, duration_sec) または None
+      最初のフレーズのURLとdurationを返す（LSLへの即時レスポンス用）。
+      残りのフレーズはLSLが /next_voice でポーリングして受け取る。
     """
     phrases = _split_phrases(text)
     if not phrases:
@@ -4870,26 +5019,28 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
 
     # フレーズ数が1つならシンプルに生成して返す
     if len(phrases) == 1:
-        url = _generate_one_phrase(phrases[0], user_uuid, 0)
-        return url
+        result = _generate_one_phrase(phrases[0], user_uuid, 0)
+        return result  # (url, duration) または None
 
     # 複数フレーズ: 並列生成してできた順にキューへ積む
     # まず最初のフレーズを同期生成（即レスポンス用）
-    first_url = _generate_one_phrase(phrases[0], user_uuid, 0)
+    first_result = _generate_one_phrase(phrases[0], user_uuid, 0)
 
     # 残りのフレーズをバックグラウンドで順番に生成してキューに積む
     def generate_remaining():
         for i, phrase in enumerate(phrases[1:], start=1):
-            url = _generate_one_phrase(phrase, user_uuid, i)
-            if url:
+            result = _generate_one_phrase(phrase, user_uuid, i)
+            if result:
+                url, duration = result
                 with _voice_queues_lock:
                     if user_uuid in _voice_queues:
-                        _voice_queues[user_uuid].append(url)
-                        logger.info(f"📥 キュー追加[{i}]: {url}")
+                        # ★ v33.18: (url, duration) のタプルでキュー保持
+                        _voice_queues[user_uuid].append((url, duration))
+                        logger.info(f"📥 キュー追加[{i}]: {url} ({duration:.1f}秒)")
 
     background_executor.submit(generate_remaining)
 
-    return first_url  # 最初のURLを即レスポンスとして返す
+    return first_result  # 最初の (url, duration) を即レスポンス
 
 def cleanup_old_voice_files():
     try:
@@ -4967,7 +5118,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.17',
+        'version': 'v33.19',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -5077,6 +5228,44 @@ def admin_fix_sequences():
         return create_json_response({
             'success': True,
             'message': 'シーケンス修正完了。Renderログで詳細を確認してください'
+        })
+    except Exception as e:
+        return create_json_response({'success': False, 'error': str(e)}, 500)
+
+
+@app.route('/admin/cleanup_invalid_news', methods=['POST', 'GET'])
+def admin_cleanup_invalid_news():
+    """
+    ★ v33.19: 過去に蓄積された「中身のないニュース」をDBから削除する。
+    is_valid_news() の検証ロジックを既存データに適用する。
+    
+    GET でドライラン（削除対象を表示するだけ）、POST で実削除。
+    """
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    
+    is_dry_run = (request.method == 'GET')
+    rejected_items = []
+    
+    try:
+        with get_db_session() as session:
+            all_news = session.query(HololiveNews).all()
+            for news in all_news:
+                is_valid, reason = is_valid_news(news.title or '', news.content or '')
+                if not is_valid:
+                    rejected_items.append({
+                        'id': news.id,
+                        'title': (news.title or '')[:60],
+                        'reason': reason,
+                    })
+                    if not is_dry_run:
+                        session.delete(news)
+        
+        return create_json_response({
+            'mode': 'dry-run (GET)' if is_dry_run else 'deleted (POST)',
+            'total_rejected': len(rejected_items),
+            'items': rejected_items[:30],
+            'note': 'GET でドライラン、POST で実削除。トークン付きでブラウザGET可能',
         })
     except Exception as e:
         return create_json_response({'success': False, 'error': str(e)}, 500)
@@ -5352,12 +5541,16 @@ def chat_lsl():
         # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
         res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text))
         v_url = ""
+        v_duration = 0.0
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
-            direct_url = generate_voice_file(res_text, user_uuid)
-            if direct_url:
-                v_url = direct_url
+            voice_result = generate_voice_file(res_text, user_uuid)
+            if voice_result:
+                # ★ v33.18: (url, duration) のタプルで返ってくる
+                v_url, v_duration = voice_result
             
-        return Response(f"{res_text}|{v_url}", mimetype='text/plain; charset=utf-8', status=200)
+        # ★ v33.18: レスポンス形式 "text|url|duration" 
+        # LSLは duration + 0.5秒 後に次の音声を取得する
+        return Response(f"{res_text}|{v_url}|{v_duration:.1f}", mimetype='text/plain; charset=utf-8', status=200)
     
     except Exception as e:
         err_str = str(e)
@@ -5863,9 +6056,17 @@ def next_voice():
         with _voice_queues_lock:
             q = _voice_queues.get(user_uuid)
             if q and len(q) > 0:
-                url = q.popleft()
-                logger.info(f"📤 next_voice返却: {url}")
-                return Response(url, 200, mimetype='text/plain; charset=utf-8')
+                item = q.popleft()
+                # ★ v33.18: (url, duration) のタプルで保持されている
+                if isinstance(item, tuple):
+                    url, duration = item
+                    response_text = f"{url}|{duration:.1f}"
+                else:
+                    # 後方互換: 旧形式の文字列のみ
+                    url = item
+                    response_text = f"{url}|0.0"
+                logger.info(f"📤 next_voice返却: {response_text}")
+                return Response(response_text, 200, mimetype='text/plain; charset=utf-8')
 
         return Response("", 200)
 
@@ -6232,7 +6433,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.17 クラッシュ耐性版)")
+    logger.info("🚀 初期化完了! (v33.19 ニュース内容検証版)")
 
 initialize_app()
 
