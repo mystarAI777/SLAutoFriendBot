@@ -1290,7 +1290,16 @@ def get_japan_time() -> str:
     return f"今の日本の時間は、{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 
 def is_time_request(msg: str) -> bool:
-    return any(kw in msg for kw in ['今何時', '時刻', '何時', 'なんじ'])
+    """
+    時刻を聞かれているか判定。
+    v33.20.2: ユーザーは「今の時間」「時間は」「時間教えて」など
+    様々な表現で聞いてくるため、キーワードを大幅に拡充。
+    """
+    return any(kw in msg for kw in [
+        '今何時', '時刻', '何時', 'なんじ',
+        '今の時間', '今の時刻', '時間は', '時間教', '時間を教',
+        '何時です', '今時間', 'いまなんじ', 'いま何時',
+    ])
 
 def is_weather_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
@@ -1392,15 +1401,85 @@ def sanitize_response_for_sl(text: str) -> str:
     return text
 
 def get_weather_forecast(location: str = "東京") -> str:
+    """
+    気象庁公式JSON APIから天気予報を取得する。
+    v33.20.2: tsukumijima API が HTTP 403 で死亡したため気象庁公式に切替。
+
+    URL:    https://www.jma.go.jp/bosai/forecast/data/forecast/{エリアコード}.json
+    特徴:   登録不要・無料・公式
+    レスポンス構造:
+        data[0] = 直近の天気予報
+            ["timeSeries"][0]   = 直近3日間の天気
+                ["areas"][0]    = 県の最初のエリア (例: 東京なら "東京地方")
+                    ["weathers"][0] = 今日の天気文字列 (例: "晴れ 夜 くもり")
+                    ["winds"][0]    = 今日の風
+            ["timeSeries"][2]   = 今日と明日の最低・最高気温
+                ["areas"][0]
+                    ["temps"]   = ["朝の最低", "日中の最高"] のような配列
+        data[0]["publishingOffice"] = 発表元 (例: "気象庁")
+    """
     try:
         location_code = LOCATION_CODES.get(location, LOCATION_CODES["東京"])
-        url = f"https://weather.tsukumijima.net/api/forecast/city/{location_code}"
-        res = requests.get(url, timeout=5)
-        if res.status_code != 200: return f"{location}の天気情報が取得できなかったよ…"
+        url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{location_code}.json"
+        # User-Agent を付けないと 403 を返す環境がある
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ 気象庁API応答エラー: HTTP {res.status_code}")
+            return f"{location}の天気情報が取得できなかったよ…"
+
         data = res.json()
-        today = data['forecasts'][0]
-        return f"{location}の今日の天気は「{today['telop']}」だよ！{today['detail']['weather'] if today.get('detail') else ''}"
-    except:
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return f"{location}の天気情報が空だったよ…"
+
+        # 直近の天気予報（先頭エリア = 県の主要エリア）
+        recent = data[0]
+        time_series = recent.get('timeSeries', [])
+        if not time_series:
+            return f"{location}の天気情報が取得できなかったよ…"
+
+        # timeSeries[0] = 天気・風（3日分）
+        weather_ts = time_series[0]
+        areas = weather_ts.get('areas', [])
+        if not areas:
+            return f"{location}の天気情報が取得できなかったよ…"
+
+        area = areas[0]
+        area_name = area.get('area', {}).get('name', location)
+        weathers = area.get('weathers', [])
+        winds = area.get('winds', [])
+
+        if not weathers:
+            return f"{location}の天気情報が取得できなかったよ…"
+
+        today_weather = weathers[0].replace('\u3000', ' ').strip()
+        today_wind = winds[0].replace('\u3000', ' ').strip() if winds else ''
+
+        # 気温（timeSeries[2] にあれば取得）
+        temp_text = ''
+        try:
+            if len(time_series) >= 3:
+                temp_areas = time_series[2].get('areas', [])
+                if temp_areas:
+                    temps = temp_areas[0].get('temps', [])
+                    if len(temps) >= 2:
+                        # temps = ["朝の最低", "日中の最高"]
+                        # ただし時刻によっては最初が現在気温の場合もある
+                        temp_text = f" 最高気温は{temps[1]}℃くらいになりそうだよ。"
+        except Exception:
+            pass
+
+        result = f"{area_name}の今日の天気は「{today_weather}」だよ！"
+        if today_wind:
+            result += f" 風は{today_wind}。"
+        result += temp_text
+        return result
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"⚠️ 気象庁APIタイムアウト ({location})")
+        return f"{location}の天気情報が取得できなかったよ…"
+    except Exception as e:
+        logger.error(f"❌ 気象庁API取得エラー: {e}")
         return f"{location}の天気情報が取得できなかったよ…"
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
