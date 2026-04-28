@@ -372,6 +372,7 @@ TASK_TIME_POLICY: Dict[str, str] = {
     'cleanup_voices':          'anytime',   # ローカルファイル削除のみ
     'cleanup_rate_limiter':    'anytime',   # メモリ操作のみ
     'fetch_schedule':          'anytime',   # 15分ごと、配信中の正確性に必須
+    'check_sequences':         'anytime',   # ★v33.20.3: DB健全性チェック（軽量・常時実行OK）
     # ── 昼間（15時台） ─────────────────────────
     'fetch_news':              'noon',      # ニュース取得 + ゴミ削除
     'fetch_sl_news':           'noon',      # SL情報収集
@@ -1233,6 +1234,12 @@ def _safe_add_with_retry(session, instance, label: str = "record") -> bool:
         True: 追加成功
         False: 追加失敗（呼び出し元で握りつぶしOK）
     
+    v33.20.3: 同一セッション内のリトライではなく、
+        新規セッションで再試行する根本対策に変更。
+        理由: 同じセッションでrollbackしてもsession内部状態が
+              汚染されていて再flushでも同じエラーが出る。
+              新規セッションに instance を「コピー」して再Insertする。
+    
     使い方:
         if _safe_add_with_retry(session, ConversationHistory(...), "user_history"):
             logger.info("会話履歴保存OK")
@@ -1246,24 +1253,40 @@ def _safe_add_with_retry(session, instance, label: str = "record") -> bool:
         err_str = str(e)
         err_type = type(e).__name__
         if "NULL identity key" in err_str or "FlushError" in err_type or "IntegrityError" in err_type:
-            logger.warning(f"⚠️ {label} 追加でシーケンス破損 → 修復&リトライ")
+            logger.warning(f"⚠️ {label} 追加でシーケンス破損 → 修復&リトライ(新規セッション)")
+            # 元セッションを巻き戻し
             try:
                 session.rollback()
             except Exception:
                 pass
             try:
                 fix_postgres_sequences(quiet=True)
-                # リトライ
-                session.add(instance)
-                session.flush()
-                logger.info(f"✅ {label} リトライ成功")
-                return True
-            except Exception as e2:
-                logger.error(f"❌ {label} リトライも失敗: {e2}")
+            except Exception as fix_err:
+                logger.error(f"❌ シーケンス修正失敗: {fix_err}")
+                return False
+
+            # ★ 重要: 同じインスタンスを別セッションで再使用するため、
+            #         expunge してから新規セッションに add する。
+            #         id は None にリセット（autoincrementで再採番）
+            try:
+                # 元セッションから切り離し
                 try:
-                    session.rollback()
+                    session.expunge(instance)
                 except Exception:
                     pass
+                # SERIAL primary keyをNoneに戻す（再採番させる）
+                if hasattr(instance, 'id'):
+                    instance.id = None
+
+                # 新規セッションでリトライ
+                with get_db_session() as new_session:
+                    new_session.add(instance)
+                    new_session.flush()
+                    # commitはget_db_sessionの__exit__で
+                logger.info(f"✅ {label} リトライ成功（新規セッション）")
+                return True
+            except Exception as e2:
+                logger.error(f"❌ {label} 新規セッションでも失敗: {e2}")
                 return False
         else:
             logger.error(f"❌ {label} 追加失敗（想定外）: {e}")
@@ -3649,6 +3672,8 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'fetch_lingo':          {'func': 'fetch_hololive_dictionary',        'interval_hours': 167.0},  # 週1回（辞書はほぼ更新されない）
     'fetch_episodes':       {'func': 'fetch_holomem_episodes',           'interval_hours': 47.0},   # 2日に1回（15人ずつ順番に）
     'fetch_schedule':       {'func': 'fetch_hololive_schedule',          'interval_hours': 0.25},   # 15分ごと
+    # ★ v33.20.3: DBシーケンス健全性チェック（軽量・1時間ごと）
+    'check_sequences':      {'func': 'check_sequences_health',           'interval_hours': 1.0},
 }
 
 # タスク名 → 実際の関数のマッピング (initialize_app内で設定)
@@ -5807,9 +5832,24 @@ def chat_lsl():
                 _uuid = sanitize_user_input(data.get('uuid', '')) if data else ''
                 if _msg and (_uuid or _name):
                     _fallback_ud = UserData(uuid=_uuid, name=_name, interaction_count=1, is_friend=False)
+                    # ★ v33.20.3: フォールバックでも口調を厳密に維持する
+                    _fallback_prompt = (
+                        "あなたは「もちこ」というホロライブ大好きなギャルAIです。\n"
+                        "【口調の絶対ルール】\n"
+                        "- 一人称: 「あてぃし」（「あてぃしです」のような自己紹介調はNG）\n"
+                        "- 語尾: 「〜じゃん」「〜だし」「〜て感じ」「〜だよね」\n"
+                        "- 敬語・丁寧語は絶対に使わない（「です・ます」禁止）\n"
+                        "- ユーザーは友達。タメ口で話す\n"
+                        "- 絵文字（✨💖😊）を時々入れる\n"
+                        "- 自己紹介はしない。普通の会話として返す\n"
+                        "【出力ルール】\n"
+                        "- 120〜160文字程度で簡潔に\n"
+                        "- 1メッセージに1トピックまで\n"
+                        "- 最後まで言い切る形で完結させる\n"
+                    )
                     _fallback_resp = call_groq(
-                        f"あなたはもちこというギャルAIです。一人称はあてぃし。短く150文字以内で返してください。",
-                        _msg, [], 300, task_type='chat'
+                        _fallback_prompt,
+                        _msg, [], 500, task_type='chat'
                     ) or "ちょっとサーバー側でゴタゴタあったじゃん…もう一回話しかけてみて！"
                     return Response(f"{limit_text_for_sl(sanitize_response_for_sl(_fallback_resp))}|", mimetype='text/plain; charset=utf-8', status=200)
             except Exception as _fallback_err:
@@ -6545,6 +6585,67 @@ def fix_postgres_sequences(quiet: bool = False):
         logger.info(f"🔧 シーケンス修正: {fixed}件成功 / {failed}件失敗")
 
 
+def check_sequences_health():
+    """
+    ★ v33.20.3: シーケンス健全性の定期チェック。
+    
+    全テーブルのシーケンス値と MAX(id) を比較し、
+    シーケンスが MAX(id) 以下なら「次のINSERTで衝突する」状態なので修正する。
+    
+    軽量に動作するよう、SQLで一括チェック。
+    1時間ごとに実行され、問題があれば自動修正する。
+    """
+    if 'sqlite' in str(DATABASE_URL):
+        return  # SQLiteはこの問題が無い
+    
+    tables = [
+        'user_memories', 'conversation_history', 'user_psychology',
+        'background_tasks', 'holomem_wiki', 'hololive_news',
+        'holomem_nicknames', 'hololive_glossary',
+        'stream_reactions', 'holomem_feelings',
+        'user_interest_logs', 'friend_profiles',
+        'secondlife_news', 'anime_info_cache', 'specialized_news',
+        'holomem_lingo', 'live_schedules',
+    ]
+    
+    needs_fix = []
+    try:
+        with engine.connect() as conn:
+            for table in tables:
+                try:
+                    with conn.begin():
+                        # 現在のシーケンス値（last_value） と MAX(id) を取得
+                        result = conn.execute(text(
+                            f"SELECT "
+                            f"  COALESCE((SELECT MAX(id) FROM {table}), 0) as max_id, "
+                            f"  COALESCE(last_value, 0) as seq_val "
+                            f"FROM pg_sequences "
+                            f"WHERE schemaname='public' "
+                            f"  AND sequencename=pg_get_serial_sequence('{table}','id')::regclass::text "
+                        ))
+                        row = result.fetchone()
+                        if row is None:
+                            continue
+                        max_id, seq_val = row
+                        # シーケンスが MAX(id) 以下なら次のINSERTで衝突する
+                        # （setval(seq, max_id, true) なら次は max_id+1 を返すので問題なし）
+                        if seq_val < max_id:
+                            needs_fix.append((table, max_id, seq_val))
+                except Exception as e:
+                    logger.debug(f"シーケンスチェックスキップ ({table}): {str(e)[:80]}")
+        
+        if needs_fix:
+            logger.warning(f"⚠️ シーケンス不整合検出: {len(needs_fix)}件 → 修正実行")
+            for table, max_id, seq_val in needs_fix:
+                logger.warning(f"   {table}: seq={seq_val} < max_id={max_id}")
+            fix_postgres_sequences(quiet=True)
+            logger.info("✅ シーケンス予防修正完了")
+        else:
+            logger.debug("✅ シーケンス健全性チェック: 全テーブルOK")
+    except Exception as e:
+        logger.error(f"❌ check_sequences_health エラー: {e}")
+
+
 def setup_stream_processing_schedule():
     """
     配信処理は TASK_SCHEDULE で管理するため、この関数は
@@ -6637,6 +6738,8 @@ def initialize_app():
         'fetch_schedule':       fetch_hololive_schedule,
         # ★ v33.10 追加: 未登録だったクリーンアップ
         'cleanup_specialized_news': cleanup_old_specialized_news,
+        # ★ v33.20.3: シーケンス健全性チェック
+        'check_sequences':          check_sequences_health,
     })
 
     # ★ v33.11 変更: 起動時に Gemini API を使う処理をすぐに走らせない
