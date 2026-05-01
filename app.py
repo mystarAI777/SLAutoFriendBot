@@ -3848,7 +3848,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 400}  # v33.12: 1000 → 400 (150-200文字応答に最適化)
+            generation_config={"temperature": 0.8, "max_output_tokens": 700}  # v33.12: 1000 → 700 (150-200文字応答に最適化)
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -4229,9 +4229,9 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     response = call_gemini(system_prompt, normalized_message, history_for_ai)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
-        # ★ v33.12: 通常会話は 400 tokens に絞る（150-200文字応答）
+        # ★ v33.12: 通常会話は 700 tokens に絞る（150-200文字応答）
         _task_type = 'search' if is_task_report else 'chat'
-        _max_tokens = 800 if is_task_report else 400  # 検索レポートは長め、通常は短め
+        _max_tokens = 800 if is_task_report else 700  # 検索レポートは長め、通常は短め
         response = call_groq(system_prompt, normalized_message, history_for_ai, _max_tokens, task_type=_task_type)
     
     if not response:
