@@ -5001,9 +5001,7 @@ def get_safe_friend_summary(target_user_name: str) -> Optional[str]:
         logger.error(f"get_safe_friend_summary エラー: {e}")
         return None
 
-
-
-logger.info("📥 Migrating nicknames to database...")
+                logger.info("📥 Migrating nicknames to database...")
                 initial_nicknames = {
                     'みこち': 'さくらみこ', 'すいちゃん': '星街すいせい', 'フブちゃん': '白上フブキ',
                     'まつり': '夏色まつり', 'あくたん': '湊あくあ', 'スバル': '大空スバル',
@@ -5040,7 +5038,7 @@ logger.info("📥 Migrating nicknames to database...")
                     session.add(HololiveGlossary(term=term, description=desc))
                 logger.info(f"✅ Glossary initialized: {len(initial_glossary)}")
 
-        except Exception as e:
+            except Exception as e:
             logger.error(f"❌ Knowledge DB initialization failed: {e}")
 
 # ==============================================================================
