@@ -5000,8 +5000,12 @@ def get_safe_friend_summary(target_user_name: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"get_safe_friend_summary エラー: {e}")
         return None
-
-                logger.info("📥 Migrating nicknames to database...")
+def initialize_knowledge_db():
+    """初期知識データをDBに投入する"""
+    with get_db_session() as session:
+        try:
+            if session.query(HolomemNickname).count() == 0:
+                logger.info("📥 Migrating nicknames to database...") 
                 initial_nicknames = {
                     'みこち': 'さくらみこ', 'すいちゃん': '星街すいせい', 'フブちゃん': '白上フブキ',
                     'まつり': '夏色まつり', 'あくたん': '湊あくあ', 'スバル': '大空スバル',
