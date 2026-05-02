@@ -109,7 +109,7 @@ os.makedirs(VOICE_DIR, exist_ok=True)
 
 SERVER_URL = os.environ.get('RENDER_EXTERNAL_URL', "http://localhost:5000")
 VOICEVOX_SPEAKER_ID = 20
-SL_SAFE_CHAR_LIMIT = 600
+SL_SAFE_CHAR_LIMIT = 650
 MIN_MESSAGES_FOR_ANALYSIS = 10
 SEARCH_TIMEOUT = 10
 VOICE_FILE_MAX_AGE_HOURS = 24
@@ -4357,8 +4357,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
 # 【出力のルール（超重要）】
 1. **文字数の目安**:
-   - 通常会話: 150〜200文字
-   - ニュース・配信情報・ホロメン語り: 250〜400文字（解像度を上げる）
+   - 通常会話: 200〜250文字
+   - ニュース・配信情報・ホロメン語り: 300〜450文字（解像度を上げる）
 2. **1メッセージに1テーマまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
 3. **相手に2つ以上の質問を同時にしない**。質問するなら1個だけ。
 4. 絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調は維持してください。
@@ -4403,8 +4403,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     # ★ v33.16: ニュース・ホロメン話題は出力トークンを拡張して解像度を上げる
     is_rich_topic = is_news_topic(message) or is_holomem_topic(message)
-    gemini_max_tokens = 1000 if is_rich_topic else 600
-    groq_max_tokens = 1000 if (is_task_report or is_rich_topic) else 400
+    gemini_max_tokens = 1050 if is_rich_topic else 650
+    groq_max_tokens = 1050 if (is_task_report or is_rich_topic) else 450
 
     response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     if not response:
@@ -5566,7 +5566,7 @@ def chat_lsl():
 
         # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
         # ニュース・ホロメン話題は番号付きリストで長くなるため上限を拡張
-        _sl_max = 1200 if (is_news_topic(message) or is_holomem_topic(message)) else SL_SAFE_CHAR_LIMIT
+        _sl_max = 1250 if (is_news_topic(message) or is_holomem_topic(message)) else SL_SAFE_CHAR_LIMIT
         res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text), max_length=_sl_max)
         v_url = ""
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
