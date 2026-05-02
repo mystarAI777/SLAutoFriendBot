@@ -142,9 +142,9 @@ GROQ_MODELS = [
 # compound-beta はツール呼び出し・マルチステップが得意だが応答が遅い
 # llama-4-maverick は長文コンテキスト + 高速のバランスが良い
 GROQ_TASK_MODELS = {
-    'chat':     ['llama-3.1-8b-instant', 'llama-4-maverick-17b-128e-instruct', 'llama-3.3-70b-versatile'],
-    'search':   ['compound-beta', 'llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct'],
-    'analysis': ['llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct', 'deepseek-r1-distill-llama-70b'],
+    'chat':     ['llama-3.1-8b-instant', 'qwen-qwen3-32b', 'llama-3.3-70b-versatile'],
+    'search':   ['meta-llama/llama-4-scout-17b-16e-instruct', 'llama-3.3-70b-versatile', 'openai/gpt-oss-120b'],
+    'analysis': ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct', 'deepseek-r1-distill-llama-70b'],
     'default':  GROQ_MODELS,
 }
 
