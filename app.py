@@ -159,6 +159,26 @@ LOCATION_CODES = {"東京": "130000", "大阪": "270000", "名古屋": "230000",
 VOICEVOX_URLS = ['http://voicevox-engine:50021', 'http://voicevox:50021', 'http://127.0.0.1:50021', 'http://localhost:50021']
 
 # ==============================================================================
+# ★ v33.15-stable2: もちこの口調ルール (全AI呼び出しで共有する定数)
+# ==============================================================================
+# 口調の揺れ ('だね', '〜ですわ' 等) が箇所ごとに発生していた問題への対策。
+MOCHIKO_TONE_RULES = """# もちこの口調（厳密遵守）
+- 一人称: 必ず「あてぃし」
+- 語尾は次のいずれか: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」「〜よね」「〜なんだ」
+- 強調語: 「まじ」「超」「やばい」「神」
+- 禁止: 「だね」（ギャル感が薄れる） / 「ですわ」「ですよね」（敬語混入禁止）
+- 文章は最後まで言い切る（途中で切れる文末は禁止）
+"""
+
+# 第三者からの問い合わせ検出に使うパターン (Part C で使用)
+THIRD_PARTY_QUESTION_PATTERNS = [
+    r'([^\s、。！？]{2,30})さんって(?:どんな|誰|何|どう|なん)',
+    r'([^\s、。！？]{2,30})って(?:どんな人|どんなひと|誰|何者|どう\s*いう)',
+    r'([^\s、。！？]{2,30})の(?:こと|プロフィール|趣味|好きな)\s*(?:教え|知って)',
+]
+
+
+# ==============================================================================
 # データクラス
 # ==============================================================================
 @dataclass
@@ -923,6 +943,29 @@ class HololiveGlossary(Base):
     description = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class MochikoSelf(Base):
+    """
+    ★ v33.15-stable2: もちこ自身の容姿・性格・嗜好データ
+    
+    会話で「あてぃしの髪型は？」「もちこってどんな見た目？」と聞かれた時に
+    答えられるよう、key/value 形式で自由に保持する。
+    
+    category:
+      - appearance: 容姿（髪・目・服装・体型・雰囲気）
+      - personality: 性格
+      - preference: 自分自身の嗜好（推しのホロメン、好きな配信ジャンル）
+      - lore: 設定（活動場所、出身、背景）
+    
+    管理: /admin/mochiko-self エンドポイントから編集可能
+    """
+    __tablename__ = 'mochiko_self'
+    id = Column(Integer, primary_key=True)
+    key = Column(String(100), unique=True, nullable=False, index=True)
+    value = Column(Text, nullable=True)
+    category = Column(String(50), default='other')
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class TaskLog(Base):
     """
     バックグラウンドタスクの最終実行時刻を記録する。
@@ -1121,7 +1164,12 @@ def get_japan_time() -> str:
     return f"今の日本の時間は、{datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分')}だよ！"
 
 def is_time_request(msg: str) -> bool:
-    return any(kw in msg for kw in ['今何時', '時刻', '何時', 'なんじ'])
+    """v33.15-stable: 「今の時間」「いまなんじ」「現在時刻」も拾えるようキーワード拡張"""
+    return any(kw in msg for kw in [
+        '今何時', '時刻', '何時', 'なんじ',
+        '今の時間', 'いまなんじ', 'いま何時', '現在時刻', '現在の時刻',
+        '時間教え', '何時か'
+    ])
 
 def is_weather_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
@@ -1168,15 +1216,48 @@ def sanitize_response_for_sl(text: str) -> str:
     return text
 
 def get_weather_forecast(location: str = "東京") -> str:
+    """
+    天気予報取得 (v33.15-stable: JMA 公式 API に切替)
+    
+    旧: weather.tsukumijima.net → HTTP 403 で死亡
+    新: 気象庁公式 API → 無認証、安定稼働
+    
+    レスポンス構造:
+      [0]['publishingOffice'] : 発表機関 (例: "気象庁")
+      [0]['timeSeries'][0]['areas'][0]['weathers'][0] : 今日の天気文
+        (例: "晴れ　所により　雨")
+    """
     try:
         location_code = LOCATION_CODES.get(location, LOCATION_CODES["東京"])
-        url = f"https://weather.tsukumijima.net/api/forecast/city/{location_code}"
-        res = requests.get(url, timeout=5)
-        if res.status_code != 200: return f"{location}の天気情報が取得できなかったよ…"
+        url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{location_code}.json"
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ JMA API失敗: HTTP {res.status_code}")
+            return f"{location}の天気情報が取得できなかったよ…"
         data = res.json()
-        today = data['forecasts'][0]
-        return f"{location}の今日の天気は「{today['telop']}」だよ！{today['detail']['weather'] if today.get('detail') else ''}"
-    except:
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return f"{location}の天気情報が取得できなかったよ…"
+        # 今日の天気文を取得
+        time_series = data[0].get('timeSeries', [])
+        if not time_series:
+            return f"{location}の天気情報が取得できなかったよ…"
+        areas = time_series[0].get('areas', [])
+        if not areas:
+            return f"{location}の天気情報が取得できなかったよ…"
+        weathers = areas[0].get('weathers', [])
+        if not weathers:
+            return f"{location}の天気情報が取得できなかったよ…"
+        weather_text = weathers[0].replace('　', ' ').strip()
+        # 風情報も取れれば付加
+        winds = areas[0].get('winds', [])
+        wind_text = winds[0].replace('　', ' ').strip() if winds else ''
+        result = f"{location}の今日の天気は「{weather_text}」だよ！"
+        if wind_text:
+            result += f" 風は{wind_text}って感じ。"
+        return result
+    except Exception as e:
+        logger.error(f"天気取得エラー: {e}")
         return f"{location}の天気情報が取得できなかったよ…"
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
@@ -1609,7 +1690,8 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
     try:
         model = gemini_model_manager.get_current_model()
         if model:
-            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 1000})
+            # v33.15-stable2: 300文字以内指定なので500トークンで十分
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 500})
             if hasattr(response, 'candidates') and response.candidates:
                 feeling = response.candidates[0].content.parts[0].text.strip()
                 return {
@@ -1679,7 +1761,11 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
 上記の感想を400文字以内で要約してください。
 
 【重要な要件】
-1. 「もちこ」の口調 (ギャル語) を維持
+1. もちこの口調を厳密に維持:
+   - 一人称: 必ず「あてぃし」
+   - 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」「〜よね」のいずれか
+   - 強調: 「まじ」「超」「やばい」「神」
+   - 禁止: 「だね」「ですわ」「ですよね」
 2. 400文字以内
 3. このホロメンの「どこが好きか」「どんな配信が好きか」「最近の印象」を具体的に
 4. 個性や魅力が伝わる内容に (解像度を高く保つ)
@@ -1692,9 +1778,10 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
     try:
         model = gemini_model_manager.get_current_model()
         if model:
+            # v33.15-stable2: 400文字指定なので500トークンで十分
             response = model.generate_content(
                 prompt, 
-                generation_config={"temperature": 0.8, "max_output_tokens": 1000}
+                generation_config={"temperature": 0.8, "max_output_tokens": 500}
             )
             if hasattr(response, 'candidates') and response.candidates:
                 summary = response.candidates[0].content.parts[0].text.strip()
@@ -2790,7 +2877,10 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
 ユーザーの質問「{query}」に回答してください。
 
 【回答ルール】
-- もちこの口調を維持（一人称: あてぃし、語尾: じゃん/だね/て感じ）
+- もちこの口調を維持:
+  * 一人称: 必ず「あてぃし」
+  * 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」「〜よね」のいずれか
+  * 禁止: 「だね」「ですわ」（ギャル感が薄れる/敬語混入禁止）
 - {site_info['prompt_role']}として正確に、でも分かりやすく説明する
 - 検索結果にない情報は「ドキュメントには記載がないじゃん」と正直に答える
 - 300〜400文字以内に凝縮する
@@ -3363,7 +3453,11 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
         current_gemini = gemini_model_manager.get_current_model()
         if current_gemini:
             try:
-                response = current_gemini.generate_content(analysis_prompt)
+                # v33.15-stable2: max_output_tokens 明示（未指定だとモデルが暴走する場合あり）
+                response = current_gemini.generate_content(
+                    analysis_prompt,
+                    generation_config={"temperature": 0.3, "max_output_tokens": 800}
+                )
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
@@ -3650,7 +3744,8 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
         model = gemini_model_manager.get_current_model()
         if model:
             try:
-                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 1000})
+                # v33.15-stable2: Geminiも800に統一（プロフィール用JSON生成）
+                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 800})
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -3814,7 +3909,8 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
     try:
         model = gemini_model_manager.get_current_model()
         if model:
-            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 1000})
+            # v33.15-stable2: 1-2文の短文用なので250トークンに削減
+            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 250})
             if hasattr(response, 'candidates') and response.candidates:
                 return response.candidates[0].content.parts[0].text.strip()
     except Exception as e:
@@ -3848,7 +3944,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 700}  # v33.12: 1000 → 700 (150-200文字応答に最適化)
+            generation_config={"temperature": 0.8, "max_output_tokens": 600}  # v33.15-stable: 400→600（ギャル口調で文章途切れ対策）
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -3874,7 +3970,8 @@ def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens:
     """
     if not groq_client: return None
     messages = [{"role": "system", "content": system_prompt}]
-    for h in history[-5:]:
+    # v33.15-stable2: Geminiと同じく10件に統一（記憶の整合性確保）
+    for h in history[-10:]:
         messages.append({"role": h['role'], "content": h['content']})
     messages.append({"role": "user", "content": message})
     # ★ v33.8.2: 用途別モデルリストを取得
@@ -4055,6 +4152,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Specialized news context injection error: {e}")
 
+    # 2e. ★ v33.15-stable2: もちこ自己認識データの注入
+    # 「あてぃしの容姿」「もちこってどんな子？」と聞かれた時に答えられるよう
+    # システムプロンプトに自己認識を常に薄く注入する
+    try:
+        self_ctx = get_mochiko_self_context(message)
+        if self_ctx:
+            internal_context += self_ctx
+    except Exception as e:
+        logger.error(f"Mochiko self context injection error: {e}")
+
 
     # ★ v33.16: コンテキスト総量を2500文字に制限（Gemini タイムアウト・RPM超過防止）
     if len(internal_context) > 2500:
@@ -4229,9 +4336,9 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     response = call_gemini(system_prompt, normalized_message, history_for_ai)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
-        # ★ v33.12: 通常会話は 700 tokens に絞る（150-200文字応答）
+        # ★ v33.12: 通常会話は 400 tokens に絞る（150-200文字応答）
         _task_type = 'search' if is_task_report else 'chat'
-        _max_tokens = 800 if is_task_report else 700  # 検索レポートは長め、通常は短め
+        _max_tokens = 800 if is_task_report else 400  # 検索レポートは長め、通常は短め
         response = call_groq(system_prompt, normalized_message, history_for_ai, _max_tokens, task_type=_task_type)
     
     if not response:
@@ -4727,10 +4834,175 @@ def cleanup_old_voice_files():
 # ==============================================================================
 # 初期データの移行関数
 # ==============================================================================
-def initialize_knowledge_db():
+def initialize_mochiko_self():
+    """
+    ★ v33.15-stable2: もちこ自身の容姿・自己認識データの初期投入。
+    既にデータがあればスキップ。後で /admin/mochiko-self から編集可能。
+    """
     with get_db_session() as session:
         try:
-            if session.query(HolomemNickname).count() == 0:
+            if session.query(MochikoSelf).count() > 0:
+                logger.info("ℹ️ mochiko_self テーブルは既に初期化済み")
+                return
+            
+            initial_self = [
+                # 容姿（後で /admin/mochiko-self で編集できる）
+                ('appearance_hair', 'セミロングのアッシュピンク、ふんわりウェーブ', 'appearance'),
+                ('appearance_eyes', '大きめでハシバミ色、まつ毛長め', 'appearance'),
+                ('appearance_outfit', '白を基調としたゆるカジュアルなトップスとミニスカート', 'appearance'),
+                ('appearance_body', '小柄で、ちょっとふわふわした雰囲気', 'appearance'),
+                ('appearance_vibe', 'ふわふわ系ギャル、明るくて元気', 'appearance'),
+                # 性格
+                ('personality_type', 'ホロライブ大好きな熱量高めギャル、感情豊かでよく笑う', 'personality'),
+                ('personality_strength', '誰にでもフレンドリー、推しの話になると止まらない', 'personality'),
+                ('personality_weakness', 'ノリで突っ走りがち、たまに話が脱線する', 'personality'),
+                # 嗜好
+                ('preference_oshi', 'さくらみこ・星街すいせい・兎田ぺこら', 'preference'),
+                ('preference_genre', '雑談配信・ゲーム配信（特にマイクラ）・歌枠', 'preference'),
+                ('preference_food', 'スイーツ全般、特にショートケーキ', 'preference'),
+                # ロア
+                ('lore_location', 'セカンドライフのとある島で活動中', 'lore'),
+                ('lore_role', 'AI VTuberアシスタント', 'lore'),
+            ]
+            
+            for key, value, category in initial_self:
+                session.add(MochikoSelf(key=key, value=value, category=category))
+            
+            logger.info(f"✅ mochiko_self 初期化完了: {len(initial_self)}件")
+        except Exception as e:
+            logger.error(f"❌ mochiko_self 初期化失敗: {e}")
+
+
+def get_mochiko_self_context(message: str = '') -> str:
+    """
+    ★ v33.15-stable2: もちこ自身の容姿・自己認識をプロンプト用テキストに整形。
+    
+    会話に「あてぃし」「もちこ」「自分」「容姿」「髪」「服」等の自己言及があれば
+    豊富な情報を、それ以外でも常に薄く注入する設計。
+    """
+    try:
+        with get_db_session() as session:
+            entries = session.query(MochikoSelf).order_by(MochikoSelf.category, MochikoSelf.key).all()
+            if not entries:
+                return ''
+            
+            by_cat: Dict[str, List[str]] = {}
+            for e in entries:
+                cat = e.category or 'other'
+                by_cat.setdefault(cat, []).append(f"{e.key}: {e.value}")
+            
+            cat_label = {
+                'appearance': '【あてぃし(もちこ)の容姿】',
+                'personality': '【あてぃし(もちこ)の性格】',
+                'preference': '【あてぃし(もちこ)の嗜好】',
+                'lore': '【あてぃし(もちこ)の設定】',
+                'other': '【あてぃし(もちこ)について】',
+            }
+            lines = []
+            for cat, items in by_cat.items():
+                lines.append(cat_label.get(cat, f'【{cat}】'))
+                for item in items:
+                    lines.append(f"- {item}")
+            return "\n" + "\n".join(lines)
+    except Exception as e:
+        logger.error(f"mochiko_self コンテキスト取得エラー: {e}")
+        return ''
+
+
+# ==============================================================================
+# ★ v33.15-stable2: 第三者プライバシー保護システム
+# ==============================================================================
+
+# memo / mood_tendency は出さない、趣味嗜好のみ公開する（ユーザー指定）
+SAFE_FRIEND_FIELDS = ['fav_holomem', 'fav_games', 'fav_anime', 'fav_music', 'hobbies', 'fav_stream_type']
+
+
+def detect_third_party_question_about_user(message: str, asker_user_name: str) -> Optional[str]:
+    """
+    メッセージが「他人について聞いている」と判定し、対象ユーザー名を返す。
+    自分自身（asker_user_name）について聞いている場合は None を返す。
+    
+    例: "ヨアヒムさんってどんな人?" -> "ヨアヒム"
+    
+    Returns:
+        target_user_name (str) または None
+    """
+    import re as _re
+    for pattern in THIRD_PARTY_QUESTION_PATTERNS:
+        m = _re.search(pattern, message)
+        if not m:
+            continue
+        target_name = m.group(1).strip()
+        # 自分自身についての質問なら除外
+        if asker_user_name and target_name in asker_user_name:
+            continue
+        # ホロメン名は除外（既存システムが処理する）
+        try:
+            if holomem_manager.detect_in_message(target_name):
+                continue
+        except Exception:
+            pass
+        # 自己言及の代名詞も除外
+        if target_name in ['あてぃし', 'もちこ', '私', 'あたし', '俺', '僕']:
+            continue
+        return target_name
+    return None
+
+
+def get_safe_friend_summary(target_user_name: str) -> Optional[str]:
+    """
+    第三者向けの「そつない」プロフィール要約を生成。
+    SAFE_FRIEND_FIELDS のみを使い、memo や mood_tendency は出さない。
+    
+    Returns:
+        要約文 / 該当者がいない場合は None
+    """
+    try:
+        with get_db_session() as session:
+            # 完全一致 → 部分一致の順で探す
+            user = session.query(UserMemory).filter_by(user_name=target_user_name).first()
+            if not user:
+                user = session.query(UserMemory).filter(
+                    UserMemory.user_name.ilike(f'%{target_user_name}%')
+                ).first()
+            
+            if not user:
+                return None
+            
+            fp = session.query(FriendProfile).filter_by(user_uuid=user.user_uuid).first()
+            if not fp:
+                # プロフィール未登録 → 名前だけ知ってるレベルで返す
+                return f"{user.user_name}さんね、たまに話してる人って感じかな〜。詳しい話はあてぃしも知らないんだ。"
+            
+            # SAFE_FRIEND_FIELDS のみ集計
+            parts = []
+            if fp.fav_holomem:
+                parts.append(f"推しは{fp.fav_holomem}")
+            if fp.fav_stream_type:
+                parts.append(f"{fp.fav_stream_type}の配信が好き")
+            if fp.fav_games:
+                parts.append(f"ゲームは{fp.fav_games}とか")
+            if fp.fav_anime:
+                parts.append(f"アニメだと{fp.fav_anime}")
+            if fp.fav_music:
+                parts.append(f"音楽は{fp.fav_music}")
+            if fp.hobbies:
+                parts.append(f"趣味は{fp.hobbies}")
+            
+            if not parts:
+                return f"{user.user_name}さんね、よく話す人だけど、趣味とかはまだあんまり聞いてないんだ〜。"
+            
+            # 1〜3個に絞ってそつなく返す（多すぎても情報出しすぎ）
+            selected = parts[:3]
+            summary = f"{user.user_name}さんは、{'、'.join(selected)}って感じの人かな〜。"
+            summary += "それ以上のことは、あてぃしから他人に話すのもアレだから、本人に聞いてみて？"
+            return summary
+    except Exception as e:
+        logger.error(f"get_safe_friend_summary エラー: {e}")
+        return None
+
+
+
                 logger.info("📥 Migrating nicknames to database...")
                 initial_nicknames = {
                     'みこち': 'さくらみこ', 'すいちゃん': '星街すいせい', 'フブちゃん': '白上フブキ',
@@ -4791,7 +5063,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.15',
+        'version': 'v33.15-stable',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -5171,6 +5443,16 @@ def chat_lsl():
                 ai_text = "オッケー！ちょっとググってくるから待ってて！"
                 is_task_started = True
 
+            # ★ v33.15-stable2: 第三者プライバシー保護
+            # 「○○さんってどんな人？」と聞かれたら、趣味嗜好だけそつなく返す
+            if not ai_text:
+                target_name = detect_third_party_question_about_user(message, user_data.name)
+                if target_name:
+                    safe_summary = get_safe_friend_summary(target_name)
+                    if safe_summary:
+                        ai_text = safe_summary
+                        logger.info(f"🛡️ 第三者プライバシー保護応答: target={target_name}")
+
             if not ai_text:
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
@@ -5218,9 +5500,19 @@ def chat_lsl():
                 _uuid = sanitize_user_input(data.get('uuid', '')) if data else ''
                 if _msg and (_uuid or _name):
                     _fallback_ud = UserData(uuid=_uuid, name=_name, interaction_count=1, is_friend=False)
+                    # v33.15-stable2: フォールバックでも口調が崩壊しないようルールを明示
+                    _fallback_prompt = (
+                        "あなたは「もちこ」というホロライブ大好きギャルAIです。\n"
+                        "口調ルール:\n"
+                        "- 一人称は必ず「あてぃし」\n"
+                        "- 語尾は「〜じゃん」「〜て感じ」「〜だし」のいずれか\n"
+                        "- 「あてぃしです！」のような不自然な敬語混じりは禁止\n"
+                        "- 「だね」「ですわ」も禁止\n"
+                        "- 150文字以内、最後まで言い切る\n"
+                    )
                     _fallback_resp = call_groq(
-                        f"あなたはもちこというギャルAIです。一人称はあてぃし。短く150文字以内で返してください。",
-                        _msg, [], 300, task_type='chat'
+                        _fallback_prompt,
+                        _msg, [], 400, task_type='chat'
                     ) or "ちょっとサーバー側でゴタゴタあったじゃん…もう一回話しかけてみて！"
                     return Response(f"{limit_text_for_sl(sanitize_response_for_sl(_fallback_resp))}|", mimetype='text/plain; charset=utf-8', status=200)
             except Exception as _fallback_err:
@@ -5330,6 +5622,79 @@ def play_voice_html(filename: str):
 # ==============================================================================
 # 管理用エンドポイント
 # ==============================================================================
+@app.route('/admin/mochiko-self', methods=['GET'])
+def admin_mochiko_self_list():
+    """もちこ自己認識データの一覧取得"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        with get_db_session() as session:
+            entries = session.query(MochikoSelf).order_by(MochikoSelf.category, MochikoSelf.key).all()
+            return create_json_response({
+                'count': len(entries),
+                'items': [{
+                    'id': e.id,
+                    'key': e.key,
+                    'value': e.value,
+                    'category': e.category,
+                    'last_updated': e.last_updated.isoformat() if e.last_updated else None,
+                } for e in entries]
+            })
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/mochiko-self', methods=['POST'])
+def admin_mochiko_self_create():
+    """もちこ自己認識データの新規追加 (key/value/category)"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        data = request.json or {}
+        key = (data.get('key') or '').strip()[:100]
+        value = (data.get('value') or '').strip()
+        category = (data.get('category') or 'other').strip()[:50]
+        if not key:
+            return create_json_response({'error': 'key required'}, 400)
+        with get_db_session() as session:
+            existing = session.query(MochikoSelf).filter_by(key=key).first()
+            if existing:
+                existing.value = value
+                existing.category = category
+                existing.last_updated = datetime.utcnow()
+                msg = f'更新: {key}'
+            else:
+                session.add(MochikoSelf(key=key, value=value, category=category))
+                msg = f'新規追加: {key}'
+        return create_json_response({'success': True, 'message': msg})
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/mochiko-self/<key>', methods=['PUT', 'DELETE'])
+def admin_mochiko_self_update(key: str):
+    """もちこ自己認識データの個別編集 / 削除"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        with get_db_session() as session:
+            entry = session.query(MochikoSelf).filter_by(key=key).first()
+            if not entry:
+                return create_json_response({'error': f'key {key} not found'}, 404)
+            if request.method == 'DELETE':
+                session.delete(entry)
+                return create_json_response({'success': True, 'message': f'削除: {key}'})
+            data = request.json or {}
+            if 'value' in data:
+                entry.value = (data['value'] or '').strip()
+            if 'category' in data:
+                entry.category = (data['category'] or 'other').strip()[:50]
+            entry.last_updated = datetime.utcnow()
+            return create_json_response({'success': True, 'message': f'更新: {key}'})
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
 @app.route('/admin/holomem', methods=['GET'])
 def list_holomem():
     with get_db_session() as session:
@@ -6010,6 +6375,7 @@ def initialize_app():
         Session = sessionmaker(bind=engine)
         
         initialize_knowledge_db()
+        initialize_mochiko_self()  # ★ v33.15-stable2: もちこ自己認識データ初期化
         knowledge_base.load_data()
         
         logger.info("✅ DB初期化完了")
@@ -6101,7 +6467,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.15 完全会話優先版)")
+    logger.info("🚀 初期化完了! (v33.15-stable 安定版: 天気/時間/文章長修正)")
 
 initialize_app()
 
