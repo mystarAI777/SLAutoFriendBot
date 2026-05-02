@@ -142,9 +142,9 @@ GROQ_MODELS = [
 # compound-beta はツール呼び出し・マルチステップが得意だが応答が遅い
 # llama-4-maverick は長文コンテキスト + 高速のバランスが良い
 GROQ_TASK_MODELS = {
-    'chat':     ['llama-3.1-8b-instant', 'qwen-qwen3-32b', 'llama-3.3-70b-versatile'],
-    'search':   ['meta-llama/llama-4-scout-17b-16e-instruct', 'llama-3.3-70b-versatile', 'openai/gpt-oss-120b'],
-    'analysis': ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct', 'deepseek-r1-distill-llama-70b'],
+    'chat':     ['llama-3.1-8b-instant', 'llama-4-maverick-17b-128e-instruct', 'llama-3.3-70b-versatile'],
+    'search':   ['compound-beta', 'llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct'],
+    'analysis': ['llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct', 'deepseek-r1-distill-llama-70b'],
     'default':  GROQ_MODELS,
 }
 
@@ -1174,14 +1174,43 @@ def is_time_request(msg: str) -> bool:
 def is_weather_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
 
+def is_news_topic(msg: str) -> bool:
+    """
+    v33.16: メッセージがニュース・話題系かどうか判定する。
+    True の場合、generate_ai_response 内で:
+      - 番号付きリスト形式での回答を許可
+      - 出力トークン上限を増やす（解像度の高い応答）
+    """
+    keywords = ['ニュース', 'news', 'NEWS', '最新', '話題', '今', 'トレンド',
+                '配信中', '配信してる', '配信予定', '何が', '何か', 'どんな']
+    return any(kw in msg for kw in keywords)
+
+
+def is_holomem_topic(msg: str) -> bool:
+    """
+    v33.16: メッセージがホロメン関連の話題かどうか判定する。
+    True の場合、出力トークン上限を増やす（推し語り・配信感想で解像度を上げる）。
+    """
+    try:
+        if holomem_manager.detect_in_message(msg):
+            return True
+    except Exception:
+        pass
+    holo_kws = ['ホロライブ', 'ホロメン', 'VTuber', 'Vtuber', 'vtuber',
+                '推し', '配信', 'ライブ', '歌枠', '雑談枠', 'コラボ']
+    return any(kw in msg for kw in holo_kws)
+
+
 def is_explicit_search_request(msg: str) -> bool:
     msg = msg.strip()
     strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい']
     if any(kw in msg for kw in strong_triggers):
         return True
-    noun_triggers = ['ニュース', 'news', 'NEWS', '情報', '日程', 'スケジュール', '天気', '予報']
+    # v33.16: 「天気/予報」を除外。is_weather_request() で先に処理されるため、
+    #         ここで検索ルートに流すと JMA API が呼ばれず雑な要約応答になる。
+    noun_triggers = ['ニュース', 'news', 'NEWS', '情報', '日程', 'スケジュール']
     if any(kw in msg for kw in noun_triggers):
-        # ★ v33.16b: 「ホロライブのニュース」「最新情報」のような短い問い合わせは
+        # 「ホロライブのニュース」のような短い問い合わせは
         # DBコンテキスト（HololiveNews等）で十分答えられるため、外部検索しない。
         # 「〇〇のニュース教えて」「〇〇について調べて」など明示的な調査依頼のみ検索。
         if any(kw in msg for kw in ['調べて', '検索', '教えて', '詳しく', '最新']):
@@ -3923,7 +3952,11 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
 # ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
-def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Optional[str]:
+def call_gemini(system_prompt: str, message: str, history: List[Dict], max_output_tokens: int = 600) -> Optional[str]:
+    """
+    v33.16: max_output_tokens を引数化。ニュース・ホロメン話題時は拡張。
+    通常: 600 / ニュース・ホロメン: 1000 (約400文字応答)
+    """
     model = gemini_model_manager.get_current_model()
     if not model:
         return None
@@ -3944,7 +3977,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict]) -> Option
 
         response = model.generate_content(
             contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": 600}  # v33.15-stable: 400→600（ギャル口調で文章途切れ対策）
+            generation_config={"temperature": 0.8, "max_output_tokens": max_output_tokens}
         )
         
         if hasattr(response, 'candidates') and response.candidates:
@@ -4026,16 +4059,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
         holo_keywords = ['ニュース', '情報', 'ホロライブ', 'ホロメン', '配信', 'どう', '最近', 'なんか', 'って']
         if any(kw in message for kw in holo_keywords):
             with get_db_session() as session_news:
-                # ★ v33.16: 3件+80文字に削減（コンテキスト肥大化防止）
-                latest_news = session_news.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(3).all()
+                # ★ v33.16: 5件+200文字に拡張（番号付きリスト引用に対応）
+                latest_news = session_news.query(HololiveNews).order_by(HololiveNews.created_at.desc()).limit(5).all()
                 if latest_news:
                     news_lines = []
-                    for n in latest_news:
-                        body_preview = n.content[:80] if n.content and n.content != n.title else ""
+                    for i, n in enumerate(latest_news, 1):
+                        body_preview = n.content[:200] if n.content and n.content != n.title else ""
                         if body_preview:
-                            news_lines.append(f"【{n.title}】{body_preview}")
+                            news_lines.append(f"{i}. 【{n.title}】{body_preview}")
                         else:
-                            news_lines.append(f"【{n.title}】")
+                            news_lines.append(f"{i}. 【{n.title}】")
                     news_text = "\n".join(news_lines)
                     internal_context += f"\n\n【ホロライブ最新ニュース】\n{news_text}"
     except Exception as e:
@@ -4163,9 +4196,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
         logger.error(f"Mochiko self context injection error: {e}")
 
 
-    # ★ v33.16: コンテキスト総量を2500文字に制限（Gemini タイムアウト・RPM超過防止）
-    if len(internal_context) > 2500:
-        internal_context = internal_context[:2500] + "\n…(コンテキスト省略)"
+    # ★ v33.16: コンテキスト総量を3500文字に拡張
+    # 2500だとホロメン詳細+ニュース+スケジュール+友達記憶で切り詰められ
+    # DB活用が薄くなる。ホロメン解像度を保つため拡張。
+    if len(internal_context) > 3500:
+        internal_context = internal_context[:3500] + "\n…(コンテキスト省略)"
 
     if not groq_client and not gemini_model:
         return "ごめんね、今ちょっとAIの調子が悪いみたい…また後で話しかけて！"
@@ -4294,12 +4329,18 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 8. **【アニメ情報】がある場合、それを使ってアニメの話を盛り上げてください。知らなかった作品でも、検索して得た情報から「あー、それ知ってる！〇〇なやつでしょ？」と自然に反応してください。**
 
 # 【出力のルール（超重要）】
-1. 1回の回答は「**150〜200文字程度**」に厳密に収めてください（400字はNG、長すぎると会話が止まります）。
-2. **1メッセージに1トピックまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
+1. **文字数の目安**:
+   - 通常会話: 150〜200文字
+   - ニュース・配信情報・ホロメン語り: 250〜400文字（解像度を上げる）
+2. **1メッセージに1テーマまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
 3. **相手に2つ以上の質問を同時にしない**。質問するなら1個だけ。
 4. 絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調は維持してください。
-5. 箇条書きは使わない。自然な会話文で返してください。
+5. **箇条書き・番号付きリストの使い分け**:
+   - **ニュース・配信情報・話題まとめ**: 番号付きリスト（1. / 2. / 3.）でOK。各項目の頭に絵文字を付けて見やすく。
+   - **通常の雑談**: 自然な会話文で返してください（リスト禁止）。
+   - 例: 「ホロライブのニュース教えて」→ 番号付きで3〜5件、各項目に短い感想付き。
 6. 文章が途中で切れるとカッコ悪いから、必ず最後まで言い切る形で完結させてください。
+7. **DB情報の活用**: 【ホロライブ最新ニュース】や【ホロライブ配信スケジュール】が与えられている場合、その内容を**実際に引用**して答えてください（「〇〇って配信してたよ」と具体的に）。「最新情報あるよ」だけの抽象的応答は禁止。
 
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
@@ -4333,13 +4374,17 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     else:
         history_for_ai = history
 
-    response = call_gemini(system_prompt, normalized_message, history_for_ai)
+    # ★ v33.16: ニュース・ホロメン話題は出力トークンを拡張して解像度を上げる
+    is_rich_topic = is_news_topic(message) or is_holomem_topic(message)
+    gemini_max_tokens = 1000 if is_rich_topic else 600
+    groq_max_tokens = 1000 if (is_task_report or is_rich_topic) else 400
+
+    response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     if not response:
         # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
-        # ★ v33.12: 通常会話は 400 tokens に絞る（150-200文字応答）
+        # ★ v33.16: ニュース・ホロメン話題は通常会話より長めに（解像度向上）
         _task_type = 'search' if is_task_report else 'chat'
-        _max_tokens = 800 if is_task_report else 400  # 検索レポートは長め、通常は短め
-        response = call_groq(system_prompt, normalized_message, history_for_ai, _max_tokens, task_type=_task_type)
+        response = call_groq(system_prompt, normalized_message, history_for_ai, groq_max_tokens, task_type=_task_type)
     
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
@@ -5393,6 +5438,17 @@ def chat_lsl():
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
 
+            # ★ v33.16: 時刻・天気判定を最優先に移動
+            # 旧版では is_explicit_search_request が先に評価されたため、
+            # 「東京の天気」が検索ルートに流れて Groq 8B が雑な要約を返していた。
+            if not ai_text:
+                if is_time_request(message):
+                    ai_text = get_japan_time()
+                    logger.info(f"⏰ 時刻応答: {ai_text}")
+                elif is_weather_request(message):
+                    ai_text = get_weather_forecast(extract_location(message))
+                    logger.info(f"🌦️ 天気応答: {ai_text[:60]}")
+
             # ★ 追加: 専門サイト検索トピック検出
             # Blender / CGニュース / 脳科学のキーワードを検知し、
             # 対象サイト内限定検索（site:演算子）をバックグラウンドで実行
@@ -5461,12 +5517,8 @@ def chat_lsl():
                     ai_text = holomem_resp
                     logger.info("🎀 ホロメン応答完了")
             
-            if not ai_text:
-                if is_time_request(message):
-                    ai_text = get_japan_time()
-                elif is_weather_request(message):
-                    ai_text = get_weather_forecast(extract_location(message))
-            
+            # ★ v33.16: 時刻・天気は Patch 5 の位置（最優先）で処理済み
+
             # ★ v33.4.0: session を渡して友達記憶を活用
             if not ai_text:
                 ai_text = _generate_with_timeout(user_data, message, history, session, user_uuid)
