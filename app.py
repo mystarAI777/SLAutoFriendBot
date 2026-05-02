@@ -5565,7 +5565,9 @@ def chat_lsl():
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
 
         # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
-        res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text))
+        # ニュース・ホロメン話題は番号付きリストで長くなるため上限を拡張
+        _sl_max = 1200 if (is_news_topic(message) or is_holomem_topic(message)) else SL_SAFE_CHAR_LIMIT
+        res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text), max_length=_sl_max)
         v_url = ""
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
             direct_url = generate_voice_file(res_text, user_uuid)
