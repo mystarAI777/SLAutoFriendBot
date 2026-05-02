@@ -5038,7 +5038,7 @@ def get_safe_friend_summary(target_user_name: str) -> Optional[str]:
                     session.add(HololiveGlossary(term=term, description=desc))
                 logger.info(f"✅ Glossary initialized: {len(initial_glossary)}")
 
-            except Exception as e:
+        except Exception as e:
             logger.error(f"❌ Knowledge DB initialization failed: {e}")
 
 # ==============================================================================
