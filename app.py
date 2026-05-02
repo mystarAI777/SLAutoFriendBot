@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 # ===== サードパーティライブラリ =====
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -138,13 +138,25 @@ GROQ_MODELS = [
     "deepseek-r1-distill-llama-70b",        # 推論特化フォールバック (上記が全滅した場合)
 ]
 
-# 用途別モデル選択マップ
-# compound-beta はツール呼び出し・マルチステップが得意だが応答が遅い
-# llama-4-maverick は長文コンテキスト + 高速のバランスが良い
+# 用途別モデル選択マップ (v33.16 再設計)
+# 設計思想:
+#   - chat:     雑談・もちこ口調維持・DB活用が最重要 -> 70B 優先
+#   - search:   検索結果の長文要約 -> 128k長文対応の Llama4 Maverick 優先
+#   - analysis: 心理分析・JSON出力安定性 -> 70B + 推論特化 DeepSeek
+#
+# 注意: llama-3.1-8b-instant は応答速度は速いが、
+#       150文字以内の制約や「あてぃし」口調の維持に失敗しやすい。
+#       会話用途では最終フォールバックに格下げ。
 GROQ_TASK_MODELS = {
-    'chat':     ['llama-3.1-8b-instant', 'llama-4-maverick-17b-128e-instruct', 'llama-3.3-70b-versatile'],
-    'search':   ['compound-beta', 'llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct'],
-    'analysis': ['llama-3.3-70b-versatile', 'llama-4-maverick-17b-128e-instruct', 'deepseek-r1-distill-llama-70b'],
+    'chat':     ['llama-3.3-70b-versatile',
+                 'llama-4-maverick-17b-128e-instruct',
+                 'llama-3.1-8b-instant'],
+    'search':   ['llama-4-maverick-17b-128e-instruct',
+                 'compound-beta',
+                 'llama-3.3-70b-versatile'],
+    'analysis': ['llama-3.3-70b-versatile',
+                 'deepseek-r1-distill-llama-70b',
+                 'llama-4-maverick-17b-128e-instruct'],
     'default':  GROQ_MODELS,
 }
 
@@ -169,6 +181,16 @@ MOCHIKO_TONE_RULES = """# もちこの口調（厳密遵守）
 - 禁止: 「だね」（ギャル感が薄れる） / 「ですわ」「ですよね」（敬語混入禁止）
 - 文章は最後まで言い切る（途中で切れる文末は禁止）
 """
+
+# v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
+CORRECTION_PATTERNS = [
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:でしょ|だよ|だって|だった|の方|だろ)',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*じゃなくて\s*([^\s\u3001\u3002!?！？]{2,30})',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:所属|の子|のメンバー)',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:だっけ|だよね)',
+    r'違うよ[\u3001\u3002]?\s*([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})',
+]
+
 
 # 第三者からの問い合わせ検出に使うパターン (Part C で使用)
 THIRD_PARTY_QUESTION_PATTERNS = [
@@ -966,6 +988,23 @@ class MochikoSelf(Base):
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class LearningLog(Base):
+    """
+    v33.16: ファクトチェック付き自動学習の監査ログ。
+    会話中の指摘っぽい発言を記録し、信頼度判定の結果と DB 反映状況を残す。
+    """
+    __tablename__ = 'learning_log'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    user_message = Column(Text, nullable=False)
+    extracted = Column(Text, nullable=True)
+    fact_check_score = Column(Integer, default=0)
+    fact_check_evidence = Column(Text, nullable=True)
+    action_taken = Column(String(20), index=True)
+    db_changes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class TaskLog(Base):
     """
     バックグラウンドタスクの最終実行時刻を記録する。
@@ -1173,33 +1212,6 @@ def is_time_request(msg: str) -> bool:
 
 def is_weather_request(msg: str) -> bool:
     return any(kw in msg for kw in ['今日の天気', '明日の天気', '天気予報', '天気は'])
-
-def is_news_topic(msg: str) -> bool:
-    """
-    v33.16: メッセージがニュース・話題系かどうか判定する。
-    True の場合、generate_ai_response 内で:
-      - 番号付きリスト形式での回答を許可
-      - 出力トークン上限を増やす（解像度の高い応答）
-    """
-    keywords = ['ニュース', 'news', 'NEWS', '最新', '話題', '今', 'トレンド',
-                '配信中', '配信してる', '配信予定', '何が', '何か', 'どんな']
-    return any(kw in msg for kw in keywords)
-
-
-def is_holomem_topic(msg: str) -> bool:
-    """
-    v33.16: メッセージがホロメン関連の話題かどうか判定する。
-    True の場合、出力トークン上限を増やす（推し語り・配信感想で解像度を上げる）。
-    """
-    try:
-        if holomem_manager.detect_in_message(msg):
-            return True
-    except Exception:
-        pass
-    holo_kws = ['ホロライブ', 'ホロメン', 'VTuber', 'Vtuber', 'vtuber',
-                '推し', '配信', 'ライブ', '歌枠', '雑談枠', 'コラボ']
-    return any(kw in msg for kw in holo_kws)
-
 
 def is_news_topic(msg: str) -> bool:
     """
@@ -1444,27 +1456,83 @@ class HolomemKeywordManager:
         self._last_loaded: Optional[datetime] = None
     
     def load_from_db(self, force: bool = False) -> bool:
+        """
+        v33.16: HolomemWiki に加えて HolomemLingo (1086件のファン辞書) も読み込む。
+        これにより「リオナ」「ヴィヴィ」「ちはや」など愛称・略称も検出可能になる。
+        """
         with self._lock:
             try:
                 with get_db_session() as session:
-                    members = session.query(HolomemWiki).all()
                     self._keywords.clear()
                     self._all_keywords.clear()
-                    for m in members:
+
+                    # (1) HolomemWiki から正式名を読み込み
+                    wiki_members = session.query(HolomemWiki).all()
+                    for m in wiki_members:
                         name = m.member_name
                         self._keywords[name] = [name]
                         self._all_keywords.add(name)
+
+                    # (2) HolomemLingo から正式名 + aliases を読み込み
+                    lingo_entries = session.query(HolomemLingo).all()
+                    for entry in lingo_entries:
+                        name = entry.member_name
+                        if not name or len(name) < 2:
+                            continue
+                        if name not in self._all_keywords:
+                            self._keywords[name] = [name]
+                            self._all_keywords.add(name)
+                        # aliases も追加 (3文字以上のみ。誤検出防止)
+                        try:
+                            data = json.loads(entry.data or '{}')
+                            for alias in data.get('aliases', []):
+                                alias = alias.strip()
+                                if len(alias) >= 3 and alias not in self._all_keywords:
+                                    self._all_keywords.add(alias)
+                                    self._keywords.setdefault(name, []).append(alias)
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                    logger.info(f"📚 HolomemKeywordManager: wiki={len(wiki_members)}件 / lingo={len(lingo_entries)}件 / 検出キーワード総数={len(self._all_keywords)}件")
                     return True
-            except: return False
+            except Exception as e:
+                logger.error(f"HolomemKeywordManager.load_from_db エラー: {e}")
+                return False
     
     def detect_in_message(self, message: str) -> Optional[str]:
+        """後方互換: 最初に見つかった1人だけ返す"""
         with self._lock:
             normalized = knowledge_base.normalize_query(message)
             for keyword in self._all_keywords:
                 if keyword in normalized:
                     return keyword
             return None
-    
+
+    def detect_all_in_message(self, message: str, limit: int = 5) -> List[str]:
+        """
+        v33.16: メッセージ中の全ホロメンを検出して返す(最大 limit 人)。
+        重複は排除し、長いキーワードを優先(フルネームが愛称より先に検出される)。
+        """
+        with self._lock:
+            normalized = knowledge_base.normalize_query(message)
+            sorted_keywords = sorted(self._all_keywords, key=len, reverse=True)
+            detected = []
+            consumed_ranges = []
+
+            for keyword in sorted_keywords:
+                idx = normalized.find(keyword)
+                if idx < 0:
+                    continue
+                end = idx + len(keyword)
+                overlap = any(not (end <= s or idx >= e) for s, e in consumed_ranges)
+                if overlap:
+                    continue
+                detected.append(keyword)
+                consumed_ranges.append((idx, end))
+                if len(detected) >= limit:
+                    break
+            return detected
+
     def get_member_count(self) -> int:
         with self._lock: return len(self._keywords)
 
@@ -2469,6 +2537,55 @@ def fetch_holomem_episodes():
 
 
 # ==============================================================================
+# ★ v33.16: チャンネル名から日本語ホロメン名・グループ名を抽出
+# ==============================================================================
+def extract_japanese_name_from_channel(channel_name: str) -> tuple:
+    """
+    Holodex のチャンネル名から日本語ホロメン名と所属グループを抽出する。
+
+    パターン例:
+      "Riona Ch. 響咲リオナ - FLOW GLOW"   -> ("響咲リオナ", "FLOW GLOW")
+      "Pekora Ch. 兎田ぺこら"                -> ("兎田ぺこら", None)
+      "Lui ch. 鷹嶺ルイ - holoX -"           -> ("鷹嶺ルイ", "holoX")
+      "Kureiji Ollie Ch. hololive-ID"        -> (None, "hololive-ID")
+
+    Returns: (japanese_name, group_name) どちらも見つからない場合 (None, None)
+    """
+    if not channel_name:
+        return (None, None)
+
+    cleaned = channel_name.strip().rstrip('-').strip()
+    cleaned = re.sub(r'チャンネル\s*$', '', cleaned)
+
+    # グループ名抽出 ("- グループ名" / "‐ グループ名" 形式)
+    group_name = None
+    group_pattern = r'[-\u2010-\u2015]\s*(FLOW GLOW|ReGLOSS|holoX|HOLOSTARS|hololive-EN|hololive-ID|UPROAR!!|DEV_IS|holoStars-EN)\s*[-\u2010-\u2015]?\s*$'
+    group_match = re.search(group_pattern, cleaned, re.IGNORECASE)
+    if group_match:
+        group_name = group_match.group(1)
+        cleaned = cleaned[:group_match.start()].strip()
+
+    # 日本語名抽出 パターン1: "英語名 Ch. 日本語名"
+    m = re.search(r'(?:Ch\.|ch\.|Channel|channel)\s*([\u3040-\u9fff\u30fb\u30fc]+)', cleaned)
+    if m:
+        return (m.group(1).strip(), group_name)
+
+    # パターン2: "日本語名Ch.|チャンネル"
+    m = re.search(r'^([\u3040-\u9fff\u30fb\u30fc]+?)(?:Ch[\.\u3002]|チャンネル)', cleaned)
+    if m:
+        return (m.group(1).strip(), group_name)
+
+    # パターン3: 末尾の日本語連続部分(2文字以上)
+    m = re.search(r'([\u3040-\u9fff\u30fb\u30fc]{2,})\s*$', cleaned)
+    if m:
+        japanese_name = m.group(1).strip()
+        if japanese_name not in ('ホロライブ',):
+            return (japanese_name, group_name)
+
+    return (None, group_name)
+
+
+# ==============================================================================
 # ★ v33.10: Holodex API から配信スケジュール取得 (旧 schedule.hololive.tv スクレイピングから移行)
 # ==============================================================================
 def fetch_hololive_schedule():
@@ -2552,6 +2669,10 @@ def fetch_hololive_schedule():
                 # サムネ (YouTubeの自動生成サムネを使用)
                 thumbnail = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
 
+                # ★ v33.16: チャンネル名から日本語名・グループを抽出
+                japanese_name, group_name = extract_japanese_name_from_channel(member_name)
+                save_member_name = japanese_name if japanese_name else member_name
+
                 # DB保存（個別トランザクション。失敗してもループ継続）
                 try:
                     with get_db_session() as session:
@@ -2560,11 +2681,15 @@ def fetch_hololive_schedule():
                             existing.status = status
                             existing.scheduled_at = scheduled_utc
                             existing.fetched_at = datetime.utcnow()
+                            # 既存エントリの member_name がチャンネル名形式の場合のみ更新
+                            if japanese_name and existing.member_name != japanese_name:
+                                if 'Ch.' in (existing.member_name or '') or 'ch.' in (existing.member_name or ''):
+                                    existing.member_name = japanese_name
                             updated += 1
                         else:
                             session.add(LiveSchedule(
                                 video_id=video_id,
-                                member_name=member_name,
+                                member_name=save_member_name,
                                 scheduled_at=scheduled_utc,
                                 status=status,
                                 is_collab=is_collab,
@@ -2573,6 +2698,21 @@ def fetch_hololive_schedule():
                                 thumbnail=thumbnail
                             ))
                             added += 1
+
+                        # ★ v33.16: 日本語名が取れたら HolomemWiki に未登録なら自動追加
+                        if japanese_name and len(japanese_name) >= 2:
+                            wiki_existing = session.query(HolomemWiki).filter_by(member_name=japanese_name).first()
+                            if not wiki_existing:
+                                session.add(HolomemWiki(
+                                    member_name=japanese_name,
+                                    description=None,
+                                    generation=group_name,
+                                    debut_date=None,
+                                    tags=japanese_name,
+                                    status='現役',
+                                    last_updated=datetime.utcnow()
+                                ))
+                                logger.info(f"🆕 HolomemWiki 自動追加: {japanese_name} ({group_name or '所属不明'})")
                 except Exception as db_err:
                     logger.debug(f"LiveSchedule保存エラー ({video_id}): {db_err}")
 
@@ -3977,6 +4117,178 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
 
 
 # ==============================================================================
+# ★ v33.16: 自動学習システム(ファクトチェック付き)
+# ==============================================================================
+
+def detect_correction_intent(message: str) -> Optional[Dict]:
+    """
+    v33.16: ユーザー発言が「ホロメン情報の指摘」か正規表現で粗判定。LLM不要で軽量。
+    Returns: {'subject': '...', 'predicate': '...'} または None
+    """
+    for pattern in CORRECTION_PATTERNS:
+        m = re.search(pattern, message)
+        if m:
+            subject = m.group(1).strip()
+            predicate = m.group(2).strip()
+            if 2 <= len(subject) <= 25 and 2 <= len(predicate) <= 30:
+                return {'subject': subject, 'predicate': predicate}
+    return None
+
+
+def fact_check_with_lingo(subject: str, predicate: str) -> Tuple[int, List[str]]:
+    """v33.16: holomem_lingo (1086件) で照合してスコア(0-50点)を返す"""
+    score = 0
+    evidence = []
+    try:
+        with get_db_session() as session:
+            lingo = session.query(HolomemLingo).filter(
+                HolomemLingo.member_name.contains(subject)
+            ).first()
+            if lingo:
+                data_str = (lingo.data or '').lower()
+                if predicate.lower() in data_str:
+                    score = 50
+                    evidence.append(f"lingo: {lingo.member_name} の data に '{predicate}' あり")
+                else:
+                    score = 25
+                    evidence.append(f"lingo: {lingo.member_name} 登録あり(属性は不明)")
+                try:
+                    data = json.loads(lingo.data or '{}')
+                    if subject in data.get('aliases', []):
+                        score += 10
+                        evidence.append(f"lingo: aliases に '{subject}' 完全一致")
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        logger.debug(f"fact_check_with_lingo エラー: {e}")
+    return (min(score, 50), evidence)
+
+
+def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
+    """v33.16: Holodex API でチャンネル存在確認(0-50点)"""
+    score = 0
+    evidence = []
+    if not HOLODEX_API_KEY:
+        return (0, evidence)
+
+    try:
+        url = "https://holodex.net/api/v2/channels"
+        headers = {"X-APIKEY": HOLODEX_API_KEY}
+        params = {"org": "Hololive", "type": "vtuber", "limit": 50, "lang": "ja"}
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            return (0, evidence)
+
+        channels = res.json()
+        if not isinstance(channels, list):
+            return (0, evidence)
+
+        for ch in channels:
+            ch_name = (ch.get('name') or '') + ' ' + (ch.get('english_name') or '')
+            if subject in ch_name:
+                score = 50
+                evidence.append(f"Holodex: チャンネル '{ch.get('name', '')}' に '{subject}' を確認")
+                ch_group = ch.get('group') or ''
+                if ch_group:
+                    evidence.append(f"Holodex: 所属グループ = {ch_group}")
+                break
+    except Exception as e:
+        logger.debug(f"fact_check_with_holodex エラー: {e}")
+    return (score, evidence)
+
+
+def fact_check_correction(extracted: Dict) -> Dict:
+    """
+    v33.16: lingo (50点) + Holodex (50点) = 100点満点でファクトチェック。
+    Returns: {'score': 0-100, 'evidence': [...], 'trustable': bool}
+    """
+    subject = extracted.get('subject', '')
+    predicate = extracted.get('predicate', '')
+
+    score_lingo, evidence_lingo = fact_check_with_lingo(subject, predicate)
+    score_holodex, evidence_holodex = fact_check_with_holodex(subject)
+
+    total_score = score_lingo + score_holodex
+    return {
+        'score': total_score,
+        'evidence': evidence_lingo + evidence_holodex,
+        'trustable': total_score >= 60,
+    }
+
+
+def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
+    """
+    v33.16: ファクトチェック付き自動学習のメインフロー。
+    バックグラウンドで実行され、信頼度に応じて DB を更新する。
+    """
+    try:
+        result = fact_check_correction(extracted)
+        score = result['score']
+        evidence = result['evidence']
+
+        action = 'rejected'
+        db_changes = []
+
+        if result['trustable']:
+            subject = extracted['subject']
+            predicate = extracted['predicate']
+
+            try:
+                with get_db_session() as session:
+                    # (1) HolomemWiki に未登録なら追加
+                    wiki = session.query(HolomemWiki).filter_by(member_name=subject).first()
+                    if not wiki:
+                        is_group = any(g in predicate for g in ['期生', 'FLOW GLOW', 'ReGLOSS', 'holoX', 'HOLOSTARS', 'EN', 'ID', 'DEV_IS'])
+                        session.add(HolomemWiki(
+                            member_name=subject,
+                            generation=predicate if is_group else None,
+                            tags=subject,
+                            status='現役',
+                            last_updated=datetime.utcnow()
+                        ))
+                        db_changes.append(f"HolomemWiki: 新規 {subject} ({predicate if is_group else '不明'})")
+
+                    # (2) nicknames に正式名->愛称マッピングを追加
+                    lingo = session.query(HolomemLingo).filter(
+                        HolomemLingo.member_name.contains(subject)
+                    ).first()
+                    if lingo and lingo.member_name != subject:
+                        existing_nick = session.query(HolomemNickname).filter_by(nickname=subject).first()
+                        if not existing_nick:
+                            session.add(HolomemNickname(nickname=subject, fullname=lingo.member_name))
+                            db_changes.append(f"HolomemNickname: {subject} -> {lingo.member_name}")
+
+                    action = 'auto_written'
+                    logger.info(f"✅ 自動学習: {subject} (score={score})")
+            except Exception as db_err:
+                logger.error(f"自動学習 DB 書き込みエラー: {db_err}")
+                action = 'rejected'
+        elif score >= 30:
+            action = 'pending'
+            logger.info(f"⏳ 自動学習保留: {extracted} (score={score})")
+        else:
+            logger.info(f"❌ 自動学習却下: {extracted} (score={score})")
+
+        # 監査ログ記録
+        with get_db_session() as session:
+            session.add(LearningLog(
+                user_uuid=user_uuid,
+                user_message=message[:1000],
+                extracted=json.dumps(extracted, ensure_ascii=False),
+                fact_check_score=score,
+                fact_check_evidence=json.dumps(evidence, ensure_ascii=False),
+                action_taken=action,
+                db_changes=json.dumps(db_changes, ensure_ascii=False) if db_changes else None,
+            ))
+
+        if action == 'auto_written':
+            holomem_manager.load_from_db(force=True)
+
+    except Exception as e:
+        logger.error(f"process_correction_learning エラー: {e}")
+
+
+# ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
 def call_gemini(system_prompt: str, message: str, history: List[Dict], max_output_tokens: int = 600) -> Optional[str]:
@@ -4059,25 +4371,44 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     normalized_message = knowledge_base.normalize_query(message)
     internal_context = knowledge_base.get_context_info(message)
     
-    # 1. ホロメン情報の注入（SNS情報 + もちこの記憶含む）
+    # 1. ホロメン情報の注入（複数検出対応・v33.16）
     try:
         holomem_manager.load_from_db()
-        detected_name = holomem_manager.detect_in_message(normalized_message)
-        if detected_name:
+        detected_names = holomem_manager.detect_all_in_message(normalized_message, limit=5)
+        for detected_name in detected_names:
+            # HolomemWiki から詳細を取得
             info = get_holomem_info_cached(detected_name)
             if info:
-                profile = f"【人物データ: {info['member_name']}】\n・{info['description']}\n・所属: {info['generation']}\n・状態: {info['status']}"
+                profile = f"【人物データ: {info['member_name']}】\n・{info.get('description') or ''}\n・所属: {info.get('generation') or '不明'}\n・状態: {info.get('status') or '不明'}"
                 if info.get('graduation_date'):
                     profile += f"\n・卒業日: {info['graduation_date']}"
                 if info.get('recent_activity'):
                     profile += f"\n・直近のX(Twitter)の様子: {info['recent_activity']}"
                 internal_context += f"\n{profile}"
-            
-            # ★ v33.3.0追加: もちこの記憶をコンテキストに注入
+
+            # HolomemLingo から愛称・所属情報を取得 (wiki にない場合のフォールバック)
+            try:
+                with get_db_session() as session_lingo:
+                    lingo = session_lingo.query(HolomemLingo).filter_by(member_name=detected_name).first()
+                    if lingo and not info:
+                        try:
+                            data = json.loads(lingo.data or '{}')
+                            aliases = ', '.join(data.get('aliases', [])[:5]) or '不明'
+                            twitter = data.get('twitter', '')
+                            internal_context += f"\n【参考: {detected_name}】\n・愛称: {aliases}"
+                            if twitter:
+                                internal_context += f"\n・Twitter: {twitter}"
+                            internal_context += f"\n・※ 詳細は調査中、推測で答えず相手から情報を引き出してください"
+                        except json.JSONDecodeError:
+                            pass
+            except Exception as e:
+                logger.debug(f"Lingo lookup error: {e}")
+
+            # もちこの記憶
             memory_context = get_mochiko_memory_context(detected_name)
             if memory_context:
                 internal_context += memory_context
-    
+
     except Exception as e:
         logger.error(f"Context injection error: {e}")
 
@@ -4372,6 +4703,17 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 # 【禁止事項 (Hallucination Prevention)】
 - **知らない情報を無理やり捏造しないこと。**
 - 検索結果や【前提知識】にない情報は、「調べてみたけど分からなかった」と正直に伝えること。
+
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
 
 # もちこの口調:
 - 一人称: 「あてぃし」
@@ -5458,23 +5800,22 @@ def chat_lsl():
 
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
 
+            # ★ v33.16: 指摘っぽい発言を検出したらバックグラウンドで自動学習
+            # (lingo + Holodex でファクトチェックして信頼度60以上ならDB更新)
+            try:
+                correction = detect_correction_intent(message)
+                if correction:
+                    logger.info(f"🎓 指摘検出: {correction}")
+                    task_executor.submit(process_correction_learning, user_uuid, message, correction)
+            except Exception as learn_err:
+                logger.debug(f"自動学習トリガーエラー: {learn_err}")
+
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
            
             # ★ v33.7.0: SL発言なら最新SL情報をバックグラウンドでリフレッシュ予約
             # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
-
-            # ★ v33.16: 時刻・天気判定を最優先に移動
-            # 旧版では is_explicit_search_request が先に評価されたため、
-            # 「東京の天気」が検索ルートに流れて Groq 8B が雑な要約を返していた。
-            if not ai_text:
-                if is_time_request(message):
-                    ai_text = get_japan_time()
-                    logger.info(f"⏰ 時刻応答: {ai_text}")
-                elif is_weather_request(message):
-                    ai_text = get_weather_forecast(extract_location(message))
-                    logger.info(f"🌦️ 天気応答: {ai_text[:60]}")
 
             # ★ v33.16: 時刻・天気判定を最優先に移動
             # 旧版では is_explicit_search_request が先に評価されたため、
@@ -5564,13 +5905,15 @@ def chat_lsl():
             if not is_task_started:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
 
-        # ★ 修正: パイプ除去・繰り返し文字圧縮を適用してからSL文字数制限
-        # ニュース・ホロメン話題は番号付きリストで長くなるため上限を拡張
+        # ★ 修正: 音声生成はフルテキスト(文字数制限なし)を使用。
+        # SLチャット表示用テキストのみ文字数制限を適用することで、
+        # 音声が文の途中で途切れるバグを解消する。
+        voice_text = sanitize_response_for_sl(ai_text)  # パイプ除去のみ、文字数制限なし
         _sl_max = 1250 if (is_news_topic(message) or is_holomem_topic(message)) else SL_SAFE_CHAR_LIMIT
-        res_text = limit_text_for_sl(sanitize_response_for_sl(ai_text), max_length=_sl_max)
+        res_text = limit_text_for_sl(voice_text, max_length=_sl_max)  # SL表示用のみ制限
         v_url = ""
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
-            direct_url = generate_voice_file(res_text, user_uuid)
+            direct_url = generate_voice_file(voice_text, user_uuid)  # フルテキストで音声生成
             if direct_url:
                 v_url = direct_url
             
@@ -5785,6 +6128,50 @@ def admin_mochiko_self_update(key: str):
                 entry.category = (data['category'] or 'other').strip()[:50]
             entry.last_updated = datetime.utcnow()
             return create_json_response({'success': True, 'message': f'更新: {key}'})
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/learning-log', methods=['GET'])
+def admin_learning_log():
+    """
+    v33.16: 自動学習の監査ログを表示する。
+    認証は X-Wake-Token 必須(管理者のみアクセス可)。
+    クエリパラメータ:
+      - limit: 表示件数 (default 50)
+      - action: auto_written / pending / rejected でフィルタ
+    """
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        limit = int(request.args.get('limit', 50))
+        action_filter = request.args.get('action')
+        with get_db_session() as session:
+            q = session.query(LearningLog).order_by(LearningLog.created_at.desc())
+            if action_filter:
+                q = q.filter(LearningLog.action_taken == action_filter)
+            items = q.limit(limit).all()
+            total = session.query(LearningLog).count()
+            counts_by_action = {}
+            for action_name in ['auto_written', 'pending', 'rejected']:
+                counts_by_action[action_name] = session.query(LearningLog).filter_by(action_taken=action_name).count()
+
+        return create_json_response({
+            'total': total,
+            'counts_by_action': counts_by_action,
+            'showing': len(items),
+            'items': [{
+                'id': it.id,
+                'user_uuid': it.user_uuid,
+                'message': it.user_message[:200],
+                'extracted': it.extracted,
+                'score': it.fact_check_score,
+                'evidence': it.fact_check_evidence,
+                'action': it.action_taken,
+                'db_changes': it.db_changes,
+                'created_at': it.created_at.strftime('%Y-%m-%d %H:%M UTC') if it.created_at else None,
+            } for it in items]
+        })
     except Exception as e:
         return create_json_response({'error': str(e)}, 500)
 
