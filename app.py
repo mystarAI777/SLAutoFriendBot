@@ -5063,7 +5063,7 @@ def health_check_detail():
     gemini_status = gemini_model_manager.get_current_model() is not None
     return create_json_response({
         'status': 'ok',
-        'version': 'v33.15-stable',
+        'version': 'v33.15-stable2',
         'scheduler_mode': 'eco (GitHub Actions外部cron)',
         'gemini': gemini_status,
         'gemini_model': gemini_model_manager._models[gemini_model_manager._current_index] if gemini_status else None,
@@ -6467,7 +6467,7 @@ def initialize_app():
     setup_stream_processing_schedule()
     cleanup_old_voice_files()
 
-    logger.info("🚀 初期化完了! (v33.15-stable 安定版: 天気/時間/文章長修正)")
+    logger.info("🚀 初期化完了! (v33.15-stable2: 整合性+自己認識+プライバシー保護)")
 
 initialize_app()
 
