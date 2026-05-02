@@ -5003,7 +5003,7 @@ def get_safe_friend_summary(target_user_name: str) -> Optional[str]:
 
 
 
-                logger.info("📥 Migrating nicknames to database...")
+logger.info("📥 Migrating nicknames to database...")
                 initial_nicknames = {
                     'みこち': 'さくらみこ', 'すいちゃん': '星街すいせい', 'フブちゃん': '白上フブキ',
                     'まつり': '夏色まつり', 'あくたん': '湊あくあ', 'スバル': '大空スバル',
