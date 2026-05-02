@@ -1201,6 +1201,33 @@ def is_holomem_topic(msg: str) -> bool:
     return any(kw in msg for kw in holo_kws)
 
 
+def is_news_topic(msg: str) -> bool:
+    """
+    v33.16: メッセージがニュース・話題系かどうか判定する。
+    True の場合、generate_ai_response 内で:
+      - 番号付きリスト形式での回答を許可
+      - 出力トークン上限を増やす（解像度の高い応答）
+    """
+    keywords = ['ニュース', 'news', 'NEWS', '最新', '話題', '今', 'トレンド',
+                '配信中', '配信してる', '配信予定', '何が', '何か', 'どんな']
+    return any(kw in msg for kw in keywords)
+
+
+def is_holomem_topic(msg: str) -> bool:
+    """
+    v33.16: メッセージがホロメン関連の話題かどうか判定する。
+    True の場合、出力トークン上限を増やす（推し語り・配信感想で解像度を上げる）。
+    """
+    try:
+        if holomem_manager.detect_in_message(msg):
+            return True
+    except Exception:
+        pass
+    holo_kws = ['ホロライブ', 'ホロメン', 'VTuber', 'Vtuber', 'vtuber',
+                '推し', '配信', 'ライブ', '歌枠', '雑談枠', 'コラボ']
+    return any(kw in msg for kw in holo_kws)
+
+
 def is_explicit_search_request(msg: str) -> bool:
     msg = msg.strip()
     strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい']
@@ -5437,6 +5464,17 @@ def chat_lsl():
             # (次回の応答に間に合わせるため早めに投げておく)
             if is_sl_topic(message):
                 logger.info("🌐 SL話題検知 → SLコンテキスト参照します")
+
+            # ★ v33.16: 時刻・天気判定を最優先に移動
+            # 旧版では is_explicit_search_request が先に評価されたため、
+            # 「東京の天気」が検索ルートに流れて Groq 8B が雑な要約を返していた。
+            if not ai_text:
+                if is_time_request(message):
+                    ai_text = get_japan_time()
+                    logger.info(f"⏰ 時刻応答: {ai_text}")
+                elif is_weather_request(message):
+                    ai_text = get_weather_forecast(extract_location(message))
+                    logger.info(f"🌦️ 天気応答: {ai_text[:60]}")
 
             # ★ v33.16: 時刻・天気判定を最優先に移動
             # 旧版では is_explicit_search_request が先に評価されたため、
