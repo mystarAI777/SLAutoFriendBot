@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Tuple
 
 # ===== サードパーティライブラリ =====
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -181,6 +181,16 @@ MOCHIKO_TONE_RULES = """# もちこの口調（厳密遵守）
 - 禁止: 「だね」（ギャル感が薄れる） / 「ですわ」「ですよね」（敬語混入禁止）
 - 文章は最後まで言い切る（途中で切れる文末は禁止）
 """
+
+# v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
+CORRECTION_PATTERNS = [
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:でしょ|だよ|だって|だった|の方|だろ)',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*じゃなくて\s*([^\s\u3001\u3002!?！？]{2,30})',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:所属|の子|のメンバー)',
+    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:だっけ|だよね)',
+    r'違うよ[\u3001\u3002]?\s*([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})',
+]
+
 
 # v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
 CORRECTION_PATTERNS = [
@@ -835,9 +845,12 @@ VOICEVOX_URL_FROM_ENV = get_secret('VOICEVOX_URL')
 # su-shiki VOICEVOX APIキー
 SUSHIKI_API_KEY = get_secret('VOICEVOX_API_KEY') or "D_78935397H9612"
 
-# ユーザーごとの音声キュー: { user_uuid: deque([url1, url2, ...]) }
+# ユーザーごとの音声キュー: { user_uuid: deque([(url1, duration1), (url2, duration2), ...]) }
+# v33.17: 値を url 単体から (url, duration) タプルに変更
 _voice_queues: Dict[str, Any] = {}
 _voice_queues_lock = Lock()
+# v33.17: 直近の chat_lsl 応答に対する最初のフレーズの duration（chat_lslのレスポンスで使う）
+_last_voice_duration: Dict[str, float] = {}
 
 
 # GitHub Actions から /wake を叩く際の認証キー
@@ -986,6 +999,23 @@ class MochikoSelf(Base):
     value = Column(Text, nullable=True)
     category = Column(String(50), default='other')
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LearningLog(Base):
+    """
+    v33.16: ファクトチェック付き自動学習の監査ログ。
+    会話中の指摘っぽい発言を記録し、信頼度判定の結果と DB 反映状況を残す。
+    """
+    __tablename__ = 'learning_log'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    user_message = Column(Text, nullable=False)
+    extracted = Column(Text, nullable=True)
+    fact_check_score = Column(Integer, default=0)
+    fact_check_evidence = Column(Text, nullable=True)
+    action_taken = Column(String(20), index=True)
+    db_changes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class LearningLog(Base):
@@ -2534,6 +2564,55 @@ def fetch_holomem_episodes():
             continue
 
     logger.info(f"✅ エピソード情報更新完了: {count} メンバー")
+
+
+# ==============================================================================
+# ★ v33.16: チャンネル名から日本語ホロメン名・グループ名を抽出
+# ==============================================================================
+def extract_japanese_name_from_channel(channel_name: str) -> tuple:
+    """
+    Holodex のチャンネル名から日本語ホロメン名と所属グループを抽出する。
+
+    パターン例:
+      "Riona Ch. 響咲リオナ - FLOW GLOW"   -> ("響咲リオナ", "FLOW GLOW")
+      "Pekora Ch. 兎田ぺこら"                -> ("兎田ぺこら", None)
+      "Lui ch. 鷹嶺ルイ - holoX -"           -> ("鷹嶺ルイ", "holoX")
+      "Kureiji Ollie Ch. hololive-ID"        -> (None, "hololive-ID")
+
+    Returns: (japanese_name, group_name) どちらも見つからない場合 (None, None)
+    """
+    if not channel_name:
+        return (None, None)
+
+    cleaned = channel_name.strip().rstrip('-').strip()
+    cleaned = re.sub(r'チャンネル\s*$', '', cleaned)
+
+    # グループ名抽出 ("- グループ名" / "‐ グループ名" 形式)
+    group_name = None
+    group_pattern = r'[-\u2010-\u2015]\s*(FLOW GLOW|ReGLOSS|holoX|HOLOSTARS|hololive-EN|hololive-ID|UPROAR!!|DEV_IS|holoStars-EN)\s*[-\u2010-\u2015]?\s*$'
+    group_match = re.search(group_pattern, cleaned, re.IGNORECASE)
+    if group_match:
+        group_name = group_match.group(1)
+        cleaned = cleaned[:group_match.start()].strip()
+
+    # 日本語名抽出 パターン1: "英語名 Ch. 日本語名"
+    m = re.search(r'(?:Ch\.|ch\.|Channel|channel)\s*([\u3040-\u9fff\u30fb\u30fc]+)', cleaned)
+    if m:
+        return (m.group(1).strip(), group_name)
+
+    # パターン2: "日本語名Ch.|チャンネル"
+    m = re.search(r'^([\u3040-\u9fff\u30fb\u30fc]+?)(?:Ch[\.\u3002]|チャンネル)', cleaned)
+    if m:
+        return (m.group(1).strip(), group_name)
+
+    # パターン3: 末尾の日本語連続部分(2文字以上)
+    m = re.search(r'([\u3040-\u9fff\u30fb\u30fc]{2,})\s*$', cleaned)
+    if m:
+        japanese_name = m.group(1).strip()
+        if japanese_name not in ('ホロライブ',):
+            return (japanese_name, group_name)
+
+    return (None, group_name)
 
 
 # ==============================================================================
@@ -4289,6 +4368,178 @@ def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
 
 
 # ==============================================================================
+# ★ v33.16: 自動学習システム(ファクトチェック付き)
+# ==============================================================================
+
+def detect_correction_intent(message: str) -> Optional[Dict]:
+    """
+    v33.16: ユーザー発言が「ホロメン情報の指摘」か正規表現で粗判定。LLM不要で軽量。
+    Returns: {'subject': '...', 'predicate': '...'} または None
+    """
+    for pattern in CORRECTION_PATTERNS:
+        m = re.search(pattern, message)
+        if m:
+            subject = m.group(1).strip()
+            predicate = m.group(2).strip()
+            if 2 <= len(subject) <= 25 and 2 <= len(predicate) <= 30:
+                return {'subject': subject, 'predicate': predicate}
+    return None
+
+
+def fact_check_with_lingo(subject: str, predicate: str) -> Tuple[int, List[str]]:
+    """v33.16: holomem_lingo (1086件) で照合してスコア(0-50点)を返す"""
+    score = 0
+    evidence = []
+    try:
+        with get_db_session() as session:
+            lingo = session.query(HolomemLingo).filter(
+                HolomemLingo.member_name.contains(subject)
+            ).first()
+            if lingo:
+                data_str = (lingo.data or '').lower()
+                if predicate.lower() in data_str:
+                    score = 50
+                    evidence.append(f"lingo: {lingo.member_name} の data に '{predicate}' あり")
+                else:
+                    score = 25
+                    evidence.append(f"lingo: {lingo.member_name} 登録あり(属性は不明)")
+                try:
+                    data = json.loads(lingo.data or '{}')
+                    if subject in data.get('aliases', []):
+                        score += 10
+                        evidence.append(f"lingo: aliases に '{subject}' 完全一致")
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        logger.debug(f"fact_check_with_lingo エラー: {e}")
+    return (min(score, 50), evidence)
+
+
+def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
+    """v33.16: Holodex API でチャンネル存在確認(0-50点)"""
+    score = 0
+    evidence = []
+    if not HOLODEX_API_KEY:
+        return (0, evidence)
+
+    try:
+        url = "https://holodex.net/api/v2/channels"
+        headers = {"X-APIKEY": HOLODEX_API_KEY}
+        params = {"org": "Hololive", "type": "vtuber", "limit": 50, "lang": "ja"}
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            return (0, evidence)
+
+        channels = res.json()
+        if not isinstance(channels, list):
+            return (0, evidence)
+
+        for ch in channels:
+            ch_name = (ch.get('name') or '') + ' ' + (ch.get('english_name') or '')
+            if subject in ch_name:
+                score = 50
+                evidence.append(f"Holodex: チャンネル '{ch.get('name', '')}' に '{subject}' を確認")
+                ch_group = ch.get('group') or ''
+                if ch_group:
+                    evidence.append(f"Holodex: 所属グループ = {ch_group}")
+                break
+    except Exception as e:
+        logger.debug(f"fact_check_with_holodex エラー: {e}")
+    return (score, evidence)
+
+
+def fact_check_correction(extracted: Dict) -> Dict:
+    """
+    v33.16: lingo (50点) + Holodex (50点) = 100点満点でファクトチェック。
+    Returns: {'score': 0-100, 'evidence': [...], 'trustable': bool}
+    """
+    subject = extracted.get('subject', '')
+    predicate = extracted.get('predicate', '')
+
+    score_lingo, evidence_lingo = fact_check_with_lingo(subject, predicate)
+    score_holodex, evidence_holodex = fact_check_with_holodex(subject)
+
+    total_score = score_lingo + score_holodex
+    return {
+        'score': total_score,
+        'evidence': evidence_lingo + evidence_holodex,
+        'trustable': total_score >= 60,
+    }
+
+
+def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
+    """
+    v33.16: ファクトチェック付き自動学習のメインフロー。
+    バックグラウンドで実行され、信頼度に応じて DB を更新する。
+    """
+    try:
+        result = fact_check_correction(extracted)
+        score = result['score']
+        evidence = result['evidence']
+
+        action = 'rejected'
+        db_changes = []
+
+        if result['trustable']:
+            subject = extracted['subject']
+            predicate = extracted['predicate']
+
+            try:
+                with get_db_session() as session:
+                    # (1) HolomemWiki に未登録なら追加
+                    wiki = session.query(HolomemWiki).filter_by(member_name=subject).first()
+                    if not wiki:
+                        is_group = any(g in predicate for g in ['期生', 'FLOW GLOW', 'ReGLOSS', 'holoX', 'HOLOSTARS', 'EN', 'ID', 'DEV_IS'])
+                        session.add(HolomemWiki(
+                            member_name=subject,
+                            generation=predicate if is_group else None,
+                            tags=subject,
+                            status='現役',
+                            last_updated=datetime.utcnow()
+                        ))
+                        db_changes.append(f"HolomemWiki: 新規 {subject} ({predicate if is_group else '不明'})")
+
+                    # (2) nicknames に正式名->愛称マッピングを追加
+                    lingo = session.query(HolomemLingo).filter(
+                        HolomemLingo.member_name.contains(subject)
+                    ).first()
+                    if lingo and lingo.member_name != subject:
+                        existing_nick = session.query(HolomemNickname).filter_by(nickname=subject).first()
+                        if not existing_nick:
+                            session.add(HolomemNickname(nickname=subject, fullname=lingo.member_name))
+                            db_changes.append(f"HolomemNickname: {subject} -> {lingo.member_name}")
+
+                    action = 'auto_written'
+                    logger.info(f"✅ 自動学習: {subject} (score={score})")
+            except Exception as db_err:
+                logger.error(f"自動学習 DB 書き込みエラー: {db_err}")
+                action = 'rejected'
+        elif score >= 30:
+            action = 'pending'
+            logger.info(f"⏳ 自動学習保留: {extracted} (score={score})")
+        else:
+            logger.info(f"❌ 自動学習却下: {extracted} (score={score})")
+
+        # 監査ログ記録
+        with get_db_session() as session:
+            session.add(LearningLog(
+                user_uuid=user_uuid,
+                user_message=message[:1000],
+                extracted=json.dumps(extracted, ensure_ascii=False),
+                fact_check_score=score,
+                fact_check_evidence=json.dumps(evidence, ensure_ascii=False),
+                action_taken=action,
+                db_changes=json.dumps(db_changes, ensure_ascii=False) if db_changes else None,
+            ))
+
+        if action == 'auto_written':
+            holomem_manager.load_from_db(force=True)
+
+    except Exception as e:
+        logger.error(f"process_correction_learning エラー: {e}")
+
+
+# ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
 def call_gemini(system_prompt: str, message: str, history: List[Dict], max_output_tokens: int = 600) -> Optional[str]:
@@ -4715,6 +4966,17 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 - ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
 - 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
 
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
+
 # もちこの口調:
 - 一人称: 「あてぃし」
 - 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」
@@ -5080,6 +5342,26 @@ def background_specialized_search(task_id: str, query_data: Dict):
 # （元の 3332〜3385行あたり）
 # ============================================================
 
+def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
+    """
+    v33.17: テキストの音声長を概算する（秒）。
+
+    su-shiki API のレスポンスに正確な duration が含まれないため、
+    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
+    speed=1.4 倍速指定なので、その分短くなる。
+
+    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
+
+    最小 1.0秒、最大 30.0秒で clip する。
+    """
+    if not text:
+        return 1.0
+    char_count = len(text)
+    base_duration = char_count * 0.13
+    actual_duration = base_duration / max(speed, 1.0) + 0.3
+    return max(1.0, min(actual_duration, 30.0))
+
+
 def _split_phrases(text: str) -> List[str]:
     """
     テキストを自然なフレーズ単位に分割する。
@@ -5094,9 +5376,13 @@ def _split_phrases(text: str) -> List[str]:
     - SL MoAP再生の重なりを解消
     - 1回あたりのVOICEVOX API呼び出しは増えるが
       同時並列生成数が減るので全体スループット向上
+
+    v33.17: 30/90 → 60/180 にさらに拡大
+    - 7フレーズ分割が LSL のキュー処理能力を超えていた
+    - 1フレーズを長くして分割数を半減（400文字応答 → 約3フレーズ）
     """
-    MIN_CHARS = 30
-    MAX_CHARS = 90
+    MIN_CHARS = 60
+    MAX_CHARS = 180
 
     # Step1: 強区切りのみで分割（読点では分割しない）
     raw_parts = re.split(r'([。！？\n])', text)
@@ -5150,6 +5436,36 @@ def _split_phrases(text: str) -> List[str]:
 
     if not result and text.strip():
         result = [text.strip()]
+
+    # ★ v33.17: 最大3フレーズに圧縮（LSL側のキュー過密対策）
+    # 実機ログから 7フレーズ → エラー、3フレーズ → 安定動作 を確認済み
+    # 4フレーズ以上に分割された場合、隣接フレーズを結合して3個に抑える
+    MAX_PHRASES = 3
+    while len(result) > MAX_PHRASES:
+        # 一番短いフレーズを探して、隣の短い方と結合する
+        min_len_idx = 0
+        min_len = len(result[0])
+        for i in range(1, len(result)):
+            if len(result[i]) < min_len:
+                min_len = len(result[i])
+                min_len_idx = i
+        # 左右の短い方と結合
+        if min_len_idx == 0:
+            result[0] = result[0] + result[1]
+            del result[1]
+        elif min_len_idx == len(result) - 1:
+            result[-2] = result[-2] + result[-1]
+            del result[-1]
+        else:
+            left_len = len(result[min_len_idx - 1])
+            right_len = len(result[min_len_idx + 1])
+            if left_len <= right_len:
+                result[min_len_idx - 1] = result[min_len_idx - 1] + result[min_len_idx]
+            else:
+                result[min_len_idx] = result[min_len_idx] + result[min_len_idx + 1]
+                del result[min_len_idx + 1]
+                continue
+            del result[min_len_idx]
 
     return result
 
@@ -5208,6 +5524,10 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
 
     logger.info(f"🎙️ {len(phrases)}フレーズに分割: {phrases}")
 
+    # ★ v33.17: フレーズごとに duration を計算しておく
+    # キューには (url, duration) タプルを保存する
+    phrase_durations = [estimate_audio_duration(p) for p in phrases]
+
     # キューを初期化（古いものをクリア）
     from collections import deque
     with _voice_queues_lock:
@@ -5216,21 +5536,27 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
     # フレーズ数が1つならシンプルに生成して返す
     if len(phrases) == 1:
         url = _generate_one_phrase(phrases[0], user_uuid, 0)
+        # ★ v33.17: グローバル変数で最初のフレーズの duration を保持
+        # (chat_lsl の Response で使うため、generate_voice_file の戻り値に
+        #  含めるのではなく、別の方法で渡す必要がある → 後述の E-4 で対応)
+        _last_voice_duration[user_uuid] = phrase_durations[0]
         return url
 
     # 複数フレーズ: 並列生成してできた順にキューへ積む
     # まず最初のフレーズを同期生成（即レスポンス用）
     first_url = _generate_one_phrase(phrases[0], user_uuid, 0)
+    _last_voice_duration[user_uuid] = phrase_durations[0]
 
     # 残りのフレーズをバックグラウンドで順番に生成してキューに積む
+    # ★ v33.17: キューに (url, duration) タプルを積む
     def generate_remaining():
         for i, phrase in enumerate(phrases[1:], start=1):
             url = _generate_one_phrase(phrase, user_uuid, i)
             if url:
                 with _voice_queues_lock:
                     if user_uuid in _voice_queues:
-                        _voice_queues[user_uuid].append(url)
-                        logger.info(f"📥 キュー追加[{i}]: {url}")
+                        _voice_queues[user_uuid].append((url, phrase_durations[i]))
+                        logger.info(f"📥 キュー追加[{i}]: {url} (duration={phrase_durations[i]:.1f}s)")
 
     background_executor.submit(generate_remaining)
 
@@ -6176,6 +6502,50 @@ def admin_learning_log():
         return create_json_response({'error': str(e)}, 500)
 
 
+@app.route('/admin/learning-log', methods=['GET'])
+def admin_learning_log():
+    """
+    v33.16: 自動学習の監査ログを表示する。
+    認証は X-Wake-Token 必須(管理者のみアクセス可)。
+    クエリパラメータ:
+      - limit: 表示件数 (default 50)
+      - action: auto_written / pending / rejected でフィルタ
+    """
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        limit = int(request.args.get('limit', 50))
+        action_filter = request.args.get('action')
+        with get_db_session() as session:
+            q = session.query(LearningLog).order_by(LearningLog.created_at.desc())
+            if action_filter:
+                q = q.filter(LearningLog.action_taken == action_filter)
+            items = q.limit(limit).all()
+            total = session.query(LearningLog).count()
+            counts_by_action = {}
+            for action_name in ['auto_written', 'pending', 'rejected']:
+                counts_by_action[action_name] = session.query(LearningLog).filter_by(action_taken=action_name).count()
+
+        return create_json_response({
+            'total': total,
+            'counts_by_action': counts_by_action,
+            'showing': len(items),
+            'items': [{
+                'id': it.id,
+                'user_uuid': it.user_uuid,
+                'message': it.user_message[:200],
+                'extracted': it.extracted,
+                'score': it.fact_check_score,
+                'evidence': it.fact_check_evidence,
+                'action': it.action_taken,
+                'db_changes': it.db_changes,
+                'created_at': it.created_at.strftime('%Y-%m-%d %H:%M UTC') if it.created_at else None,
+            } for it in items]
+        })
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
 @app.route('/admin/holomem', methods=['GET'])
 def list_holomem():
     with get_db_session() as session:
@@ -6548,9 +6918,17 @@ def next_voice():
         with _voice_queues_lock:
             q = _voice_queues.get(user_uuid)
             if q and len(q) > 0:
-                url = q.popleft()
-                logger.info(f"📤 next_voice返却: {url}")
-                return Response(url, 200, mimetype='text/plain; charset=utf-8')
+                # ★ v33.17: キューの値が (url, duration) タプル
+                item = q.popleft()
+                if isinstance(item, tuple):
+                    url, duration = item
+                else:
+                    # 旧データ互換（万が一文字列だけが残っていたら）
+                    url = item
+                    duration = estimate_audio_duration("", 1.4)
+                logger.info(f"📤 next_voice返却: {url} (duration={duration:.1f}s)")
+                # ★ v33.17: LSLが "url|duration" を期待
+                return Response(f"{url}|{duration:.2f}", 200, mimetype='text/plain; charset=utf-8')
 
         return Response("", 200)
 
