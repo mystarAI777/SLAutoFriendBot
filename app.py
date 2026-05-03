@@ -5398,9 +5398,10 @@ def _split_phrases(text: str) -> List[str]:
     v33.17: 30/90 → 60/180 にさらに拡大
     - 7フレーズ分割が LSL のキュー処理能力を超えていた
     - 1フレーズを長くして分割数を半減（400文字応答 → 約3フレーズ）
+    5.3　MAX5フレーズに変更。60/90に変更した。3フレーズではLSLでエラーでる。
     """
     MIN_CHARS = 60
-    MAX_CHARS = 180
+    MAX_CHARS = 90
 
     # Step1: 強区切りのみで分割（読点では分割しない）
     raw_parts = re.split(r'([。！？\n])', text)
@@ -5458,7 +5459,7 @@ def _split_phrases(text: str) -> List[str]:
     # ★ v33.17: 最大3フレーズに圧縮（LSL側のキュー過密対策）
     # 実機ログから 7フレーズ → エラー、3フレーズ → 安定動作 を確認済み
     # 4フレーズ以上に分割された場合、隣接フレーズを結合して3個に抑える
-    MAX_PHRASES = 3
+    MAX_PHRASES = 5
     while len(result) > MAX_PHRASES:
         # 一番短いフレーズを探して、隣の短い方と結合する
         min_len_idx = 0
