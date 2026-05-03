@@ -1815,7 +1815,7 @@ def extract_reactions_from_news(member_name: str, stream_title: str) -> Dict:
     この配信に関連する反応・感想キーワードを抽出する。
 
     反応源として外部スクレイピングを使わず、
-    既にDBにある記事本文（800文字まで取得済み）から抽出するので、
+    既にDBにある記事本文（600文字まで取得済み）から抽出するので、
     外部依存がなく安定している。
     """
     reactions = {
@@ -1837,7 +1837,7 @@ def extract_reactions_from_news(member_name: str, stream_title: str) -> Dict:
             highlight_kws = ['シーン', 'ここ', '場面', '爆笑', 'クライマックス', '神回']
 
             for news in recent_news:
-                body = (news.content or '')[:800]
+                body = (news.content or '')[:600]
                 # 本文を一文ずつ分割してキーワードヒット判定
                 sentences = re.split(r'[。！？\n]', body)
                 for sent in sentences:
@@ -2415,7 +2415,7 @@ def fetch_hololive_tsuushin_news():
                         for tag in body_elem.select('script, style, nav, .ad, .share, figure'):
                             tag.decompose()
                         content = clean_text(body_elem.get_text(separator='\n'))
-                        content = content[:800]
+                        content = content[:600]
                     else:
                         content = title
 
@@ -3254,7 +3254,7 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
         try:
             resp = model.generate_content(
                 prompt,
-                generation_config={"temperature": 0.5, "max_output_tokens": 800}
+                generation_config={"temperature": 0.5, "max_output_tokens": 600}
             )
             if hasattr(resp, 'candidates') and resp.candidates:
                 response = resp.candidates[0].content.parts[0].text.strip()
@@ -3268,7 +3268,7 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
 
     if not response and groq_client:
         # ★ v33.8.2: 専門検索は compound-beta が得意
-        response = call_groq(prompt, query, [], 800, task_type='search')
+        response = call_groq(prompt, query, [], 600, task_type='search')
 
     if not response:
         response = (
@@ -3815,7 +3815,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
                 # v33.15-stable2: max_output_tokens 明示（未指定だとモデルが暴走する場合あり）
                 response = current_gemini.generate_content(
                     analysis_prompt,
-                    generation_config={"temperature": 0.3, "max_output_tokens": 800}
+                    generation_config={"temperature": 0.3, "max_output_tokens": 600}
                 )
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
@@ -3838,7 +3838,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
                         model=models[0],
                         messages=[{"role": "user", "content": analysis_prompt}],
                         temperature=0.3,
-                        max_tokens=800
+                        max_tokens=600
                     )
                     text = response.choices[0].message.content.strip()
                     json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
@@ -4103,8 +4103,8 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
         model = gemini_model_manager.get_current_model()
         if model:
             try:
-                # v33.15-stable2: Geminiも800に統一（プロフィール用JSON生成）
-                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 800})
+                # v33.15-stable2: Geminiも600に統一（プロフィール用JSON生成）
+                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 600})
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -4126,7 +4126,7 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
                     resp = groq_client.chat.completions.create(
                         model=available[0],
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3, max_tokens=800
+                        temperature=0.3, max_tokens=600
                     )
                     text = resp.choices[0].message.content.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -4481,7 +4481,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict], max_outpu
     
     return None
 
-def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800, task_type: str = 'default') -> Optional[str]:
+def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 600, task_type: str = 'default') -> Optional[str]:
     """Groq API呼び出し。task_type で用途別モデルを選択する。
     task_type: 'chat' | 'search' | 'analysis' | 'default'
     """
@@ -4637,7 +4637,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                 lore_blocks = []
                 # エピソード
                 if matched_member.episodes:
-                    lore_blocks.append(f"▼{matched_member.member_name}のエピソード:\n{matched_member.episodes[:800]}")
+                    lore_blocks.append(f"▼{matched_member.member_name}のエピソード:\n{matched_member.episodes[:600]}")
                 # ファン用語（lingoテーブル）
                 lingo = session_lore.query(HolomemLingo).filter_by(
                     member_name=matched_member.member_name
@@ -4945,8 +4945,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     # ★ v33.16: ニュース・ホロメン話題は出力トークンを拡張して解像度を上げる
     is_rich_topic = is_news_topic(message) or is_holomem_topic(message)
-    gemini_max_tokens = 800 if is_rich_topic else 450
-    groq_max_tokens = 800 if (is_task_report or is_rich_topic) else 450
+    gemini_max_tokens = 600 if is_rich_topic else 450
+    groq_max_tokens = 600 if (is_task_report or is_rich_topic) else 450
 
     response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     if not response:
