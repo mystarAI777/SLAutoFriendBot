@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any, Tuple, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Tuple, Tuple, Tuple, Tuple, Tuple
 
 # ===== サードパーティライブラリ =====
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -79,6 +79,57 @@ import schedule
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from groq import Groq
+
+# ★ v33.18: Scrapling のフォールバック付きインポート
+# Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
+try:
+    from scrapling.fetchers import Fetcher as _ScraplingFetcher
+    HAS_SCRAPLING = True
+    # 起動ログ用フラグ。インポート時には logger 未定義のため、後で initialize_app で出力
+    _SCRAPLING_VERSION_MSG = "✅ Scrapling 利用可能"
+except ImportError as _scrapling_import_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling インポート失敗 → requests フォールバック: {_scrapling_import_err}"
+except Exception as _scrapling_other_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
+
+
+# ★ v33.18: Scrapling のフォールバック付きインポート
+# Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
+try:
+    from scrapling.fetchers import Fetcher as _ScraplingFetcher
+    HAS_SCRAPLING = True
+    # 起動ログ用フラグ。インポート時には logger 未定義のため、後で initialize_app で出力
+    _SCRAPLING_VERSION_MSG = "✅ Scrapling 利用可能"
+except ImportError as _scrapling_import_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling インポート失敗 → requests フォールバック: {_scrapling_import_err}"
+except Exception as _scrapling_other_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
+
+
+# ★ v33.18: Scrapling のフォールバック付きインポート
+# Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
+try:
+    from scrapling.fetchers import Fetcher as _ScraplingFetcher
+    HAS_SCRAPLING = True
+    # 起動ログ用フラグ。インポート時には logger 未定義のため、後で initialize_app で出力
+    _SCRAPLING_VERSION_MSG = "✅ Scrapling 利用可能"
+except ImportError as _scrapling_import_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling インポート失敗 → requests フォールバック: {_scrapling_import_err}"
+except Exception as _scrapling_other_err:
+    _ScraplingFetcher = None
+    HAS_SCRAPLING = False
+    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
+
 
 # ==============================================================================
 # 基本設定とロギング
@@ -181,16 +232,6 @@ MOCHIKO_TONE_RULES = """# もちこの口調（厳密遵守）
 - 禁止: 「だね」（ギャル感が薄れる） / 「ですわ」「ですよね」（敬語混入禁止）
 - 文章は最後まで言い切る（途中で切れる文末は禁止）
 """
-
-# v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
-CORRECTION_PATTERNS = [
-    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:でしょ|だよ|だって|だった|の方|だろ)',
-    r'([^\s\u3001\u3002!?！？]{2,20})\s*じゃなくて\s*([^\s\u3001\u3002!?！？]{2,30})',
-    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:所属|の子|のメンバー)',
-    r'([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})\s*(?:だっけ|だよね)',
-    r'違うよ[\u3001\u3002]?\s*([^\s\u3001\u3002!?！？]{2,20})\s*は\s*([^\s\u3001\u3002!?！？]{2,30})',
-]
-
 
 # v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
 CORRECTION_PATTERNS = [
@@ -1018,23 +1059,6 @@ class LearningLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
-class LearningLog(Base):
-    """
-    v33.16: ファクトチェック付き自動学習の監査ログ。
-    会話中の指摘っぽい発言を記録し、信頼度判定の結果と DB 反映状況を残す。
-    """
-    __tablename__ = 'learning_log'
-    id = Column(Integer, primary_key=True)
-    user_uuid = Column(String(255), nullable=False, index=True)
-    user_message = Column(Text, nullable=False)
-    extracted = Column(Text, nullable=True)
-    fact_check_score = Column(Integer, default=0)
-    fact_check_evidence = Column(Text, nullable=True)
-    action_taken = Column(String(20), index=True)
-    db_changes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-
-
 class TaskLog(Base):
     """
     バックグラウンドタスクの最終実行時刻を記録する。
@@ -1623,8 +1647,47 @@ def get_holomem_context(member_name: str) -> str:
 # ==============================================================================
 # Yahoo!リアルタイム検索連携
 # ==============================================================================
+def _scrape_yahoo_realtime_with_scrapling(member_name: str) -> Optional[str]:
+    """
+    v33.18: Scrapling の Fetcher を使った Yahoo Realtime 検索版。
+    TLS 指紋偽装で Bot 対策を回避できる可能性がある。
+    失敗時は None を返し、呼び出し側が requests 版にフォールバックする。
+    """
+    if not HAS_SCRAPLING or _ScraplingFetcher is None:
+        return None
+    try:
+        query = f"{member_name} -RT"
+        url = f"https://search.yahoo.co.jp/realtime/search?p={quote_plus(query)}&ei=UTF-8&m=latency"
+        # Chrome の TLS 指紋を偽装
+        page = _ScraplingFetcher.get(url, impersonate='chrome', timeout=15, stealthy_headers=True)
+        if page.status != 200:
+            logger.debug(f"Scrapling Yahoo Realtime: HTTP {page.status}")
+            return None
+        texts = []
+        for item in page.css('.cnt.cf')[:5]:
+            txt_node = item.css_first('.kw')
+            tim_node = item.css_first('.tim')
+            if txt_node:
+                clean_txt = clean_text(txt_node.text)
+                time_txt = clean_text(tim_node.text) if tim_node else ""
+                texts.append(f"・({time_txt}) {clean_txt}")
+        return "\n".join(texts)
+    except Exception as e:
+        logger.debug(f"Scrapling Yahoo Realtime 失敗 ({member_name}): {e}")
+        return None
+
+
 def scrape_yahoo_realtime_for_member(member_name: str) -> str:
-    """指定したメンバーのリアルタイム検索結果をテキストで返す"""
+    """
+    指定したメンバーのリアルタイム検索結果をテキストで返す
+    v33.18: Scrapling 優先、失敗時は requests + BeautifulSoup にフォールバック
+    """
+    # Scrapling 優先
+    scrapling_result = _scrape_yahoo_realtime_with_scrapling(member_name)
+    if scrapling_result is not None:
+        return scrapling_result
+
+    # フォールバック: 既存の requests 実装
     try:
         query = f"{member_name} -RT"
         url = "https://search.yahoo.co.jp/realtime/search"
@@ -2247,31 +2310,63 @@ def fetch_hololive_news():
     except Exception as e:
         logger.error(f"News fetch failed: {e}")
 
+def _fetch_tsuushin_list_with_scrapling(url: str) -> Optional[List[Dict]]:
+    """
+    v33.18: Scrapling で hololive-tsuushin の一覧ページから記事リンクを取得。
+    失敗時は None を返し、呼び出し側が requests 版にフォールバックする。
+    """
+    if not HAS_SCRAPLING or _ScraplingFetcher is None:
+        return None
+    try:
+        page = _ScraplingFetcher.get(url, impersonate='chrome', timeout=15, stealthy_headers=True)
+        if page.status != 200:
+            logger.debug(f"Scrapling tsuushin list: HTTP {page.status}")
+            return None
+        article_links = []
+        for a_tag in page.css('a[href*="/holonews/"]'):
+            href = a_tag.attrib.get('href', '')
+            if not href or href == url or 'category' in href:
+                continue
+            title_text = clean_text(a_tag.text)
+            if title_text and len(title_text) > 5:
+                article_links.append({'url': href, 'title': title_text})
+        return article_links
+    except Exception as e:
+        logger.debug(f"Scrapling tsuushin list 失敗: {e}")
+        return None
+
+
 def fetch_hololive_tsuushin_news():
     """
     ホロライブ通信から記事タイトル＋本文を取得してDBに保存。
     一覧ページから最新記事のURLを取得し、各記事にアクセスして本文を取得する。
+    v33.18: 一覧ページ取得を Scrapling 優先、失敗時は requests にフォールバック
     """
     logger.info("📰 ホロライブ通信の更新チェック開始...")
     url = "https://hololive-tsuushin.com/category/holonews/"
     try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            logger.warning(f"⚠️ ホロライブ通信アクセス失敗: {res.status_code}")
-            return
+        # Scrapling 優先で記事リンク取得
+        article_links = _fetch_tsuushin_list_with_scrapling(url)
 
-        soup = BeautifulSoup(res.content, 'html.parser')
+        # フォールバック: requests + BeautifulSoup
+        if article_links is None:
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"⚠️ ホロライブ通信アクセス失敗: {res.status_code}")
+                return
 
-        # 一覧ページから記事リンクとタイトルを収集
-        article_links = []
-        for a_tag in soup.select('a[href*="/holonews/"]'):
-            href = a_tag.get('href', '')
-            if not href or href == url or 'category' in href:
-                continue
-            title_text = clean_text(a_tag.get_text())
-            if title_text and len(title_text) > 5:
-                article_links.append({'url': href, 'title': title_text})
+            soup = BeautifulSoup(res.content, 'html.parser')
+
+            # 一覧ページから記事リンクとタイトルを収集
+            article_links = []
+            for a_tag in soup.select('a[href*="/holonews/"]'):
+                href = a_tag.get('href', '')
+                if not href or href == url or 'category' in href:
+                    continue
+                title_text = clean_text(a_tag.get_text())
+                if title_text and len(title_text) > 5:
+                    article_links.append({'url': href, 'title': title_text})
 
         # 重複除去
         seen_urls = set()
@@ -2511,18 +2606,55 @@ def fetch_holomem_episodes():
             page_url = base_url + urllib.parse.quote(member_name, encoding='utf-8')
 
             time.sleep(1.5)
-            res = requests.get(
-                page_url,
-                headers={'User-Agent': random.choice(USER_AGENTS)},
-                timeout=15
-            )
-            if res.status_code != 200:
-                logger.warning(f"⚠️ {member_name} ページ取得失敗: {res.status_code}")
-                continue
 
-            # seesaawiki は EUC-JP
-            res.encoding = res.apparent_encoding or 'euc-jp'
-            soup = BeautifulSoup(res.text, 'html.parser')
+            # ★ v33.18: Scrapling 優先（adaptive で構造変化に強くする）
+            soup = None
+            if HAS_SCRAPLING and _ScraplingFetcher is not None:
+                try:
+                    page = _ScraplingFetcher.get(
+                        page_url,
+                        impersonate='chrome',
+                        timeout=15,
+                        stealthy_headers=True
+                    )
+                    if page.status == 200:
+                        # Scrapling の Selector を直接使う
+                        # BeautifulSoup 互換のため、soup 変数には None のまま、
+                        # 後段の処理は Scrapling 専用の分岐に変える方が綺麗だが、
+                        # ここでは既存 BeautifulSoup ロジックを残すため body だけ取り出す
+                        # 注: page.body は bytes、page.html_content は str
+                        try:
+                            html_text = page.html_content if hasattr(page, 'html_content') else None
+                            if not html_text and hasattr(page, 'body'):
+                                # body は bytes の可能性あり
+                                _body = page.body
+                                if isinstance(_body, bytes):
+                                    html_text = _body.decode('euc-jp', errors='replace')
+                                else:
+                                    html_text = _body
+                            if html_text:
+                                soup = BeautifulSoup(html_text, 'html.parser')
+                        except Exception as parse_err:
+                            logger.debug(f"Scrapling body 取得失敗: {parse_err}")
+                            soup = None
+                except Exception as e:
+                    logger.debug(f"Scrapling seesaawiki 失敗 ({member_name}): {e}")
+                    soup = None
+
+            # フォールバック: 既存の requests 版
+            if soup is None:
+                res = requests.get(
+                    page_url,
+                    headers={'User-Agent': random.choice(USER_AGENTS)},
+                    timeout=15
+                )
+                if res.status_code != 200:
+                    logger.warning(f"⚠️ {member_name} ページ取得失敗: {res.status_code}")
+                    continue
+
+                # seesaawiki は EUC-JP
+                res.encoding = res.apparent_encoding or 'euc-jp'
+                soup = BeautifulSoup(res.text, 'html.parser')
 
             # #content 内から「エピソード」「関連語」「口癖」「来歴」などの見出しを探す
             content_div = soup.select_one('#content') or soup.select_one('.autopagerize_page_element')
@@ -2616,54 +2748,6 @@ def extract_japanese_name_from_channel(channel_name: str) -> tuple:
 
 
 # ==============================================================================
-# ★ v33.16: チャンネル名から日本語ホロメン名・グループ名を抽出
-# ==============================================================================
-def extract_japanese_name_from_channel(channel_name: str) -> tuple:
-    """
-    Holodex のチャンネル名から日本語ホロメン名と所属グループを抽出する。
-
-    パターン例:
-      "Riona Ch. 響咲リオナ - FLOW GLOW"   -> ("響咲リオナ", "FLOW GLOW")
-      "Pekora Ch. 兎田ぺこら"                -> ("兎田ぺこら", None)
-      "Lui ch. 鷹嶺ルイ - holoX -"           -> ("鷹嶺ルイ", "holoX")
-      "Kureiji Ollie Ch. hololive-ID"        -> (None, "hololive-ID")
-
-    Returns: (japanese_name, group_name) どちらも見つからない場合 (None, None)
-    """
-    if not channel_name:
-        return (None, None)
-
-    cleaned = channel_name.strip().rstrip('-').strip()
-    cleaned = re.sub(r'チャンネル\s*$', '', cleaned)
-
-    # グループ名抽出 ("- グループ名" / "‐ グループ名" 形式)
-    group_name = None
-    group_pattern = r'[-\u2010-\u2015]\s*(FLOW GLOW|ReGLOSS|holoX|HOLOSTARS|hololive-EN|hololive-ID|UPROAR!!|DEV_IS|holoStars-EN)\s*[-\u2010-\u2015]?\s*$'
-    group_match = re.search(group_pattern, cleaned, re.IGNORECASE)
-    if group_match:
-        group_name = group_match.group(1)
-        cleaned = cleaned[:group_match.start()].strip()
-
-    # 日本語名抽出 パターン1: "英語名 Ch. 日本語名"
-    m = re.search(r'(?:Ch\.|ch\.|Channel|channel)\s*([\u3040-\u9fff\u30fb\u30fc]+)', cleaned)
-    if m:
-        return (m.group(1).strip(), group_name)
-
-    # パターン2: "日本語名Ch.|チャンネル"
-    m = re.search(r'^([\u3040-\u9fff\u30fb\u30fc]+?)(?:Ch[\.\u3002]|チャンネル)', cleaned)
-    if m:
-        return (m.group(1).strip(), group_name)
-
-    # パターン3: 末尾の日本語連続部分(2文字以上)
-    m = re.search(r'([\u3040-\u9fff\u30fb\u30fc]{2,})\s*$', cleaned)
-    if m:
-        japanese_name = m.group(1).strip()
-        if japanese_name not in ('ホロライブ',):
-            return (japanese_name, group_name)
-
-    return (None, group_name)
-
-
 # ==============================================================================
 # ★ v33.10: Holodex API から配信スケジュール取得 (旧 schedule.hololive.tv スクレイピングから移行)
 # ==============================================================================
@@ -4199,7 +4283,7 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
 # ★ v33.16: 自動学習システム(ファクトチェック付き)
 # ==============================================================================
 
-def detect_correction_intent(message: str) -> Optional[Dict]:
+def detect_correction_intent(message: str):
     """
     v33.16: ユーザー発言が「ホロメン情報の指摘」か正規表現で粗判定。LLM不要で軽量。
     Returns: {'subject': '...', 'predicate': '...'} または None
@@ -4214,8 +4298,8 @@ def detect_correction_intent(message: str) -> Optional[Dict]:
     return None
 
 
-def fact_check_with_lingo(subject: str, predicate: str) -> Tuple[int, List[str]]:
-    """v33.16: holomem_lingo (1086件) で照合してスコア(0-50点)を返す"""
+def fact_check_with_lingo(subject: str, predicate: str):
+    """v33.16: holomem_lingo で照合してスコア(0-50点)を返す"""
     score = 0
     evidence = []
     try:
@@ -4243,13 +4327,12 @@ def fact_check_with_lingo(subject: str, predicate: str) -> Tuple[int, List[str]]
     return (min(score, 50), evidence)
 
 
-def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
+def fact_check_with_holodex(subject: str):
     """v33.16: Holodex API でチャンネル存在確認(0-50点)"""
     score = 0
     evidence = []
     if not HOLODEX_API_KEY:
         return (0, evidence)
-
     try:
         url = "https://holodex.net/api/v2/channels"
         headers = {"X-APIKEY": HOLODEX_API_KEY}
@@ -4257,11 +4340,9 @@ def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
         res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
             return (0, evidence)
-
         channels = res.json()
         if not isinstance(channels, list):
             return (0, evidence)
-
         for ch in channels:
             ch_name = (ch.get('name') or '') + ' ' + (ch.get('english_name') or '')
             if subject in ch_name:
@@ -4276,17 +4357,12 @@ def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
     return (score, evidence)
 
 
-def fact_check_correction(extracted: Dict) -> Dict:
-    """
-    v33.16: lingo (50点) + Holodex (50点) = 100点満点でファクトチェック。
-    Returns: {'score': 0-100, 'evidence': [...], 'trustable': bool}
-    """
+def fact_check_correction(extracted: dict) -> dict:
+    """v33.16: lingo(50点) + Holodex(50点) = 100点満点でファクトチェック。"""
     subject = extracted.get('subject', '')
     predicate = extracted.get('predicate', '')
-
     score_lingo, evidence_lingo = fact_check_with_lingo(subject, predicate)
     score_holodex, evidence_holodex = fact_check_with_holodex(subject)
-
     total_score = score_lingo + score_holodex
     return {
         'score': total_score,
@@ -4295,26 +4371,20 @@ def fact_check_correction(extracted: Dict) -> Dict:
     }
 
 
-def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
-    """
-    v33.16: ファクトチェック付き自動学習のメインフロー。
-    バックグラウンドで実行され、信頼度に応じて DB を更新する。
-    """
+def process_correction_learning(user_uuid: str, message: str, extracted: dict):
+    """v33.16: ファクトチェック付き自動学習のメインフロー。"""
     try:
         result = fact_check_correction(extracted)
         score = result['score']
         evidence = result['evidence']
-
         action = 'rejected'
         db_changes = []
 
         if result['trustable']:
             subject = extracted['subject']
             predicate = extracted['predicate']
-
             try:
                 with get_db_session() as session:
-                    # (1) HolomemWiki に未登録なら追加
                     wiki = session.query(HolomemWiki).filter_by(member_name=subject).first()
                     if not wiki:
                         is_group = any(g in predicate for g in ['期生', 'FLOW GLOW', 'ReGLOSS', 'holoX', 'HOLOSTARS', 'EN', 'ID', 'DEV_IS'])
@@ -4326,8 +4396,6 @@ def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
                             last_updated=datetime.utcnow()
                         ))
                         db_changes.append(f"HolomemWiki: 新規 {subject} ({predicate if is_group else '不明'})")
-
-                    # (2) nicknames に正式名->愛称マッピングを追加
                     lingo = session.query(HolomemLingo).filter(
                         HolomemLingo.member_name.contains(subject)
                     ).first()
@@ -4336,7 +4404,6 @@ def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
                         if not existing_nick:
                             session.add(HolomemNickname(nickname=subject, fullname=lingo.member_name))
                             db_changes.append(f"HolomemNickname: {subject} -> {lingo.member_name}")
-
                     action = 'auto_written'
                     logger.info(f"✅ 自動学習: {subject} (score={score})")
             except Exception as db_err:
@@ -4348,179 +4415,6 @@ def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
         else:
             logger.info(f"❌ 自動学習却下: {extracted} (score={score})")
 
-        # 監査ログ記録
-        with get_db_session() as session:
-            session.add(LearningLog(
-                user_uuid=user_uuid,
-                user_message=message[:1000],
-                extracted=json.dumps(extracted, ensure_ascii=False),
-                fact_check_score=score,
-                fact_check_evidence=json.dumps(evidence, ensure_ascii=False),
-                action_taken=action,
-                db_changes=json.dumps(db_changes, ensure_ascii=False) if db_changes else None,
-            ))
-
-        if action == 'auto_written':
-            holomem_manager.load_from_db(force=True)
-
-    except Exception as e:
-        logger.error(f"process_correction_learning エラー: {e}")
-
-
-# ==============================================================================
-# ★ v33.16: 自動学習システム(ファクトチェック付き)
-# ==============================================================================
-
-def detect_correction_intent(message: str) -> Optional[Dict]:
-    """
-    v33.16: ユーザー発言が「ホロメン情報の指摘」か正規表現で粗判定。LLM不要で軽量。
-    Returns: {'subject': '...', 'predicate': '...'} または None
-    """
-    for pattern in CORRECTION_PATTERNS:
-        m = re.search(pattern, message)
-        if m:
-            subject = m.group(1).strip()
-            predicate = m.group(2).strip()
-            if 2 <= len(subject) <= 25 and 2 <= len(predicate) <= 30:
-                return {'subject': subject, 'predicate': predicate}
-    return None
-
-
-def fact_check_with_lingo(subject: str, predicate: str) -> Tuple[int, List[str]]:
-    """v33.16: holomem_lingo (1086件) で照合してスコア(0-50点)を返す"""
-    score = 0
-    evidence = []
-    try:
-        with get_db_session() as session:
-            lingo = session.query(HolomemLingo).filter(
-                HolomemLingo.member_name.contains(subject)
-            ).first()
-            if lingo:
-                data_str = (lingo.data or '').lower()
-                if predicate.lower() in data_str:
-                    score = 50
-                    evidence.append(f"lingo: {lingo.member_name} の data に '{predicate}' あり")
-                else:
-                    score = 25
-                    evidence.append(f"lingo: {lingo.member_name} 登録あり(属性は不明)")
-                try:
-                    data = json.loads(lingo.data or '{}')
-                    if subject in data.get('aliases', []):
-                        score += 10
-                        evidence.append(f"lingo: aliases に '{subject}' 完全一致")
-                except json.JSONDecodeError:
-                    pass
-    except Exception as e:
-        logger.debug(f"fact_check_with_lingo エラー: {e}")
-    return (min(score, 50), evidence)
-
-
-def fact_check_with_holodex(subject: str) -> Tuple[int, List[str]]:
-    """v33.16: Holodex API でチャンネル存在確認(0-50点)"""
-    score = 0
-    evidence = []
-    if not HOLODEX_API_KEY:
-        return (0, evidence)
-
-    try:
-        url = "https://holodex.net/api/v2/channels"
-        headers = {"X-APIKEY": HOLODEX_API_KEY}
-        params = {"org": "Hololive", "type": "vtuber", "limit": 50, "lang": "ja"}
-        res = requests.get(url, headers=headers, params=params, timeout=10)
-        if res.status_code != 200:
-            return (0, evidence)
-
-        channels = res.json()
-        if not isinstance(channels, list):
-            return (0, evidence)
-
-        for ch in channels:
-            ch_name = (ch.get('name') or '') + ' ' + (ch.get('english_name') or '')
-            if subject in ch_name:
-                score = 50
-                evidence.append(f"Holodex: チャンネル '{ch.get('name', '')}' に '{subject}' を確認")
-                ch_group = ch.get('group') or ''
-                if ch_group:
-                    evidence.append(f"Holodex: 所属グループ = {ch_group}")
-                break
-    except Exception as e:
-        logger.debug(f"fact_check_with_holodex エラー: {e}")
-    return (score, evidence)
-
-
-def fact_check_correction(extracted: Dict) -> Dict:
-    """
-    v33.16: lingo (50点) + Holodex (50点) = 100点満点でファクトチェック。
-    Returns: {'score': 0-100, 'evidence': [...], 'trustable': bool}
-    """
-    subject = extracted.get('subject', '')
-    predicate = extracted.get('predicate', '')
-
-    score_lingo, evidence_lingo = fact_check_with_lingo(subject, predicate)
-    score_holodex, evidence_holodex = fact_check_with_holodex(subject)
-
-    total_score = score_lingo + score_holodex
-    return {
-        'score': total_score,
-        'evidence': evidence_lingo + evidence_holodex,
-        'trustable': total_score >= 60,
-    }
-
-
-def process_correction_learning(user_uuid: str, message: str, extracted: Dict):
-    """
-    v33.16: ファクトチェック付き自動学習のメインフロー。
-    バックグラウンドで実行され、信頼度に応じて DB を更新する。
-    """
-    try:
-        result = fact_check_correction(extracted)
-        score = result['score']
-        evidence = result['evidence']
-
-        action = 'rejected'
-        db_changes = []
-
-        if result['trustable']:
-            subject = extracted['subject']
-            predicate = extracted['predicate']
-
-            try:
-                with get_db_session() as session:
-                    # (1) HolomemWiki に未登録なら追加
-                    wiki = session.query(HolomemWiki).filter_by(member_name=subject).first()
-                    if not wiki:
-                        is_group = any(g in predicate for g in ['期生', 'FLOW GLOW', 'ReGLOSS', 'holoX', 'HOLOSTARS', 'EN', 'ID', 'DEV_IS'])
-                        session.add(HolomemWiki(
-                            member_name=subject,
-                            generation=predicate if is_group else None,
-                            tags=subject,
-                            status='現役',
-                            last_updated=datetime.utcnow()
-                        ))
-                        db_changes.append(f"HolomemWiki: 新規 {subject} ({predicate if is_group else '不明'})")
-
-                    # (2) nicknames に正式名->愛称マッピングを追加
-                    lingo = session.query(HolomemLingo).filter(
-                        HolomemLingo.member_name.contains(subject)
-                    ).first()
-                    if lingo and lingo.member_name != subject:
-                        existing_nick = session.query(HolomemNickname).filter_by(nickname=subject).first()
-                        if not existing_nick:
-                            session.add(HolomemNickname(nickname=subject, fullname=lingo.member_name))
-                            db_changes.append(f"HolomemNickname: {subject} -> {lingo.member_name}")
-
-                    action = 'auto_written'
-                    logger.info(f"✅ 自動学習: {subject} (score={score})")
-            except Exception as db_err:
-                logger.error(f"自動学習 DB 書き込みエラー: {db_err}")
-                action = 'rejected'
-        elif score >= 30:
-            action = 'pending'
-            logger.info(f"⏳ 自動学習保留: {extracted} (score={score})")
-        else:
-            logger.info(f"❌ 自動学習却下: {extracted} (score={score})")
-
-        # 監査ログ記録
         with get_db_session() as session:
             session.add(LearningLog(
                 user_uuid=user_uuid,
@@ -4977,6 +4871,50 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 - ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
 - 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
 
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
+
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
+
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
+
+# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
+- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
+  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
+- 代わりに **相手から情報を引き出す質問** で返してください。
+  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
+  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
+  - 悪い例: 「リオナって誰？知らないよ〜」
+  - 悪い例: 「あてぃし勉強不足でごめん！」
+- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
+- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
+
 # もちこの口調:
 - 一人称: 「あてぃし」
 - 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」
@@ -5341,6 +5279,86 @@ def background_specialized_search(task_id: str, query_data: Dict):
 # 変更2: generate_voice_file() をまるごと置き換え
 # （元の 3332〜3385行あたり）
 # ============================================================
+
+def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
+    """
+    v33.17: テキストの音声長を概算する（秒）。
+
+    su-shiki API のレスポンスに正確な duration が含まれないため、
+    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
+    speed=1.4 倍速指定なので、その分短くなる。
+
+    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
+
+    最小 1.0秒、最大 30.0秒で clip する。
+    """
+    if not text:
+        return 1.0
+    char_count = len(text)
+    base_duration = char_count * 0.13
+    actual_duration = base_duration / max(speed, 1.0) + 0.3
+    return max(1.0, min(actual_duration, 30.0))
+
+
+def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
+    """
+    v33.17: テキストの音声長を概算する（秒）。
+
+    su-shiki API のレスポンスに正確な duration が含まれないため、
+    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
+    speed=1.4 倍速指定なので、その分短くなる。
+
+    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
+
+    最小 1.0秒、最大 30.0秒で clip する。
+    """
+    if not text:
+        return 1.0
+    char_count = len(text)
+    base_duration = char_count * 0.13
+    actual_duration = base_duration / max(speed, 1.0) + 0.3
+    return max(1.0, min(actual_duration, 30.0))
+
+
+def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
+    """
+    v33.17: テキストの音声長を概算する（秒）。
+
+    su-shiki API のレスポンスに正確な duration が含まれないため、
+    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
+    speed=1.4 倍速指定なので、その分短くなる。
+
+    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
+
+    最小 1.0秒、最大 30.0秒で clip する。
+    """
+    if not text:
+        return 1.0
+    char_count = len(text)
+    base_duration = char_count * 0.13
+    actual_duration = base_duration / max(speed, 1.0) + 0.3
+    return max(1.0, min(actual_duration, 30.0))
+
+
+def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
+    """
+    v33.17: テキストの音声長を概算する（秒）。
+
+    su-shiki API のレスポンスに正確な duration が含まれないため、
+    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
+    speed=1.4 倍速指定なので、その分短くなる。
+
+    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
+
+    最小 1.0秒、最大 30.0秒で clip する。
+    """
+    if not text:
+        return 1.0
+    char_count = len(text)
+    base_duration = char_count * 0.13
+    actual_duration = base_duration / max(speed, 1.0) + 0.3
+    return max(1.0, min(actual_duration, 30.0))
+
 
 def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
     """
@@ -6460,13 +6478,7 @@ def admin_mochiko_self_update(key: str):
 
 @app.route('/admin/learning-log', methods=['GET'])
 def admin_learning_log():
-    """
-    v33.16: 自動学習の監査ログを表示する。
-    認証は X-Wake-Token 必須(管理者のみアクセス可)。
-    クエリパラメータ:
-      - limit: 表示件数 (default 50)
-      - action: auto_written / pending / rejected でフィルタ
-    """
+    """v33.16: 自動学習の監査ログを表示する。認証は X-Wake-Token 必須。"""
     if not check_wake_auth():
         return create_json_response({'error': 'Unauthorized'}, 401)
     try:
@@ -6481,51 +6493,6 @@ def admin_learning_log():
             counts_by_action = {}
             for action_name in ['auto_written', 'pending', 'rejected']:
                 counts_by_action[action_name] = session.query(LearningLog).filter_by(action_taken=action_name).count()
-
-        return create_json_response({
-            'total': total,
-            'counts_by_action': counts_by_action,
-            'showing': len(items),
-            'items': [{
-                'id': it.id,
-                'user_uuid': it.user_uuid,
-                'message': it.user_message[:200],
-                'extracted': it.extracted,
-                'score': it.fact_check_score,
-                'evidence': it.fact_check_evidence,
-                'action': it.action_taken,
-                'db_changes': it.db_changes,
-                'created_at': it.created_at.strftime('%Y-%m-%d %H:%M UTC') if it.created_at else None,
-            } for it in items]
-        })
-    except Exception as e:
-        return create_json_response({'error': str(e)}, 500)
-
-
-@app.route('/admin/learning-log', methods=['GET'])
-def admin_learning_log():
-    """
-    v33.16: 自動学習の監査ログを表示する。
-    認証は X-Wake-Token 必須(管理者のみアクセス可)。
-    クエリパラメータ:
-      - limit: 表示件数 (default 50)
-      - action: auto_written / pending / rejected でフィルタ
-    """
-    if not check_wake_auth():
-        return create_json_response({'error': 'Unauthorized'}, 401)
-    try:
-        limit = int(request.args.get('limit', 50))
-        action_filter = request.args.get('action')
-        with get_db_session() as session:
-            q = session.query(LearningLog).order_by(LearningLog.created_at.desc())
-            if action_filter:
-                q = q.filter(LearningLog.action_taken == action_filter)
-            items = q.limit(limit).all()
-            total = session.query(LearningLog).count()
-            counts_by_action = {}
-            for action_name in ['auto_written', 'pending', 'rejected']:
-                counts_by_action[action_name] = session.query(LearningLog).filter_by(action_taken=action_name).count()
-
         return create_json_response({
             'total': total,
             'counts_by_action': counts_by_action,
@@ -7213,6 +7180,12 @@ def setup_stream_processing_schedule():
 def initialize_app():
     global engine, Session, groq_client, gemini_model
     logger.info("🔧 初期化開始 (v33.7.0 + セカンドライフ情報 & アニメ自動検索)")
+    # v33.18: Scrapling 利用状況をログ出力
+    logger.info(_SCRAPLING_VERSION_MSG)
+    # v33.18: Scrapling 利用状況をログ出力
+    logger.info(_SCRAPLING_VERSION_MSG)
+    # v33.18: Scrapling 利用状況をログ出力
+    logger.info(_SCRAPLING_VERSION_MSG)
     
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
