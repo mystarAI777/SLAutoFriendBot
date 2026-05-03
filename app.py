@@ -3254,7 +3254,7 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
         try:
             resp = model.generate_content(
                 prompt,
-                generation_config={"temperature": 0.5, "max_output_tokens": 1000}
+                generation_config={"temperature": 0.5, "max_output_tokens": 800}
             )
             if hasattr(resp, 'candidates') and resp.candidates:
                 response = resp.candidates[0].content.parts[0].text.strip()
@@ -4945,8 +4945,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
     # ★ v33.16: ニュース・ホロメン話題は出力トークンを拡張して解像度を上げる
     is_rich_topic = is_news_topic(message) or is_holomem_topic(message)
-    gemini_max_tokens = 1050 if is_rich_topic else 650
-    groq_max_tokens = 1050 if (is_task_report or is_rich_topic) else 450
+    gemini_max_tokens = 800 if is_rich_topic else 450
+    groq_max_tokens = 800 if (is_task_report or is_rich_topic) else 450
 
     response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     if not response:
