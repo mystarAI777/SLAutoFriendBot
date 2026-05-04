@@ -5413,27 +5413,11 @@ def _split_phrases(text: str) -> List[str]:
         if p in ('。', '！', '？', '\n'):
             buffer += p
             if buffer.strip():
-# --- ★ ここで LSL へ即時送信 ★ ---
-                phrase_to_send = buffer.strip()
-                if sl_url:  # LSLのURLを保持している変数
-                    try:
-                        requests.post(sl_url, data={'type': 'chat', 'text': phrase_to_send}, timeout=2)
-                    except:
-                        pass
-                # -------------------------------
                 merged_raw.append(buffer.strip())
             buffer = ""
         else:
             buffer += p
     if buffer.strip():
-# --- ★ 最後のフレーズも同様に送信 ★ ---
-        phrase_to_send = buffer.strip()
-        if sl_url:
-            try:
-                requests.post(sl_url, data={'type': 'chat', 'text': phrase_to_send}, timeout=2)
-            except:
-                pass
-        # -------------------------------
     merged_raw.append(buffer.strip())
 
     # 空要素を除外
