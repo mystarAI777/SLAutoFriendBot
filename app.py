@@ -5434,7 +5434,7 @@ def _split_phrases(text: str) -> List[str]:
             except:
                 pass
         # -------------------------------
-    　　merged_raw.append(buffer.strip())
+    merged_raw.append(buffer.strip())
 
     # 空要素を除外
     merged_raw = [p for p in merged_raw if p and len(p) >= 1]
