@@ -1002,7 +1002,7 @@ class HololiveNews(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=False)
-    url = Column(String(1000), unique=True)
+    url = Column(String(600), unique=True)
     news_hash = Column(String(100), unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -1164,7 +1164,7 @@ class SecondLifeNews(Base):
     source = Column(String(100), nullable=False)    # 'official_blog' / 'community' / 'marketplace'
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=True)
-    url = Column(String(1000), nullable=True)
+    url = Column(String(600), nullable=True)
     news_hash = Column(String(100), unique=True, index=True)
     category = Column(String(50), nullable=True)    # 'update' / 'event' / 'trend' / 'news'
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -1201,7 +1201,7 @@ class SpecializedNews(Base):
     site_name = Column(String(100), nullable=False, index=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=True)
-    url = Column(String(1000), nullable=True)
+    url = Column(String(600), nullable=True)
     news_hash = Column(String(100), unique=True, index=True)
     query_keyword = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -1248,7 +1248,7 @@ def clean_text(text: str) -> str:
 def limit_text_for_sl(text: str, max_length: int = SL_SAFE_CHAR_LIMIT) -> str:
     return text[:max_length - 3] + "..." if len(text) > max_length else text
 
-def sanitize_user_input(text: str, max_length: int = 1000) -> str:
+def sanitize_user_input(text: str, max_length: int = 600) -> str:
     if not text: return ""
     text = text[:max_length]; text = escape(text)
     return text.strip()
@@ -1815,7 +1815,7 @@ def extract_reactions_from_news(member_name: str, stream_title: str) -> Dict:
     この配信に関連する反応・感想キーワードを抽出する。
 
     反応源として外部スクレイピングを使わず、
-    既にDBにある記事本文（800文字まで取得済み）から抽出するので、
+    既にDBにある記事本文（600文字まで取得済み）から抽出するので、
     外部依存がなく安定している。
     """
     reactions = {
@@ -1837,7 +1837,7 @@ def extract_reactions_from_news(member_name: str, stream_title: str) -> Dict:
             highlight_kws = ['シーン', 'ここ', '場面', '爆笑', 'クライマックス', '神回']
 
             for news in recent_news:
-                body = (news.content or '')[:800]
+                body = (news.content or '')[:600]
                 # 本文を一文ずつ分割してキーワードヒット判定
                 sentences = re.split(r'[。！？\n]', body)
                 for sent in sentences:
@@ -2212,7 +2212,7 @@ def fetch_member_detail_from_wiki(member_name: str) -> Optional[Dict]:
         soup = BeautifulSoup(res.content, 'html.parser')
         content = soup.select_one('#content, .wiki-content')
         if not content: return None
-        text = clean_text(content.text)[:1000]
+        text = clean_text(content.text)[:600]
         detail = {'member_name': member_name}
         debut = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日)[^\d]*デビュー', text)
         if debut: detail['debut_date'] = debut.group(1)
@@ -2415,7 +2415,7 @@ def fetch_hololive_tsuushin_news():
                         for tag in body_elem.select('script, style, nav, .ad, .share, figure'):
                             tag.decompose()
                         content = clean_text(body_elem.get_text(separator='\n'))
-                        content = content[:800]
+                        content = content[:600]
                     else:
                         content = title
 
@@ -3183,7 +3183,7 @@ def save_to_specialized_news(
                     site_name=site_name,
                     title=title[:500],
                     content=content[:2000],
-                    url=url[:1000] if url else "",
+                    url=url[:600] if url else "",
                     news_hash=news_hash,
                     query_keyword=query_keyword[:200] if query_keyword else "",
                     created_at=datetime.utcnow()
@@ -3254,7 +3254,7 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
         try:
             resp = model.generate_content(
                 prompt,
-                generation_config={"temperature": 0.5, "max_output_tokens": 1000}
+                generation_config={"temperature": 0.5, "max_output_tokens": 600}
             )
             if hasattr(resp, 'candidates') and resp.candidates:
                 response = resp.candidates[0].content.parts[0].text.strip()
@@ -3268,7 +3268,7 @@ def execute_specialized_site_search(query: str, site_info: Dict) -> str:
 
     if not response and groq_client:
         # ★ v33.8.2: 専門検索は compound-beta が得意
-        response = call_groq(prompt, query, [], 800, task_type='search')
+        response = call_groq(prompt, query, [], 600, task_type='search')
 
     if not response:
         response = (
@@ -3815,7 +3815,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
                 # v33.15-stable2: max_output_tokens 明示（未指定だとモデルが暴走する場合あり）
                 response = current_gemini.generate_content(
                     analysis_prompt,
-                    generation_config={"temperature": 0.3, "max_output_tokens": 800}
+                    generation_config={"temperature": 0.3, "max_output_tokens": 600}
                 )
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
@@ -3838,7 +3838,7 @@ def analyze_user_psychology(session, user_uuid: str, user_name: str):
                         model=models[0],
                         messages=[{"role": "user", "content": analysis_prompt}],
                         temperature=0.3,
-                        max_tokens=800
+                        max_tokens=600
                     )
                     text = response.choices[0].message.content.strip()
                     json_match = re.search(r'\{[^}]+\}', text, re.DOTALL)
@@ -4103,8 +4103,8 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
         model = gemini_model_manager.get_current_model()
         if model:
             try:
-                # v33.15-stable2: Geminiも800に統一（プロフィール用JSON生成）
-                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 800})
+                # v33.15-stable2: Geminiも600に統一（プロフィール用JSON生成）
+                response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 600})
                 if hasattr(response, 'candidates') and response.candidates:
                     text = response.candidates[0].content.parts[0].text.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -4126,7 +4126,7 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
                     resp = groq_client.chat.completions.create(
                         model=available[0],
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3, max_tokens=800
+                        temperature=0.3, max_tokens=600
                     )
                     text = resp.choices[0].message.content.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
@@ -4418,7 +4418,7 @@ def process_correction_learning(user_uuid: str, message: str, extracted: dict):
         with get_db_session() as session:
             session.add(LearningLog(
                 user_uuid=user_uuid,
-                user_message=message[:1000],
+                user_message=message[:600],
                 extracted=json.dumps(extracted, ensure_ascii=False),
                 fact_check_score=score,
                 fact_check_evidence=json.dumps(evidence, ensure_ascii=False),
@@ -4439,7 +4439,7 @@ def process_correction_learning(user_uuid: str, message: str, extracted: dict):
 def call_gemini(system_prompt: str, message: str, history: List[Dict], max_output_tokens: int = 600) -> Optional[str]:
     """
     v33.16: max_output_tokens を引数化。ニュース・ホロメン話題時は拡張。
-    通常: 600 / ニュース・ホロメン: 1000 (約400文字応答)
+    通常: 600 / ニュース・ホロメン: 600 (約400文字応答)
     """
     model = gemini_model_manager.get_current_model()
     if not model:
@@ -4481,7 +4481,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict], max_outpu
     
     return None
 
-def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 800, task_type: str = 'default') -> Optional[str]:
+def call_groq(system_prompt: str, message: str, history: List[Dict], max_tokens: int = 600, task_type: str = 'default') -> Optional[str]:
     """Groq API呼び出し。task_type で用途別モデルを選択する。
     task_type: 'chat' | 'search' | 'analysis' | 'default'
     """
@@ -4637,7 +4637,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                 lore_blocks = []
                 # エピソード
                 if matched_member.episodes:
-                    lore_blocks.append(f"▼{matched_member.member_name}のエピソード:\n{matched_member.episodes[:800]}")
+                    lore_blocks.append(f"▼{matched_member.member_name}のエピソード:\n{matched_member.episodes[:600]}")
                 # ファン用語（lingoテーブル）
                 lingo = session_lore.query(HolomemLingo).filter_by(
                     member_name=matched_member.member_name
@@ -5511,7 +5511,7 @@ def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]
             logger.error(f"❌ 音声バイナリではない[{idx}]: {res.text[:80]}")
             return None
 
-        ts = int(time.time() * 1000)
+        ts = int(time.time() * 600)
         filename = f"voice_{user_uuid[:8]}_{ts}_{idx}.mp3"
         filepath = os.path.join(VOICE_DIR, filename)
         with open(filepath, 'wb') as f:
@@ -6612,10 +6612,10 @@ def get_database_stats():
     reaction_count = stats.get('stream_reactions', 0)
     feeling_count = stats.get('holomem_feelings', 0)
     
-    estimated_size_kb = (reaction_count * 650 + feeling_count * 1000) / 1024
+    estimated_size_kb = (reaction_count * 650 + feeling_count * 600) / 1024
     max_reactions = 150
     max_feelings = 100
-    max_size_kb = (max_reactions * 650 + max_feelings * 1000) / 1024
+    max_size_kb = (max_reactions * 650 + max_feelings * 600) / 1024
     
     return create_json_response({
         **stats,
