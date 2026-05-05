@@ -892,6 +892,8 @@ _voice_queues: Dict[str, Any] = {}
 _voice_queues_lock = Lock()
 # v33.17: 直近の chat_lsl 応答に対する最初のフレーズの duration（chat_lslのレスポンスで使う）
 _last_voice_duration: Dict[str, float] = {}
+# v33.22: 最初のフレーズの表示テキスト（絵文字付き）→ chat_lsl の res_text に使う
+_last_voice_text: Dict[str, str] = {}
 
 
 # GitHub Actions から /wake を叩く際の認証キー
@@ -1246,7 +1248,16 @@ def clean_text(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', text)).strip()
 
 def limit_text_for_sl(text: str, max_length: int = SL_SAFE_CHAR_LIMIT) -> str:
-    return text[:max_length - 3] + "..." if len(text) > max_length else text
+    """文の自然な区切り位置でカットする（途中切れ防止）"""
+    if len(text) <= max_length:
+        return text
+    # 文末記号を優先順に探し、半分より後ろで見つかれば採用
+    for sep in ['。', '！', '？', '…', '\n', '、']:
+        idx = text.rfind(sep, 0, max_length - 1)
+        if idx > max_length // 2:
+            return text[:idx + 1]
+    # 自然な区切りが見つからなければ省略記号付きカット
+    return text[:max_length - 3] + "..."
 
 def sanitize_user_input(text: str, max_length: int = 600) -> str:
     if not text: return ""
@@ -1336,6 +1347,30 @@ def sanitize_response_for_sl(text: str) -> str:
     # 3回以上の連続改行を2回に制限
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text
+
+
+def strip_emoji_for_tts(text: str) -> str:
+    """
+    TTS(su-shiki VOICEVOX API)に渡すテキストから絵文字・記号を除去する。
+    絵文字をそのまま渡すと音声品質が下がるため除去する。
+    SLチャット表示用テキストには影響しない（表示は元テキストを使う）。
+    """
+    if not text:
+        return text
+    result = []
+    for char in text:
+        cp = ord(char)
+        if 0x1F300 <= cp <= 0x1FAFF:   # 絵文字ブロック全般
+            continue
+        if 0x2600 <= cp <= 0x27BF:      # その他記号・装飾
+            continue
+        if 0xFE00 <= cp <= 0xFE0F:      # 異体字セレクタ
+            continue
+        if cp == 0x200D:                # ゼロ幅接合子
+            continue
+        result.append(char)
+    return re.sub(r'  +', ' ', ''.join(result)).strip()
+
 
 def get_weather_forecast(location: str = "東京") -> str:
     """
@@ -5529,22 +5564,23 @@ def _generate_one_phrase(phrase: str, user_uuid: str, idx: int) -> Optional[str]
         return None
 
 
-def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
+def generate_voice_file(display_text: str, user_uuid: str) -> Optional[str]:
     """
-    テキストをフレーズ分割し、並列で音声生成。
-    生成できたものからユーザーのキューに積む。
-    最初のフレーズのURLを返す（LSLへの即時レスポンス用）。
-    残りのフレーズはLSLが /next_voice でポーリングして受け取る。
+    v33.22: 絵文字付きテキスト(display_text)でフレーズ分割し、
+    TTS送信時のみ絵文字を除去する。
+    キューには (url, duration, display_phrase) を保存し、
+    /next_voice でテキストも返すことでSLチャット表示と音声を同期させる。
     """
-    phrases = _split_phrases(text)
+    # 絵文字付きテキストで分割（チャット表示テキストの基準）
+    phrases = _split_phrases(display_text)
     if not phrases:
         return None
 
     logger.info(f"🎙️ {len(phrases)}フレーズに分割: {phrases}")
 
-    # ★ v33.17: フレーズごとに duration を計算しておく
-    # キューには (url, duration) タプルを保存する
-    phrase_durations = [estimate_audio_duration(p) for p in phrases]
+    # TTS用: 各フレーズから絵文字を除去
+    tts_phrases = [strip_emoji_for_tts(p) for p in phrases]
+    phrase_durations = [estimate_audio_duration(p) for p in tts_phrases]
 
     # キューを初期化（古いものをクリア）
     from collections import deque
@@ -5553,32 +5589,37 @@ def generate_voice_file(text: str, user_uuid: str) -> Optional[str]:
 
     # フレーズ数が1つならシンプルに生成して返す
     if len(phrases) == 1:
-        url = _generate_one_phrase(phrases[0], user_uuid, 0)
-        # ★ v33.17: グローバル変数で最初のフレーズの duration を保持
-        # (chat_lsl の Response で使うため、generate_voice_file の戻り値に
-        #  含めるのではなく、別の方法で渡す必要がある → 後述の E-4 で対応)
+        url = _generate_one_phrase(tts_phrases[0], user_uuid, 0)
         _last_voice_duration[user_uuid] = phrase_durations[0]
+        _last_voice_text[user_uuid] = phrases[0]  # 絵文字付き
         return url
 
-    # 複数フレーズ: 並列生成してできた順にキューへ積む
-    # まず最初のフレーズを同期生成（即レスポンス用）
-    first_url = _generate_one_phrase(phrases[0], user_uuid, 0)
+    # 複数フレーズ: 最初のフレーズを同期生成（即レスポンス用）
+    first_url = _generate_one_phrase(tts_phrases[0], user_uuid, 0)
     _last_voice_duration[user_uuid] = phrase_durations[0]
+    _last_voice_text[user_uuid] = phrases[0]  # 絵文字付き
 
-    # 残りのフレーズをバックグラウンドで順番に生成してキューに積む
-    # ★ v33.17: キューに (url, duration) タプルを積む
+    # 残りをバックグラウンドで生成してキューに積む
+    # v33.22: キューに (url, duration, display_phrase) の3要素タプルを積む
     def generate_remaining():
-        for i, phrase in enumerate(phrases[1:], start=1):
-            url = _generate_one_phrase(phrase, user_uuid, i)
+        for i, (tts_p, disp_p) in enumerate(
+            zip(tts_phrases[1:], phrases[1:]), start=1
+        ):
+            url = _generate_one_phrase(tts_p, user_uuid, i)
             if url:
                 with _voice_queues_lock:
                     if user_uuid in _voice_queues:
-                        _voice_queues[user_uuid].append((url, phrase_durations[i]))
-                        logger.info(f"📥 キュー追加[{i}]: {url} (duration={phrase_durations[i]:.1f}s)")
+                        _voice_queues[user_uuid].append(
+                            (url, phrase_durations[i], disp_p)  # 絵文字付きtext
+                        )
+                        logger.info(
+                            f"📥 キュー追加[{i}]: {url} "
+                            f"(duration={phrase_durations[i]:.1f}s) "
+                            f"text='{disp_p[:15]}...'"
+                        )
 
     background_executor.submit(generate_remaining)
-
-    return first_url  # 最初のURLを即レスポンスとして返す
+    return first_url
 
 def cleanup_old_voice_files():
     try:
@@ -6249,18 +6290,28 @@ def chat_lsl():
             if not is_task_started:
                 session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
 
-        # ★ 修正: 音声生成はフルテキスト(文字数制限なし)を使用。
-        # SLチャット表示用テキストのみ文字数制限を適用することで、
-        # 音声が文の途中で途切れるバグを解消する。
-        voice_text = sanitize_response_for_sl(ai_text)  # パイプ除去のみ、文字数制限なし
-        _sl_max = 1250 if (is_news_topic(message) or is_holomem_topic(message)) else SL_SAFE_CHAR_LIMIT
-        res_text = limit_text_for_sl(voice_text, max_length=_sl_max)  # SL表示用のみ制限
+        # v33.22: SL表示・TTS・音声生成の完全分離
+        # voice_text : パイプ除去済みフルテキスト（絵文字付き）
+        # res_text   : 音声あり→フレーズ1のテキスト / 音声なし→650文字制限
+        # generate_voice_file は絵文字付きで渡し、内部でTTS用に除去する
+        voice_text = sanitize_response_for_sl(ai_text)  # パイプ除去のみ
         v_url = ""
+        first_phrase_text = ""
         if generate_voice and global_state.voicevox_enabled and not is_task_started:
-            direct_url = generate_voice_file(voice_text, user_uuid)  # フルテキストで音声生成
+            direct_url = generate_voice_file(voice_text, user_uuid)  # 絵文字付きで渡す
             if direct_url:
                 v_url = direct_url
-            
+                first_phrase_text = _last_voice_text.get(user_uuid, '')
+
+        # res_text の決定:
+        #   音声生成成功 → フレーズ1テキスト（絵文字付き）をSLチャットに表示
+        #                  続きは /next_voice のレスポンスで順次表示
+        #   音声なし    → 650文字制限＋文区切りカットして表示
+        if v_url and first_phrase_text:
+            res_text = first_phrase_text
+        else:
+            res_text = limit_text_for_sl(voice_text, max_length=SL_SAFE_CHAR_LIMIT)
+
         return Response(f"{res_text}|{v_url}", mimetype='text/plain; charset=utf-8', status=200)
     
     except Exception as e:
@@ -6887,15 +6938,27 @@ def next_voice():
             if q and len(q) > 0:
                 # ★ v33.17: キューの値が (url, duration) タプル
                 item = q.popleft()
-                if isinstance(item, tuple):
+                if isinstance(item, tuple) and len(item) == 3:
+                    url, duration, disp_text = item
+                elif isinstance(item, tuple) and len(item) == 2:
                     url, duration = item
+                    disp_text = ""
                 else:
                     # 旧データ互換（万が一文字列だけが残っていたら）
                     url = item
                     duration = estimate_audio_duration("", 1.4)
-                logger.info(f"📤 next_voice返却: {url} (duration={duration:.1f}s)")
-                # ★ v33.17: LSLが "url|duration" を期待
-                return Response(f"{url}|{duration:.2f}", 200, mimetype='text/plain; charset=utf-8')
+                    disp_text = ""
+                logger.info(
+                    f"📤 next_voice返却: {url} (duration={duration:.1f}s) "
+                    f"text='{disp_text[:15]}...'"
+                )
+                # v33.22: LSLが "url|duration|text" を期待
+                # text はパイプ除去済み(sanitize_response_for_slで全角変換済み)
+                return Response(
+                    f"{url}|{duration:.2f}|{disp_text}",
+                    200,
+                    mimetype='text/plain; charset=utf-8'
+                )
 
         return Response("", 200)
 
