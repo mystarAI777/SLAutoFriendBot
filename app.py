@@ -981,6 +981,23 @@ class HolomemLingo(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class HolomemPronunciation(Base):
+    """
+    v33.23: ホロメン名の読み仮名(ひらがな)を保持するテーブル。
+    TTS音声生成時に漢字メンバー名をひらがなに置換するために使う。
+    SLチャット表示テキストには影響しない（漢字のまま）。
+
+    例: kanji='響咲リオナ' / hiragana='ひびきさきりおな'
+    """
+    __tablename__ = 'holomem_pronunciations'
+    id = Column(Integer, primary_key=True)
+    kanji = Column(String(100), unique=True, nullable=False, index=True)
+    hiragana = Column(String(200), nullable=False)
+    source = Column(String(20), default='auto')  # auto / manual
+    confidence = Column(Integer, default=50)     # 0-100, manual=100
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class LiveSchedule(Base):
     """
     schedule.hololive.tv からスクレイピングした配信スケジュール。
@@ -1626,6 +1643,139 @@ class HolomemKeywordManager:
         with self._lock: return len(self._keywords)
 
 holomem_manager = HolomemKeywordManager()
+# ==============================================================================
+# ★ v33.23: ホロメン読み仮名管理 (TTS発音矯正用)
+# ==============================================================================
+class PronunciationManager:
+    """
+    HolomemPronunciation テーブルから {漢字: ひらがな} の辞書を構築し、
+    TTS音声生成前にテキスト内の漢字メンバー名をひらがなに置換する。
+
+    起動時に1回ロードし、以後はメモリ辞書から高速参照。
+    /admin/pronunciations の更新時には refresh() を呼ぶ。
+    """
+    def __init__(self):
+        self._lock = RLock()
+        self._mapping: Dict[str, str] = {}  # {kanji: hiragana}
+        self._sorted_keys: List[str] = []   # 長い順 (部分一致誤爆防止)
+
+    def load_from_db(self) -> bool:
+        with self._lock:
+            try:
+                with get_db_session() as session:
+                    rows = session.query(HolomemPronunciation).all()
+                    self._mapping = {r.kanji: r.hiragana for r in rows if r.kanji and r.hiragana}
+                    # 長い文字列から先にマッチさせる（"響咲リオナ"を"リオナ"より先に）
+                    self._sorted_keys = sorted(self._mapping.keys(), key=len, reverse=True)
+                    logger.info(f"📣 PronunciationManager ロード完了: {len(self._mapping)}件")
+                    return True
+            except Exception as e:
+                logger.error(f"PronunciationManager.load_from_db エラー: {e}")
+                return False
+
+    def convert_for_tts(self, text: str) -> str:
+        """テキスト内の漢字ホロメン名をひらがな読みに置換する"""
+        if not text or not self._mapping:
+            return text
+        with self._lock:
+            for kanji in self._sorted_keys:
+                if kanji in text:
+                    text = text.replace(kanji, self._mapping[kanji])
+            return text
+
+    def get_count(self) -> int:
+        with self._lock:
+            return len(self._mapping)
+
+    def refresh(self):
+        self.load_from_db()
+
+
+pronunciation_manager = PronunciationManager()
+
+
+def _is_hiragana_only(text: str) -> bool:
+    """文字列がひらがなのみか判定 (長音符・中黒は許可)"""
+    if not text:
+        return False
+    for ch in text:
+        cp = ord(ch)
+        if 0x3041 <= cp <= 0x309F:  # ひらがな
+            continue
+        if ch in ('ー', '・', '〜'):
+            continue
+        return False
+    return True
+
+
+def initialize_pronunciation_from_lingo():
+    """
+    起動時に1回だけ実行される初期化処理。
+    holomem_lingo の aliases から「漢字メンバー名と長さが近いひらがな」を
+    推測して HolomemPronunciation テーブルに投入する。
+
+    ルール:
+      - aliases の中で全部ひらがなのものを候補にする
+      - 候補のうち、漢字名の文字数 ±2 の範囲のものを優先採用
+      - 同条件の候補が複数あれば最も長いもの (フルネーム読み) を採用
+      - 既に HolomemPronunciation にエントリがあればスキップ (上書きしない)
+    """
+    try:
+        with get_db_session() as session:
+            existing_count = session.query(HolomemPronunciation).count()
+            if existing_count > 0:
+                logger.info(f"ℹ️ HolomemPronunciation は既に {existing_count}件 登録済み (初期化スキップ)")
+                return
+
+            lingo_entries = session.query(HolomemLingo).all()
+            logger.info(f"📣 初期発音データ生成中... (lingo {len(lingo_entries)}件 を解析)")
+
+            inserted = 0
+            for entry in lingo_entries:
+                kanji_name = (entry.member_name or "").strip()
+                if not kanji_name or len(kanji_name) < 2:
+                    continue
+                # 既に純ひらがななら登録不要 (TTSがそのまま読める)
+                if _is_hiragana_only(kanji_name):
+                    continue
+
+                try:
+                    data = json.loads(entry.data or '{}')
+                except json.JSONDecodeError:
+                    continue
+
+                aliases = data.get('aliases', [])
+                if not aliases:
+                    continue
+
+                # ひらがなのみの候補を抽出
+                hiragana_candidates = [a.strip() for a in aliases if _is_hiragana_only(a.strip())]
+                if not hiragana_candidates:
+                    continue
+
+                # 漢字名の文字数 ±2 の範囲を優先
+                kanji_len = len(kanji_name)
+                tier1 = [c for c in hiragana_candidates if kanji_len - 2 <= len(c) <= kanji_len + 4]
+                # tier1 が空なら長さ無視で全候補
+                pool = tier1 if tier1 else hiragana_candidates
+                # 最も長いもの (フルネーム読みである可能性が高い)
+                best = max(pool, key=len)
+
+                if best and len(best) >= 2:
+                    session.add(HolomemPronunciation(
+                        kanji=kanji_name,
+                        hiragana=best,
+                        source='auto',
+                        confidence=50,
+                    ))
+                    inserted += 1
+
+            logger.info(f"✅ 初期発音データ投入完了: {inserted}件 (source=auto, confidence=50)")
+    except Exception as e:
+        logger.error(f"initialize_pronunciation_from_lingo エラー: {e}")
+
+
+
 
 # ==============================================================================
 # ホロメン情報キャッシュ & リアルタイム情報収集
@@ -5578,8 +5728,8 @@ def generate_voice_file(display_text: str, user_uuid: str) -> Optional[str]:
 
     logger.info(f"🎙️ {len(phrases)}フレーズに分割: {phrases}")
 
-    # TTS用: 各フレーズから絵文字を除去
-    tts_phrases = [strip_emoji_for_tts(p) for p in phrases]
+    # TTS用: 各フレーズから絵文字を除去 + ホロメン名をひらがなに変換
+    tts_phrases = [pronunciation_manager.convert_for_tts(strip_emoji_for_tts(p)) for p in phrases]
     phrase_durations = [estimate_audio_duration(p) for p in tts_phrases]
 
     # キューを初期化（古いものをクリア）
@@ -6583,6 +6733,111 @@ def update_holomem(id: int):
             holomem_manager.load_from_db(force=True)
             return create_json_response({'success': True})
     return create_json_response({'error': 'not found'}, 404)
+
+@app.route('/admin/pronunciations', methods=['GET'])
+def admin_pronunciations_list():
+    """ホロメン読み仮名一覧を取得"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        source_filter = request.args.get('source')
+        with get_db_session() as session:
+            q = session.query(HolomemPronunciation).order_by(HolomemPronunciation.kanji)
+            if source_filter:
+                q = q.filter(HolomemPronunciation.source == source_filter)
+            items = q.all()
+            total = session.query(HolomemPronunciation).count()
+            count_auto = session.query(HolomemPronunciation).filter_by(source='auto').count()
+            count_manual = session.query(HolomemPronunciation).filter_by(source='manual').count()
+        return create_json_response({
+            'total': total,
+            'count_auto': count_auto,
+            'count_manual': count_manual,
+            'items': [{
+                'id': it.id,
+                'kanji': it.kanji,
+                'hiragana': it.hiragana,
+                'source': it.source,
+                'confidence': it.confidence,
+                'last_updated': it.last_updated.isoformat() if it.last_updated else None,
+            } for it in items]
+        })
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/pronunciations', methods=['POST'])
+def admin_pronunciations_create():
+    """ホロメン読み仮名を新規登録 (kanji, hiragana 必須)"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        data = request.json or {}
+        kanji = (data.get('kanji') or '').strip()[:100]
+        hiragana = (data.get('hiragana') or '').strip()[:200]
+        if not kanji or not hiragana:
+            return create_json_response({'error': 'kanji and hiragana required'}, 400)
+        with get_db_session() as session:
+            existing = session.query(HolomemPronunciation).filter_by(kanji=kanji).first()
+            if existing:
+                existing.hiragana = hiragana
+                existing.source = 'manual'
+                existing.confidence = 100
+                existing.last_updated = datetime.utcnow()
+                msg = f'更新: {kanji} -> {hiragana}'
+            else:
+                session.add(HolomemPronunciation(
+                    kanji=kanji,
+                    hiragana=hiragana,
+                    source='manual',
+                    confidence=100,
+                ))
+                msg = f'新規追加: {kanji} -> {hiragana}'
+        pronunciation_manager.refresh()
+        return create_json_response({'success': True, 'message': msg})
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/pronunciations/<int:pid>', methods=['PUT', 'DELETE'])
+def admin_pronunciations_update(pid: int):
+    """ホロメン読み仮名を編集 / 削除"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    try:
+        with get_db_session() as session:
+            entry = session.query(HolomemPronunciation).get(pid)
+            if not entry:
+                return create_json_response({'error': f'id {pid} not found'}, 404)
+            if request.method == 'DELETE':
+                session.delete(entry)
+                pronunciation_manager.refresh()
+                return create_json_response({'success': True, 'message': f'削除: {entry.kanji}'})
+            data = request.json or {}
+            if 'hiragana' in data:
+                entry.hiragana = (data['hiragana'] or '').strip()[:200]
+                entry.source = 'manual'
+                entry.confidence = 100
+            if 'kanji' in data:
+                entry.kanji = (data['kanji'] or '').strip()[:100]
+            entry.last_updated = datetime.utcnow()
+        pronunciation_manager.refresh()
+        return create_json_response({'success': True, 'message': f'更新: id={pid}'})
+    except Exception as e:
+        return create_json_response({'error': str(e)}, 500)
+
+
+@app.route('/admin/pronunciations/refresh', methods=['POST'])
+def admin_pronunciations_refresh():
+    """発音辞書をDBから再ロード"""
+    if not check_wake_auth():
+        return create_json_response({'error': 'Unauthorized'}, 401)
+    pronunciation_manager.refresh()
+    return create_json_response({
+        'success': True,
+        'count': pronunciation_manager.get_count()
+    })
+
 
 @app.route('/admin/holomem/refresh', methods=['POST'])
 def refresh_holomem():
