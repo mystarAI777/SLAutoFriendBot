@@ -987,7 +987,7 @@ class HolomemPronunciation(Base):
     TTS音声生成時に漢字メンバー名をひらがなに置換するために使う。
     SLチャット表示テキストには影響しない（漢字のまま）。
 
-    例: kanji='響咲リオナ' / hiragana='ひびきさきりおな'
+    例: kanji='響咲リオナ' / hiragana='いさき りおな'
     """
     __tablename__ = 'holomem_pronunciations'
     id = Column(Integer, primary_key=True)
