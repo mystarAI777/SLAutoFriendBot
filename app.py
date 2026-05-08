@@ -2103,7 +2103,21 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
                     'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
                 }
     except Exception as e:
-        logger.error(f"感想生成エラー: {e}")
+   error_str = str(e)
+        if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+            gemini_model_manager.mark_limited(60)
+        logger.warning(f"感想生成Geminiエラー: {e}")
+        if groq_client:
+            try:
+                groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
+                if groq_result:
+                    return {
+                        'feeling': groq_result[:300],
+                        'emotion_tags': ','.join(emotion_tags),
+                        'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                    }
+            except Exception as ge:
+                logger.warning(f"感想生成Groqエラー: {ge}")
     
     # フォールバック: 詳細テンプレート
     templates = [
@@ -2332,10 +2346,8 @@ def process_daily_streams():
                 
             except Exception as e:
                 error_str = str(e)
-                if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
-                    gemini_model_manager.mark_limited(60)
-                logger.warning(f"感想生成Geminiエラー: {e}")
-                if groq_client:
+               except Exception as e:
+                logger.error(f"配信処理エラー: {e}")
                     try:
                         groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
                         if groq_result:
@@ -2479,8 +2491,34 @@ def update_holomem_database():
 # ==============================================================================
 # ホロライブニュース収集
 # ==============================================================================
-fetch_hololive_news
-
+def fetch_hololive_news():
+    logger.info("📰 ニュースDB更新開始...")
+    queries = ["ホロライブ", "hololive VTuber", "ホロライブ 配信"]
+    added = 0
+    with get_db_session() as session:
+        for query in queries:
+            try:
+                results = fetch_google_news_rss(query)
+                for r in results:
+                    title = r.get('title', '')
+                    if not title:
+                        continue
+                    news_hash = hashlib.md5(title.encode()).hexdigest()
+                    if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                        continue
+                    session.add(HololiveNews(
+                        title=title,
+                        content=title,
+                        url='',
+                        news_hash=news_hash,
+                        created_at=datetime.utcnow()
+                    ))
+                    added += 1
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"ニュース取得エラー ({query}): {e}")
+    logger.info(f"✅ ニュースDB更新完了: {added}件追加")
+    
 def _fetch_tsuushin_list_with_scrapling(url: str) -> Optional[List[Dict]]:
     """
     v33.18: Scrapling で hololive-tsuushin の一覧ページから記事リンクを取得。
@@ -7595,6 +7633,7 @@ def _force_fetch_news():
             logger.error(f"強制ニュース取得エラー: {e}")
     threading.Thread(target=_force_fetch_news, daemon=True).start()
 
+    def _delayed_catch_up():
         time.sleep(60)
         logger.info("⏰ 起動後60秒経過 → キャッチアップ実行（会話中ならタスクは個別スキップ）")
         catch_up_all_tasks()
