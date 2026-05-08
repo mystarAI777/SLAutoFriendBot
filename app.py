@@ -1708,7 +1708,7 @@ def _is_hiragana_only(text: str) -> bool:
     return True
 
 
-def initialize_pronunciation_from_lingo()
+def initialize_pronunciation_from_lingo():
     pronunciation_manager.load_from_db()
     """
     起動時に1回だけ実行される初期化処理。
