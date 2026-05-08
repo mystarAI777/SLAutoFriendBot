@@ -987,7 +987,7 @@ class HolomemPronunciation(Base):
     TTS音声生成時に漢字メンバー名をひらがなに置換するために使う。
     SLチャット表示テキストには影響しない（漢字のまま）。
 
-    例: kanji='響咲リオナ' / hiragana='いさき りおな'
+    例: kanji='響咲リオナ' / hiragana='ひびきさきりおな'
     """
     __tablename__ = 'holomem_pronunciations'
     id = Column(Integer, primary_key=True)
@@ -1708,7 +1708,8 @@ def _is_hiragana_only(text: str) -> bool:
     return True
 
 
-def initialize_pronunciation_from_lingo():
+def initialize_pronunciation_from_lingo()
+    pronunciation_manager.load_from_db():
     """
     起動時に1回だけ実行される初期化処理。
     holomem_lingo の aliases から「漢字メンバー名と長さが近いひらがな」を
@@ -2485,10 +2486,12 @@ def fetch_hololive_news():
                 
                 if title and link:
                     if not session.query(HololiveNews).filter_by(url=link).first():
+                        _hn_hash = hashlib.md5(link.encode()).hexdigest()
                         session.add(HololiveNews(
                             title=title,
                             content=title,
                             url=link,
+                            news_hash=_hn_hash,
                             created_at=datetime.utcnow()
                         ))
         logger.info("✅ ニュースDB更新完了")
