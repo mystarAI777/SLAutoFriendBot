@@ -2316,7 +2316,7 @@ def process_daily_streams():
                         feeling = HolomemFeeling(member_name=detected_member)
                         session.add(feeling)
                     
-                    feeling.total_watch_count += 1
+                    feeling.total_watch_count = (feeling.total_watch_count or 0) + 1
                     feeling.last_watched = datetime.utcnow()
                     feeling.last_emotion = mochiko_reaction['emotion_tags'].split(',')[0] if mochiko_reaction['emotion_tags'] else None
                     
@@ -2331,7 +2331,21 @@ def process_daily_streams():
                 time.sleep(8)
                 
             except Exception as e:
-                logger.error(f"配信処理エラー: {e}")
+                error_str = str(e)
+                if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+                    gemini_model_manager.mark_limited(60)
+                logger.warning(f"感想生成Geminiエラー: {e}")
+                if groq_client:
+                    try:
+                        groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
+                        if groq_result:
+                            return {
+                                'feeling': groq_result[:300],
+                                'emotion_tags': ','.join(emotion_tags),
+                                'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                            }
+                    except Exception as ge:
+                        logger.warning(f"感想生成Groqエラー: {ge}")
     
     logger.info(f"✅ 日次配信処理完了 ({processed_count}件処理)")
     cleanup_old_stream_reactions()
@@ -2465,38 +2479,7 @@ def update_holomem_database():
 # ==============================================================================
 # ホロライブニュース収集
 # ==============================================================================
-def fetch_hololive_news():
-    logger.info("📰 ニュースDB更新開始...")
-    url = "https://hololive.hololivepro.com/news"
-    try:
-        res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
-        if res.status_code != 200: return
-        soup = BeautifulSoup(res.content, 'html.parser')
-        
-        articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
-        
-        with get_db_session() as session:
-            for art in articles[:10]:
-                a_tag = art.find('a')
-                if not a_tag: continue
-                
-                link = a_tag.get('href')
-                title_elem = art.find(['h3', 'p', 'dt'])
-                title = clean_text(title_elem.text) if title_elem else clean_text(a_tag.text)
-                
-                if title and link:
-                    if not session.query(HololiveNews).filter_by(url=link).first():
-                        _hn_hash = hashlib.md5(link.encode()).hexdigest()
-                        session.add(HololiveNews(
-                            title=title,
-                            content=title,
-                            url=link,
-                            news_hash=_hn_hash,
-                            created_at=datetime.utcnow()
-                        ))
-        logger.info("✅ ニュースDB更新完了")
-    except Exception as e:
-        logger.error(f"News fetch failed: {e}")
+fetch_hololive_news
 
 def _fetch_tsuushin_list_with_scrapling(url: str) -> Optional[List[Dict]]:
     """
@@ -7602,7 +7585,16 @@ def initialize_app():
     # run_managed_task が会話中ならスキップしてくれる
     # ただし起動直後は会話前提でスキップが発動しないので、念のため60秒だけ遅延
     
-    def _delayed_catch_up():
+def _force_fetch_news():
+        time.sleep(30)
+        logger.info("🔔 起動時強制ニュース取得開始")
+        try:
+            wrapped_news_fetch()
+            record_task_run('fetch_news', success=True)
+        except Exception as e:
+            logger.error(f"強制ニュース取得エラー: {e}")
+    threading.Thread(target=_force_fetch_news, daemon=True).start()
+
         time.sleep(60)
         logger.info("⏰ 起動後60秒経過 → キャッチアップ実行（会話中ならタスクは個別スキップ）")
         catch_up_all_tasks()
