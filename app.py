@@ -1,5 +1,17 @@
 # ==============================================================================
-# もちこAI - v33.8.0 + pgvector RAGシステム + Gemini 2.5モデル更新
+# 最善版: fetch_hololive_news() + fetch_specialized_news() 統合改善案
+#
+# 【根拠】
+# - v35.2 (app_v35_2_11_22) : scrape_major_search_engines() が存在＆動いていた
+# - v33.1 (app_12_5起動)    : hololive.hololivepro.com 直接スクレイピングが動いていた
+# - 現在の最新版            : Google News RSS のみ → Render でブロックされ全滅
+#
+# 【両バージョンの良いとこ取り】
+# ソース1: hololive.hololivepro.com 直接スクレイピング    (v33.1 実績あり)
+# ソース2: scrape_major_search_engines() 再利用           (v35.2 実績あり)
+#          └ Yahoo → Bing → DuckDuckGo の順にフォールバック
+# ソース3: Reddit r/Hololive JSON API                     (新規追加・API不要)
+# ==============================================================================
 #
 # 手動パッチガイド v2 - ニックネーム・応答崩壊・古タスク修正
 # 
@@ -2487,61 +2499,273 @@ def update_holomem_database():
     logger.info("✅ ホロメンDB更新完了")
 
 # ==============================================================================
-# ホロライブニュース収集
+# ホロライブニュース取得（3ソース + フォールバック）
 # ==============================================================================
-def fetch_hololive_news():
-    logger.info("📰 ニュースDB更新開始...")
-    queries = ["ホロライブ", "hololive VTuber", "ホロライブ 配信"]
-    added = 0
-    with get_db_session() as session:
-        for query in queries:
-            try:
-                results = fetch_google_news_rss(query)
-                for r in results:
-                    title = r.get('title', '')
-                    if not title:
-                        continue
-                    news_hash = hashlib.md5(title.encode()).hexdigest()
-                    if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                        continue
-                    session.add(HololiveNews(
-                        title=title,
-                        content=title,
-                        url='',
-                        news_hash=news_hash,
-                        created_at=datetime.utcnow()
-                    ))
-                    added += 1
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"ニュース取得エラー ({query}): {e}")
-    logger.info(f"✅ ニュースDB更新完了: {added}件追加")
-    
-def _fetch_tsuushin_list_with_scrapling(url: str) -> Optional[List[Dict]]:
-    """
-    v33.18: Scrapling で hololive-tsuushin の一覧ページから記事リンクを取得。
-    失敗時は None を返し、呼び出し側が requests 版にフォールバックする。
-    """
-    if not HAS_SCRAPLING or _ScraplingFetcher is None:
-        return None
-    try:
-        page = _ScraplingFetcher.get(url, impersonate='chrome', timeout=15, stealthy_headers=True)
-        if page.status != 200:
-            logger.debug(f"Scrapling tsuushin list: HTTP {page.status}")
-            return None
-        article_links = []
-        for a_tag in page.css('a[href*="/holonews/"]'):
-            href = a_tag.attrib.get('href', '')
-            if not href or href == url or 'category' in href:
-                continue
-            title_text = clean_text(a_tag.text)
-            if title_text and len(title_text) > 5:
-                article_links.append({'url': href, 'title': title_text})
-        return article_links
-    except Exception as e:
-        logger.debug(f"Scrapling tsuushin list 失敗: {e}")
-        return None
 
+def fetch_hololive_news():
+    """ホロライブニュースを複数ソースから取得してDBに保存"""
+    logger.info("📰 ニュースDB更新開始...")
+    added = 0
+
+    with get_db_session() as session:
+
+        # ============================================================
+        # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
+        # v33.1 で実績あり。Google News より安定している
+        # ============================================================
+        try:
+            url = "https://hololive.hololivepro.com/news"
+            res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content, 'html.parser')
+                articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
+                logger.info(f"  [公式] {len(articles)}件の記事要素を検出")
+
+                for art in articles[:15]:
+                    a_tag = art.find('a')
+                    if not a_tag:
+                        continue
+                    link = a_tag.get('href', '')
+                    if link.startswith('/'):
+                        link = 'https://hololive.hololivepro.com' + link
+                    title_elem = art.find(['h3', 'p', 'dt'])
+                    title = (title_elem.text if title_elem else a_tag.text).strip()
+                    title = ' '.join(title.split())
+
+                    if title and len(title) > 5 and link:
+                        news_hash = hashlib.md5(link.encode()).hexdigest()
+                        if not session.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                            session.add(HololiveNews(
+                                title=title, content=title, url=link,
+                                news_hash=news_hash, created_at=datetime.utcnow()
+                            ))
+                            added += 1
+                logger.info(f"  ✅ 公式サイト: {added}件追加")
+            else:
+                logger.warning(f"  ⚠️ 公式サイト HTTP {res.status_code}")
+
+        except Exception as e:
+            logger.warning(f"  ❌ 公式サイト失敗: {str(e)[:60]}")
+
+        # ============================================================
+        # ソース2: 検索エンジン（v35.2 の scrape_major_search_engines を再利用）
+        # 公式サイトで3件未満の場合にフォールバック
+        # Yahoo → Bing → DuckDuckGo の順に試行
+        # ============================================================
+        if added < 3:
+            logger.info(f"  📡 公式が {added}件 < 3件 → 検索エンジンにフォールバック")
+            queries = ["ホロライブ 最新情報", "hololive VTuber 配信"]
+
+            for query in queries:
+                try:
+                    results = scrape_major_search_engines(query, num=5)
+                    logger.info(f"  [検索] '{query}': {len(results)}件取得")
+
+                    for r in results:
+                        title = r.get('title', '').strip()
+                        if not title or len(title) < 5:
+                            continue
+                        news_hash = hashlib.md5(title.encode()).hexdigest()
+                        if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                            continue
+                        session.add(HololiveNews(
+                            title=title,
+                            content=r.get('snippet', title)[:500],
+                            url=r.get('url', ''),
+                            news_hash=news_hash,
+                            created_at=datetime.utcnow()
+                        ))
+                        added += 1
+
+                    time.sleep(1)
+
+                except Exception as e:
+                    logger.warning(f"  ❌ 検索失敗 ({query}): {str(e)[:60]}")
+
+        # ============================================================
+        # ソース3: Reddit r/Hololive JSON API（最終手段）
+        # API キー不要。スクレイピングでなく公式JSONを使用
+        # ============================================================
+        if added < 3:
+            logger.info(f"  📡 まだ {added}件 < 3件 → Reddit APIにフォールバック")
+            try:
+                res = requests.get(
+                    "https://www.reddit.com/r/Hololive/hot.json",
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    timeout=15
+                )
+                if res.status_code == 200:
+                    posts = res.json().get('data', {}).get('children', [])
+                    for post in posts[:10]:
+                        pd = post.get('data', {})
+                        title = pd.get('title', '').strip()
+                        url = pd.get('url', '')
+                        if not title or len(title) < 5:
+                            continue
+                        news_hash = hashlib.md5(url.encode()).hexdigest()
+                        if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                            continue
+                        session.add(HololiveNews(
+                            title=title, content=title, url=url,
+                            news_hash=news_hash, created_at=datetime.utcnow()
+                        ))
+                        added += 1
+                    logger.info(f"  ✅ Reddit: {added}件（累計）")
+                else:
+                    logger.warning(f"  ⚠️ Reddit HTTP {res.status_code}")
+            except Exception as e:
+                logger.warning(f"  ❌ Reddit失敗: {str(e)[:60]}")
+
+    logger.info(f"✅ ニュースDB更新完了: {added}件追加")
+# ==============================================================================
+# SpecializedNews 取得（v35.2 のモデルを活用）
+# ホロライブ通信 + アニメDB など "専門サイト" 枠
+# ==============================================================================
+
+def fetch_specialized_news():
+    """専門サイトからニュースを取得してSpecializedNewsテーブルに保存"""
+    logger.info("📰 専門ニュース更新開始...")
+    added = 0
+
+    with get_db_session() as session:
+
+        # ============================================================
+        # ホロライブ通信（WordPress系。セレクタ複数試行）
+        # ============================================================
+        try:
+            url = "https://hololive-tsuushin.com/category/holonews/"
+            res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content, 'html.parser')
+                articles = (
+                    soup.select('.post-item') or
+                    soup.select('article.post') or
+                    soup.select('.entry-item') or
+                    soup.select('article')
+                )
+                logger.info(f"  [通信] {len(articles)}件の記事要素を検出")
+
+                for art in articles[:15]:
+                    title_elem = (
+                        art.select_one('h2') or art.select_one('h3') or
+                        art.select_one('.entry-title')
+                    )
+                    link_elem = art.find('a')
+                    title = title_elem.text.strip() if title_elem else ''
+                    title = ' '.join(title.split())
+                    link = link_elem.get('href', '') if link_elem else ''
+
+                    if title and len(title) > 5 and link:
+                        news_hash = hashlib.md5(link.encode()).hexdigest()
+                        if not session.query(SpecializedNews).filter_by(news_hash=news_hash).first():
+                            session.add(SpecializedNews(
+                                site_name='hololive_tsuushin',
+                                title=title, content=title, url=link,
+                                news_hash=news_hash, created_at=datetime.utcnow(),
+                                published_date=datetime.utcnow()
+                            ))
+                            added += 1
+                logger.info(f"  ✅ ホロライブ通信: {added}件追加")
+            else:
+                logger.warning(f"  ⚠️ ホロライブ通信 HTTP {res.status_code}")
+
+        except Exception as e:
+            logger.warning(f"  ❌ ホロライブ通信失敗: {str(e)[:60]}")
+
+    logger.info(f"✅ 専門ニュース更新完了: {added}件追加")
+
+
+# ==============================================================================
+# wrapped_news_fetch() ← TASK_SCHEDULE から呼ばれる統合エントリーポイント
+# ==============================================================================
+
+def wrapped_news_fetch():
+    """ニュース収集タスク (run_managed_task から呼ばれる)"""
+    try:
+        fetch_hololive_news()
+    except Exception as e:
+        logger.error(f"❌ fetch_hololive_news 失敗: {e}")
+
+    try:
+        fetch_specialized_news()
+    except Exception as e:
+        logger.error(f"❌ fetch_specialized_news 失敗: {e}")
+# ==============================================================================
+# SpecializedNews 取得（v35.2 のモデルを活用）
+# ホロライブ通信 + アニメDB など "専門サイト" 枠
+# ==============================================================================
+
+def fetch_specialized_news():
+    """専門サイトからニュースを取得してSpecializedNewsテーブルに保存"""
+    logger.info("📰 専門ニュース更新開始...")
+    added = 0
+
+    with get_db_session() as session:
+
+        # ============================================================
+        # ホロライブ通信（WordPress系。セレクタ複数試行）
+        # ============================================================
+        try:
+            url = "https://hololive-tsuushin.com/category/holonews/"
+            res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content, 'html.parser')
+                articles = (
+                    soup.select('.post-item') or
+                    soup.select('article.post') or
+                    soup.select('.entry-item') or
+                    soup.select('article')
+                )
+                logger.info(f"  [通信] {len(articles)}件の記事要素を検出")
+
+                for art in articles[:15]:
+                    title_elem = (
+                        art.select_one('h2') or art.select_one('h3') or
+                        art.select_one('.entry-title')
+                    )
+                    link_elem = art.find('a')
+                    title = title_elem.text.strip() if title_elem else ''
+                    title = ' '.join(title.split())
+                    link = link_elem.get('href', '') if link_elem else ''
+
+                    if title and len(title) > 5 and link:
+                        news_hash = hashlib.md5(link.encode()).hexdigest()
+                        if not session.query(SpecializedNews).filter_by(news_hash=news_hash).first():
+                            session.add(SpecializedNews(
+                                site_name='hololive_tsuushin',
+                                title=title, content=title, url=link,
+                                news_hash=news_hash, created_at=datetime.utcnow(),
+                                published_date=datetime.utcnow()
+                            ))
+                            added += 1
+                logger.info(f"  ✅ ホロライブ通信: {added}件追加")
+            else:
+                logger.warning(f"  ⚠️ ホロライブ通信 HTTP {res.status_code}")
+
+        except Exception as e:
+            logger.warning(f"  ❌ ホロライブ通信失敗: {str(e)[:60]}")
+
+    logger.info(f"✅ 専門ニュース更新完了: {added}件追加")
+
+
+# ==============================================================================
+# wrapped_news_fetch() ← TASK_SCHEDULE から呼ばれる統合エントリーポイント
+# ==============================================================================
+
+def wrapped_news_fetch():
+    """ニュース収集タスク (run_managed_task から呼ばれる)"""
+    try:
+        fetch_hololive_news()
+    except Exception as e:
+        logger.error(f"❌ fetch_hololive_news 失敗: {e}")
+
+    try:
+        fetch_specialized_news()
+    except Exception as e:
+        logger.error(f"❌ fetch_specialized_news 失敗: {e}")
 
 def fetch_hololive_tsuushin_news():
     """
