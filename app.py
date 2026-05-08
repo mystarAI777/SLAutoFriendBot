@@ -2102,8 +2102,8 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
                     'emotion_tags': ','.join(emotion_tags),
                     'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
                 }
-    except Exception as e:
-   error_str = str(e)
+except Exception as e:
+        error_str = str(e)
         if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
             gemini_model_manager.mark_limited(60)
         logger.warning(f"感想生成Geminiエラー: {e}")
@@ -2344,9 +2344,7 @@ def process_daily_streams():
                 # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
                 time.sleep(8)
                 
-            except Exception as e:
-                error_str = str(e)
-               except Exception as e:
+except Exception as e:
                 logger.error(f"配信処理エラー: {e}")
                     try:
                         groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
