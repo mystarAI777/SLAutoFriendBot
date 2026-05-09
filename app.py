@@ -3071,7 +3071,7 @@ def fetch_holomem_episodes():
         try:
             # URLエンコード（seesaawikiはEUC-JPベースだが%エンコーディングで渡せる）
             import urllib.parse
-            page_url = base_url + urllib.parse.quote(member_name, encoding='utf-8')
+            page_url = base_url + urllib.parse.quote(member_name, encoding='euc-jp')
 
             time.sleep(1.5)
 
