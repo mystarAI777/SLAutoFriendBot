@@ -2528,6 +2528,7 @@ def fetch_hololive_news():
                     logger.warning("  🔧 シーケンスズレ検出 → 自動修復")
                     try:
                         fix_postgres_sequences(quiet=True)
+                        time.sleep(2)
                     except Exception:
                         pass
                 else:
@@ -2765,6 +2766,12 @@ def fetch_specialized_news():
 
 def wrapped_news_fetch():
     """ニュース収集タスク (run_managed_task から呼ばれる)"""
+    # ★ 毎回シーケンスを修復してからニュース取得（NULL identity key対策）
+    try:
+        fix_postgres_sequences(quiet=True)
+    except Exception as e:
+        logger.warning(f"⚠️ wrapped_news_fetch: シーケンス修復失敗: {e}")
+
     try:
         fetch_hololive_news()
     except Exception as e:
