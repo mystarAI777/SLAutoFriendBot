@@ -2511,7 +2511,7 @@ def fetch_hololive_news():
     logger.info("📰 ニュースDB更新開始...")
     added = 0
 
-def _save_news(title, content, url, news_hash):
+    def _save_news(title, content, url, news_hash):
         """1件のニュースを独立セッションで保存する"""
         for attempt in range(2):
             try:
@@ -2533,7 +2533,7 @@ def _save_news(title, content, url, news_hash):
                 else:
                     logger.warning(f"  ❌ _save_news失敗: {err[:60]}")
                     break
-return False
+        return False
 
     # ============================================================
     # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
@@ -2774,6 +2774,28 @@ def wrapped_news_fetch():
         fetch_specialized_news()
     except Exception as e:
         logger.error(f"❌ fetch_specialized_news 失敗: {e}")
+
+def _fetch_tsuushin_list_with_scrapling(url: str):
+    """Scrapling でホロライブ通信の記事リストを取得する。失敗時は None を返す"""
+    if not HAS_SCRAPLING or _ScraplingFetcher is None:
+        return None
+    try:
+        page = _ScraplingFetcher.get(url, impersonate='chrome', timeout=15, stealthy_headers=True)
+        if page.status != 200:
+            return None
+        results = []
+        for a_tag in page.css('a[href*="/holonews/"]'):
+            href = a_tag.attrib.get('href', '')
+            if not href or 'category' in href:
+                continue
+            title_text = clean_text(a_tag.text)
+            if title_text and len(title_text) > 5:
+                results.append({'url': href, 'title': title_text})
+        return results if results else None
+    except Exception as e:
+        logger.debug(f"_fetch_tsuushin_list_with_scrapling 失敗: {e}")
+        return None
+
 
 def fetch_hololive_tsuushin_news():
     """
