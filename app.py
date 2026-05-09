@@ -2511,18 +2511,28 @@ def fetch_hololive_news():
     logger.info("📰 ニュースDB更新開始...")
     added = 0
 
-    def _save_news(title, content, url, news_hash):
+def _save_news(title, content, url, news_hash):
         """1件のニュースを独立セッションで保存する"""
-        try:
-            with get_db_session() as s:
-                if not s.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                    s.add(HololiveNews(
-                        title=title, content=content, url=url,
-                        news_hash=news_hash, created_at=datetime.utcnow()
-                    ))
+        for attempt in range(2):
+            try:
+                with get_db_session() as s:
+                    if not s.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                        s.add(HololiveNews(
+                            title=title, content=content, url=url,
+                            news_hash=news_hash, created_at=datetime.utcnow()
+                        ))
                     return True
-        except Exception as e:
-            logger.warning(f"  ❌ _save_news失敗: {str(e)[:60]}")
+            except Exception as e:
+                err = str(e)
+                if 'NULL identity key' in err and attempt == 0:
+                    logger.warning("  🔧 シーケンスズレ検出 → 自動修復")
+                    try:
+                        fix_postgres_sequences(quiet=True)
+                    except Exception:
+                        pass
+                else:
+                    logger.warning(f"  ❌ _save_news失敗: {err[:60]}")
+                    break
         return False
 
     # ============================================================
