@@ -2882,8 +2882,7 @@ def fetch_hololive_tsuushin_news():
                         content = content[:600]
                     else:
                         content = title
-
-		    news_hash = hashlib.md5(link.encode()).hexdigest()
+                    news_hash = hashlib.md5(link.encode()).hexdigest()
                     with engine.connect() as _conn:
                         with _conn.begin():
                             _conn.execute(text(
