@@ -2128,7 +2128,7 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
                             'emotion_tags': ','.join(emotion_tags),
                             'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
                         }
-            except Exception as ge:
+                except Exception as ge:
                 logger.warning(f"感想生成Groqエラー: {ge}")
     
     # フォールバック: 詳細テンプレート
