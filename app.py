@@ -2212,18 +2212,32 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
                 prompt, 
                 generation_config={"temperature": 0.8, "max_output_tokens": 500}
             )
-            if hasattr(response, 'candidates') and response.candidates:
-                summary = response.candidates[0].content.parts[0].text.strip()
-                memorable = []
-                for r in reactions[:5]:
-                    if any(tag in (r.emotion_tags or '') for tag in ['興奮', '感動']):
-                        memorable.append(r.stream_title[:60])
+if hasattr(response, 'candidates') and response.candidates:
+                feeling = response.candidates[0].content.parts[0].text.strip()
                 return {
-                    'summary': summary[:400],
-                    'memorable': '、'.join(memorable)[:500]
+                    'feeling': feeling[:300],
+                    'emotion_tags': ','.join(emotion_tags),
+                    'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
                 }
     except Exception as e:
-        logger.error(f"要約生成エラー: {e}")
+        error_str = str(e)
+        if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+            gemini_model_manager.mark_limited(60)
+        logger.warning(f"感想生成Geminiエラー: {e}")
+        
+    if groq_client:
+        try:
+            groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
+            if groq_result:
+                return {
+                    'feeling': groq_result[:300],
+                    'emotion_tags': ','.join(emotion_tags),
+                    'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                }
+        except Exception as ge:
+            logger.warning(f"感想生成Groqエラー: {ge}")
+    
+    # フォールバック: 詳細テンプレート
     
     return None
 
@@ -2353,21 +2367,11 @@ def process_daily_streams():
                     
                     logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
                 
-                # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
+# ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
                 time.sleep(8)
                 
-except Exception as e:
+            except Exception as e:
                 logger.error(f"配信処理エラー: {e}")
-                    try:
-                        groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
-                        if groq_result:
-                            return {
-                                'feeling': groq_result[:300],
-                                'emotion_tags': ','.join(emotion_tags),
-                                'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
-                            }
-                    except Exception as ge:
-                        logger.warning(f"感想生成Groqエラー: {ge}")
     
     logger.info(f"✅ 日次配信処理完了 ({processed_count}件処理)")
     cleanup_old_stream_reactions()
@@ -7730,7 +7734,20 @@ def fix_postgres_sequences(quiet: bool = False):
     if not quiet:
         logger.info(f"🔧 シーケンス修正: {fixed}件成功 / {failed}件失敗")
 
+def needs_run(task_name: str, interval_hours: float) -> bool:
+    """
+    前回の実行から interval_hours 以上経過していれば True を返す。
+    DBに記録がなければ（初回 or スリープで記録消失）必ず True。
+    """
+    last = get_task_last_run(task_name)
+    if last is None:
+        return True
+    return (datetime.utcnow() - last) >= timedelta(hours=interval_hours)
 
+def is_allowed_time_for_task(task_name: str) -> Tuple[bool, Optional[str]]:
+    """時間帯チェックのスタブ関数（現状は常に許可）"""
+    return True, None
+    
 def setup_stream_processing_schedule():
     """
     配信処理は TASK_SCHEDULE で管理するため、この関数は
@@ -7845,7 +7862,11 @@ def initialize_app():
     # run_managed_task が会話中ならスキップしてくれる
     # ただし起動直後は会話前提でスキップが発動しないので、念のため60秒だけ遅延
     
-def _force_fetch_news():
+# ★ v33.13: 会話アクティビティ追跡があるので、起動時の遅延は不要
+    # run_managed_task が会話中ならスキップしてくれる
+    # ただし起動直後は会話前提でスキップが発動しないので、念のため60秒だけ遅延
+    
+    def _force_fetch_news():
         time.sleep(30)
         logger.info("🔔 起動時強制ニュース取得開始")
         try:
@@ -7853,6 +7874,7 @@ def _force_fetch_news():
             record_task_run('fetch_news', success=True)
         except Exception as e:
             logger.error(f"強制ニュース取得エラー: {e}")
+    
     threading.Thread(target=_force_fetch_news, daemon=True).start()
 
     def _delayed_catch_up():
