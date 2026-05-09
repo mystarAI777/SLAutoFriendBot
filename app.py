@@ -2511,115 +2511,110 @@ def fetch_hololive_news():
     logger.info("📰 ニュースDB更新開始...")
     added = 0
 
-    with get_db_session() as session:
-
-        # ============================================================
-        # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
-        # v33.1 で実績あり。Google News より安定している
-        # ============================================================
+    def _save_news(title, content, url, news_hash):
+        """1件のニュースを独立セッションで保存する"""
         try:
-            url = "https://hololive.hololivepro.com/news"
-            res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
-
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.content, 'html.parser')
-                articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
-                logger.info(f"  [公式] {len(articles)}件の記事要素を検出")
-
-                for art in articles[:15]:
-                    a_tag = art.find('a')
-                    if not a_tag:
-                        continue
-                    link = a_tag.get('href', '')
-                    if link.startswith('/'):
-                        link = 'https://hololive.hololivepro.com' + link
-                    title_elem = art.find(['h3', 'p', 'dt'])
-                    title = (title_elem.text if title_elem else a_tag.text).strip()
-                    title = ' '.join(title.split())
-
-                    if title and len(title) > 5 and link:
-                        news_hash = hashlib.md5(link.encode()).hexdigest()
-                        if not session.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                            session.add(HololiveNews(
-                                title=title, content=title, url=link,
-                                news_hash=news_hash, created_at=datetime.utcnow()
-                            ))
-                            added += 1
-                logger.info(f"  ✅ 公式サイト: {added}件追加")
-            else:
-                logger.warning(f"  ⚠️ 公式サイト HTTP {res.status_code}")
-
+            with get_db_session() as s:
+                if not s.query(HololiveNews).filter_by(news_hash=news_hash).first():
+                    s.add(HololiveNews(
+                        title=title, content=content, url=url,
+                        news_hash=news_hash, created_at=datetime.utcnow()
+                    ))
+                    return True
         except Exception as e:
-            logger.warning(f"  ❌ 公式サイト失敗: {str(e)[:60]}")
+            logger.warning(f"  ❌ _save_news失敗: {str(e)[:60]}")
+        return False
 
-        # ============================================================
-        # ソース2: 検索エンジン（v35.2 の scrape_major_search_engines を再利用）
-        # 公式サイトで3件未満の場合にフォールバック
-        # Yahoo → Bing → DuckDuckGo の順に試行
-        # ============================================================
-        if added < 3:
-            logger.info(f"  📡 公式が {added}件 < 3件 → 検索エンジンにフォールバック")
-            queries = ["ホロライブ 最新情報", "hololive VTuber 配信"]
+    # ============================================================
+    # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
+    # v33.1 で実績あり。Google News より安定している
+    # ============================================================
+    try:
+        url = "https://hololive.hololivepro.com/news"
+        res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
 
-            for query in queries:
-                try:
-                    results = scrape_major_search_engines(query, num=5)
-                    logger.info(f"  [検索] '{query}': {len(results)}件取得")
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content, 'html.parser')
+            articles = soup.select('ul.news_list > li') or soup.select('.news_list_item')
+            logger.info(f"  [公式] {len(articles)}件の記事要素を検出")
 
-                    for r in results:
-                        title = r.get('title', '').strip()
-                        if not title or len(title) < 5:
-                            continue
-                        news_hash = hashlib.md5(title.encode()).hexdigest()
-                        if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                            continue
-                        session.add(HololiveNews(
-                            title=title,
-                            content=r.get('snippet', title)[:500],
-                            url=r.get('url', ''),
-                            news_hash=news_hash,
-                            created_at=datetime.utcnow()
-                        ))
+            for art in articles[:15]:
+                a_tag = art.find('a')
+                if not a_tag:
+                    continue
+                link = a_tag.get('href', '')
+                if link.startswith('/'):
+                    link = 'https://hololive.hololivepro.com' + link
+                title_elem = art.find(['h3', 'p', 'dt'])
+                title = (title_elem.text if title_elem else a_tag.text).strip()
+                title = ' '.join(title.split())
+
+                if title and len(title) > 5 and link:
+                    news_hash = hashlib.md5(link.encode()).hexdigest()
+                    if _save_news(title, title, link, news_hash):
                         added += 1
+            logger.info(f"  ✅ 公式サイト: {added}件追加")
+        else:
+            logger.warning(f"  ⚠️ 公式サイト HTTP {res.status_code}")
 
-                    time.sleep(1)
+    except Exception as e:
+        logger.warning(f"  ❌ 公式サイト失敗: {str(e)[:60]}")
 
-                except Exception as e:
-                    logger.warning(f"  ❌ 検索失敗 ({query}): {str(e)[:60]}")
+    # ============================================================
+    # ソース2: 検索エンジン（v35.2 の scrape_major_search_engines を再利用）
+    # 公式サイトで3件未満の場合にフォールバック
+    # Yahoo → Bing → DuckDuckGo の順に試行
+    # ============================================================
+    if added < 3:
+        logger.info(f"  📡 公式が {added}件 < 3件 → 検索エンジンにフォールバック")
+        queries = ["ホロライブ 最新情報", "hololive VTuber 配信"]
 
-        # ============================================================
-        # ソース3: Reddit r/Hololive JSON API（最終手段）
-        # API キー不要。スクレイピングでなく公式JSONを使用
-        # ============================================================
-        if added < 3:
-            logger.info(f"  📡 まだ {added}件 < 3件 → Reddit APIにフォールバック")
+        for query in queries:
             try:
-                res = requests.get(
-                    "https://www.reddit.com/r/Hololive/hot.json",
-                    headers={'User-Agent': 'Mozilla/5.0'},
-                    timeout=15
-                )
-                if res.status_code == 200:
-                    posts = res.json().get('data', {}).get('children', [])
-                    for post in posts[:10]:
-                        pd = post.get('data', {})
-                        title = pd.get('title', '').strip()
-                        url = pd.get('url', '')
-                        if not title or len(title) < 5:
-                            continue
-                        news_hash = hashlib.md5(url.encode()).hexdigest()
-                        if session.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                            continue
-                        session.add(HololiveNews(
-                            title=title, content=title, url=url,
-                            news_hash=news_hash, created_at=datetime.utcnow()
-                        ))
+                results = scrape_major_search_engines(query, num=5)
+                logger.info(f"  [検索] '{query}': {len(results)}件取得")
+
+                for r in results:
+                    title = r.get('title', '').strip()
+                    if not title or len(title) < 5:
+                        continue
+                    news_hash = hashlib.md5(title.encode()).hexdigest()
+                    if _save_news(title, r.get('snippet', title)[:500], r.get('url', ''), news_hash):
                         added += 1
-                    logger.info(f"  ✅ Reddit: {added}件（累計）")
-                else:
-                    logger.warning(f"  ⚠️ Reddit HTTP {res.status_code}")
+
+                time.sleep(1)
+
             except Exception as e:
-                logger.warning(f"  ❌ Reddit失敗: {str(e)[:60]}")
+                logger.warning(f"  ❌ 検索失敗 ({query}): {str(e)[:60]}")
+
+    # ============================================================
+    # ソース3: Reddit r/Hololive JSON API（最終手段）
+    # API キー不要。スクレイピングでなく公式JSONを使用
+    # ============================================================
+    if added < 3:
+        logger.info(f"  📡 まだ {added}件 < 3件 → Reddit APIにフォールバック")
+        try:
+            res = requests.get(
+                "https://www.reddit.com/r/Hololive/hot.json",
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=15
+            )
+            if res.status_code == 200:
+                posts = res.json().get('data', {}).get('children', [])
+                for post in posts[:10]:
+                    pd = post.get('data', {})
+                    title = pd.get('title', '').strip()
+                    url = pd.get('url', '')
+                    if not title or len(title) < 5:
+                        continue
+                    news_hash = hashlib.md5(url.encode()).hexdigest()
+                    if _save_news(title, title, url, news_hash):
+                        added += 1
+                logger.info(f"  ✅ Reddit: {added}件（累計）")
+            else:
+                logger.warning(f"  ⚠️ Reddit HTTP {res.status_code}")
+        except Exception as e:
+            logger.warning(f"  ❌ Reddit失敗: {str(e)[:60]}")
 
     logger.info(f"✅ ニュースDB更新完了: {added}件追加")
 # ==============================================================================
