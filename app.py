@@ -7770,6 +7770,49 @@ def fix_postgres_sequences(quiet: bool = False):
     if not quiet:
         logger.info(f"🔧 シーケンス修正: {fixed}件成功 / {failed}件失敗")
 
+def fix_hololive_news_constraints():
+    """hololive_newsテーブルのUNIQUE制約を実テーブルに追加する。"""
+    if 'sqlite' in str(DATABASE_URL):
+        return
+
+    # Step 1: news_hash が NULL の古い行を削除
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                result = conn.execute(text(
+                    "DELETE FROM hololive_news WHERE news_hash IS NULL"
+                ))
+                deleted = result.rowcount
+                if deleted > 0:
+                    logger.info(f"\U0001f5d1\ufe0f hololive_news: news_hash NULL行を{deleted}件削除")
+    except Exception as e:
+        logger.warning(f"\u26a0\ufe0f NULL行削除スキップ: {e}")
+
+    # Step 2: news_hash UNIQUE INDEX
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uix_hololive_news_news_hash "
+                    "ON hololive_news (news_hash)"
+                ))
+        logger.info("\u2705 hololive_news.news_hash UNIQUEインデックス OK")
+    except Exception as e:
+        logger.warning(f"\u26a0\ufe0f news_hash インデックス作成スキップ: {e}")
+
+    # Step 3: url UNIQUE INDEX
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uix_hololive_news_url "
+                    "ON hololive_news (url)"
+                ))
+        logger.info("\u2705 hololive_news.url UNIQUEインデックス OK")
+    except Exception as e:
+        logger.warning(f"\u26a0\ufe0f url インデックス作成スキップ: {e}")
+
+
 def needs_run(task_name: str, interval_hours: float) -> bool:
     """
     前回の実行から interval_hours 以上経過していれば True を返す。
@@ -7820,6 +7863,7 @@ def initialize_app():
         
         check_and_migrate_db()
         fix_postgres_sequences()
+        fix_hololive_news_constraints()
         
         Session = sessionmaker(bind=engine)
         
