@@ -2114,20 +2114,20 @@ def generate_mochiko_reaction(member_name: str, stream_title: str, reactions: Di
                     'emotion_tags': ','.join(emotion_tags),
                     'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
                 }
-except Exception as e:
-        error_str = str(e)
-        if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
-            gemini_model_manager.mark_limited(60)
-        logger.warning(f"感想生成Geminiエラー: {e}")
-        if groq_client:
-            try:
-                groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
-                if groq_result:
-                    return {
-                        'feeling': groq_result[:300],
-                        'emotion_tags': ','.join(emotion_tags),
-                        'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
-                    }
+    except Exception as e:
+            error_str = str(e)
+            if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+                gemini_model_manager.mark_limited(60)
+            logger.warning(f"感想生成Geminiエラー: {e}")
+            if groq_client:
+                try:
+                    groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
+                    if groq_result:
+                        return {
+                            'feeling': groq_result[:300],
+                            'emotion_tags': ','.join(emotion_tags),
+                            'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                        }
             except Exception as ge:
                 logger.warning(f"感想生成Groqエラー: {ge}")
     
@@ -4145,6 +4145,9 @@ def needs_run(task_name: str, interval_hours: float) -> bool:
     if last is None:
         return True
     return (datetime.utcnow() - last) >= timedelta(hours=interval_hours)
+
+def is_allowed_time_for_task(task_name: str):
+    return True, None
 
 
 def catch_up_task(task_name: str, wrapped_func, interval_hours: float = 1):
