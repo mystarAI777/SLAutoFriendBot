@@ -2883,15 +2883,20 @@ def fetch_hololive_tsuushin_news():
                     else:
                         content = title
 
-                    news_hash = hashlib.md5(link.encode()).hexdigest()
-
-                    session.add(HololiveNews(
-                        title=title,
-                        content=content,
-                        url=link,
-                        news_hash=news_hash,
-                        created_at=datetime.utcnow()
-                    ))
+		    news_hash = hashlib.md5(link.encode()).hexdigest()
+                    with engine.connect() as _conn:
+                        with _conn.begin():
+                            _conn.execute(text(
+                                "INSERT INTO hololive_news (title, content, url, news_hash, created_at) "
+                                "VALUES (:title, :content, :url, :hash, :now) "
+                                "ON CONFLICT (news_hash) DO NOTHING"
+                            ), {
+                                "title": str(title)[:500],
+                                "content": str(content)[:2000] if content else str(title)[:500],
+                                "url": str(link)[:600] if link else "",
+                                "hash": str(news_hash),
+                                "now": datetime.utcnow(),
+                            })
                     count += 1
                     logger.info(f"✅ 記事取得: {title[:30]}... ({len(content)}文字)")
 
