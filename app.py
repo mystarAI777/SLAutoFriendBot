@@ -2212,7 +2212,7 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
                 prompt, 
                 generation_config={"temperature": 0.8, "max_output_tokens": 500}
             )
-if hasattr(response, 'candidates') and response.candidates:
+            if hasattr(response, 'candidates') and response.candidates:
                 feeling = response.candidates[0].content.parts[0].text.strip()
                 return {
                     'feeling': feeling[:300],
