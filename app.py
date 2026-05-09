@@ -2533,7 +2533,7 @@ def _save_news(title, content, url, news_hash):
                 else:
                     logger.warning(f"  ❌ _save_news失敗: {err[:60]}")
                     break
-        return False
+return False
 
     # ============================================================
     # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
