@@ -2367,8 +2367,8 @@ def process_daily_streams():
                     
                     logger.info(f"✅ 感想記録: {mochiko_reaction['feeling'][:50]}...")
                 
-# ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
-                time.sleep(8)
+                    # ★ v33.11: Gemini Rate Limit対策で8秒間隔に延長
+                    time.sleep(8)
                 
             except Exception as e:
                 logger.error(f"配信処理エラー: {e}")
