@@ -2512,29 +2512,25 @@ def fetch_hololive_news():
     added = 0
 
     def _save_news(title, content, url, news_hash):
-        """1件のニュースを独立セッションで保存する"""
-        for attempt in range(2):
-            try:
-                with get_db_session() as s:
-                    if not s.query(HololiveNews).filter_by(news_hash=news_hash).first():
-                        s.add(HololiveNews(
-                            title=title, content=content, url=url,
-                            news_hash=news_hash, created_at=datetime.utcnow()
-                        ))
-                    return True
-            except Exception as e:
-                err = str(e)
-                if 'NULL identity key' in err and attempt == 0:
-                    logger.warning("  🔧 シーケンスズレ検出 → 自動修復")
-                    try:
-                        fix_postgres_sequences(quiet=True)
-                        time.sleep(2)
-                    except Exception:
-                        pass
-                else:
-                    logger.warning(f"  ❌ _save_news失敗: {err[:60]}")
-                    break
-        return False
+        """1件のニュースを生SQLでINSERT（ORMシーケンス依存を回避）"""
+        try:
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(
+                        "INSERT INTO hololive_news (title, content, url, news_hash, created_at) "
+                        "VALUES (:title, :content, :url, :hash, :now) "
+                        "ON CONFLICT (news_hash) DO NOTHING"
+                    ), {
+                        "title": str(title)[:500],
+                        "content": str(content)[:2000] if content else str(title)[:500],
+                        "url": str(url)[:600] if url else "",
+                        "hash": str(news_hash),
+                        "now": datetime.utcnow(),
+                    })
+            return True
+        except Exception as e:
+            logger.warning(f"  ❌ _save_news失敗: {str(e)[:80]}")
+            return False
 
     # ============================================================
     # ソース1: ホロライブ公式サイト直接スクレイピング（最優先）
