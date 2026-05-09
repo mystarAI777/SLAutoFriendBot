@@ -2668,7 +2668,6 @@ def fetch_specialized_news():
                                 site_name='hololive_tsuushin',
                                 title=title, content=title, url=link,
                                 news_hash=news_hash, created_at=datetime.utcnow(),
-                                published_date=datetime.utcnow()
                             ))
                             added += 1
                 logger.info(f"  ✅ ホロライブ通信: {added}件追加")
