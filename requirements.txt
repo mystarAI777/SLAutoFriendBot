@@ -26,6 +26,7 @@ beautifulsoup4==4.12.3
 # HTTP のみの軽量モード。ブラウザ系 (DynamicFetcher / StealthyFetcher) は
 # Render 無料枠で動かないため使わない。素の Fetcher のみ使用。
 scrapling>=0.4.0
+curl_cffi>=0.6.0
 
 # Background Tasks & Scheduling
 schedule==1.2.1
