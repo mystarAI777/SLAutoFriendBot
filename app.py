@@ -108,41 +108,6 @@ except Exception as _scrapling_other_err:
     HAS_SCRAPLING = False
     _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
 
-
-# ★ v33.18: Scrapling のフォールバック付きインポート
-# Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
-try:
-    from scrapling.fetchers import Fetcher as _ScraplingFetcher
-    HAS_SCRAPLING = True
-    # 起動ログ用フラグ。インポート時には logger 未定義のため、後で initialize_app で出力
-    _SCRAPLING_VERSION_MSG = "✅ Scrapling 利用可能"
-except ImportError as _scrapling_import_err:
-    _ScraplingFetcher = None
-    HAS_SCRAPLING = False
-    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling インポート失敗 → requests フォールバック: {_scrapling_import_err}"
-except Exception as _scrapling_other_err:
-    _ScraplingFetcher = None
-    HAS_SCRAPLING = False
-    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
-
-
-# ★ v33.18: Scrapling のフォールバック付きインポート
-# Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
-try:
-    from scrapling.fetchers import Fetcher as _ScraplingFetcher
-    HAS_SCRAPLING = True
-    # 起動ログ用フラグ。インポート時には logger 未定義のため、後で initialize_app で出力
-    _SCRAPLING_VERSION_MSG = "✅ Scrapling 利用可能"
-except ImportError as _scrapling_import_err:
-    _ScraplingFetcher = None
-    HAS_SCRAPLING = False
-    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling インポート失敗 → requests フォールバック: {_scrapling_import_err}"
-except Exception as _scrapling_other_err:
-    _ScraplingFetcher = None
-    HAS_SCRAPLING = False
-    _SCRAPLING_VERSION_MSG = f"⚠️ Scrapling 初期化失敗 → requests フォールバック: {_scrapling_other_err}"
-
-
 # ==============================================================================
 # 基本設定とロギング
 # ==============================================================================
