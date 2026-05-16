@@ -92,6 +92,16 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from groq import Groq
 
+# ===== Memvid風RAGシステム (pgvector + Gemini Embedding) =====
+# Memvidの設計思想: テキストをチャンク分割→埋め込みベクトル化→高速検索
+# Renderフリープランで永続化するためPostgreSQLに保存する方式を採用
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    np = None
+
 # ★ v33.18: Scrapling のフォールバック付きインポート
 # Scrapling が pip install されていれば使う、なければ既存の requests + BeautifulSoup にフォールバック
 try:
@@ -821,6 +831,290 @@ class MochikoKnowledgeFile:
 
 mochiko_knowledge_file = MochikoKnowledgeFile()
 
+# ==============================================================================
+# ★ Memvid風RAGシステム
+# ==============================================================================
+class MemvidRAG:
+    """
+    Memvidの設計思想をPostgreSQL + Gemini Embeddingで再現するRAGシステム。
+    
+    Memvidとの対応:
+      MemvidEncoder.add_text()  →  add_chunks()
+      MemvidEncoder.build()     →  build_index() (PostgreSQLへの保存)
+      MemvidRetriever.search()  →  search()
+    
+    永続化: .mp4/.json の代わりに memvid_embeddings テーブルを使用。
+    Renderフリープランでも再起動後もデータが残る。
+    """
+    
+    _instance = None
+    _lock = RLock()
+    
+    @classmethod
+    def get_instance(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+    
+    def __init__(self):
+        self._embed_lock = RLock()
+        self._cache = {}  # {content_hash: embedding}
+        self._cache_max = 500
+    
+    def _get_embedding(self, text: str) -> Optional[List[float]]:
+        """Gemini Embedding APIでテキストをベクトル化 (768次元)"""
+        if not GEMINI_API_KEY or not HAS_NUMPY:
+            return None
+        
+        import hashlib
+        cache_key = hashlib.md5(text[:200].encode()).hexdigest()
+        with self._embed_lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+        
+        try:
+            result = genai.embed_content(
+                model='models/text-embedding-004',
+                content=text[:2000],
+                task_type='retrieval_document'
+            )
+            vec = result['embedding']
+            with self._embed_lock:
+                if len(self._cache) >= self._cache_max:
+                    # LRU簡易実装: 古いものを半分削除
+                    keys = list(self._cache.keys())
+                    for k in keys[:len(keys)//2]:
+                        del self._cache[k]
+                self._cache[cache_key] = vec
+            return vec
+        except Exception as e:
+            logger.debug(f"Memvid Embedding エラー: {e}")
+            return None
+    
+    def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
+        """コサイン類似度 (numpy使用)"""
+        if not HAS_NUMPY:
+            return 0.0
+        va = np.array(a, dtype=np.float32)
+        vb = np.array(b, dtype=np.float32)
+        norm_a = np.linalg.norm(va)
+        norm_b = np.linalg.norm(vb)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(va, vb) / (norm_a * norm_b))
+    
+    def add_chunks(self, chunks: List[Dict], chunk_type: str, user_uuid: str = None):
+        """
+        チャンクをPostgreSQLに保存 (Memvid: MemvidEncoder.add_text相当)
+        chunks: [{'content': str, 'source_id': int}]
+        """
+        if not Session:
+            return 0
+        
+        saved = 0
+        for chunk in chunks:
+            content = chunk.get('content', '').strip()
+            if not content or len(content) < 10:
+                continue
+            
+            vec = self._get_embedding(content)
+            vec_json = json.dumps(vec) if vec else None
+            
+            try:
+                with get_db_session() as session:
+                    entry = MemvidEmbedding(
+                        chunk_type=chunk_type,
+                        source_id=chunk.get('source_id'),
+                        user_uuid=user_uuid,
+                        content=content[:2000],
+                        embedding_json=vec_json,
+                        embedding_dim=len(vec) if vec else 768,
+                    )
+                    session.add(entry)
+                saved += 1
+            except Exception as e:
+                logger.debug(f"Memvid chunk保存エラー: {e}")
+        
+        logger.info(f"📦 Memvid: {saved}チャンク保存 (type={chunk_type})")
+        return saved
+    
+    def search(self, query: str, chunk_type: str = None, user_uuid: str = None,
+               top_k: int = 5, min_similarity: float = 0.6) -> List[Dict]:
+        """
+        セマンティック検索 (Memvid: MemvidRetriever.search相当)
+        戻り値: [{'content': str, 'similarity': float, 'chunk_type': str}]
+        """
+        if not Session or not HAS_NUMPY:
+            return []
+        
+        query_vec = self._get_embedding(query)
+        if not query_vec:
+            return []
+        
+        try:
+            with get_db_session() as session:
+                q = session.query(MemvidEmbedding).filter(
+                    MemvidEmbedding.embedding_json.isnot(None)
+                )
+                if chunk_type:
+                    q = q.filter(MemvidEmbedding.chunk_type == chunk_type)
+                if user_uuid:
+                    q = q.filter(MemvidEmbedding.user_uuid == user_uuid)
+                
+                # 直近500件を対象に類似度計算 (大量になっても高速)
+                candidates = q.order_by(
+                    MemvidEmbedding.created_at.desc()
+                ).limit(500).all()
+                
+                scored = []
+                for c in candidates:
+                    try:
+                        vec = json.loads(c.embedding_json)
+                        sim = self._cosine_similarity(query_vec, vec)
+                        if sim >= min_similarity:
+                            scored.append({
+                                'content': c.content,
+                                'similarity': sim,
+                                'chunk_type': c.chunk_type,
+                                'source_id': c.source_id,
+                            })
+                    except Exception:
+                        continue
+                
+                scored.sort(key=lambda x: x['similarity'], reverse=True)
+                return scored[:top_k]
+        
+        except Exception as e:
+            logger.error(f"Memvid search エラー: {e}")
+            return []
+    
+    def build_knowledge_index(self):
+        """
+        既存DBから知識チャンクを生成してインデックス構築
+        (Memvid: build() 相当)
+        対象: HololiveNews, HolomemWiki, HolomemLingo
+        """
+        logger.info("🏗️ Memvid知識インデックス構築開始...")
+        total = 0
+        
+        try:
+            with get_db_session() as session:
+                # ホロライブニュース (タイトル+本文)
+                news_list = session.query(HololiveNews).order_by(
+                    HololiveNews.created_at.desc()
+                ).limit(50).all()
+                
+                news_chunks = []
+                for n in news_list:
+                    text = f"{n.title}\n{n.content or ''}"[:1000]
+                    # 既にインデックス済みかチェック
+                    existing = session.query(MemvidEmbedding).filter_by(
+                        chunk_type='hololive_news',
+                        source_id=n.id
+                    ).first()
+                    if not existing:
+                        news_chunks.append({'content': text, 'source_id': n.id})
+                
+                if news_chunks:
+                    total += self.add_chunks(news_chunks, 'hololive_news')
+                
+                # ホロメンWiki (エピソード情報)
+                wiki_list = session.query(HolomemWiki).filter(
+                    HolomemWiki.episodes.isnot(None)
+                ).limit(30).all()
+                
+                wiki_chunks = []
+                for w in wiki_list:
+                    text = f"{w.member_name}\n{w.description or ''}\n{w.episodes or ''}"[:1000]
+                    existing = session.query(MemvidEmbedding).filter_by(
+                        chunk_type='holomem_wiki',
+                        source_id=w.id
+                    ).first()
+                    if not existing:
+                        wiki_chunks.append({'content': text, 'source_id': w.id})
+                
+                if wiki_chunks:
+                    total += self.add_chunks(wiki_chunks, 'holomem_wiki')
+        
+        except Exception as e:
+            logger.error(f"Memvid知識インデックス構築エラー: {e}")
+        
+        logger.info(f"✅ Memvid知識インデックス構築完了: {total}チャンク追加")
+        return total
+    
+    def index_conversation(self, user_uuid: str, content: str, source_id: int = None):
+        """
+        会話メッセージをMemvidインデックスに追加 (非同期実行を想定)
+        重要な発言のみ対象 (20文字以上)
+        """
+        if len(content) < 20:
+            return
+        self.add_chunks(
+            [{'content': content, 'source_id': source_id}],
+            chunk_type='conversation',
+            user_uuid=user_uuid
+        )
+    
+    def get_context_for_query(self, query: str, user_uuid: str = None) -> str:
+        """
+        クエリに関連する過去の会話・知識を取得してコンテキスト文字列で返す。
+        generate_ai_response() に注入して使う。
+        """
+        results = []
+        
+        # 知識DB検索 (ニュース・Wiki)
+        knowledge_hits = self.search(
+            query,
+            chunk_type=None,
+            top_k=3,
+            min_similarity=0.65
+        )
+        # 会話履歴検索 (このユーザーの過去発言)
+        if user_uuid:
+            conv_hits = self.search(
+                query,
+                chunk_type='conversation',
+                user_uuid=user_uuid,
+                top_k=2,
+                min_similarity=0.7
+            )
+        else:
+            conv_hits = []
+        
+        results = knowledge_hits + conv_hits
+        if not results:
+            return ''
+        
+        lines = []
+        for r in results:
+            label = {
+                'hololive_news': '📰ニュース',
+                'holomem_wiki':  '📖Wiki',
+                'holomem_lingo': '🗣️ファン用語',
+                'conversation':  '💬過去の会話',
+            }.get(r['chunk_type'], '📌')
+            sim_pct = int(r['similarity'] * 100)
+            lines.append(f"{label}(類似度{sim_pct}%): {r['content'][:200]}")
+        
+        return "\n\n【Memvid RAG検索結果】\n" + "\n".join(lines)
+    
+    def cleanup_old_embeddings(self, days: int = 30):
+        """古い会話埋め込みを削除 (知識DBは残す)"""
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            with get_db_session() as session:
+                deleted = session.query(MemvidEmbedding).filter(
+                    MemvidEmbedding.chunk_type == 'conversation',
+                    MemvidEmbedding.created_at < cutoff
+                ).delete()
+                if deleted:
+                    logger.info(f"🗑️ Memvid: 古い会話埋め込み{deleted}件削除")
+        except Exception as e:
+            logger.error(f"Memvid cleanup エラー: {e}")
+
+memvid_rag = MemvidRAG.get_instance()
+
 
 def generate_mochiko_knowledge():
     """TASK_SCHEDULEから呼ばれる定期更新関数"""
@@ -925,6 +1219,33 @@ class BackgroundTask(Base):
     status = Column(String(20), default='pending', index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+
+# ==============================================================================
+# 折衷案: 会話Embedding & 要約テーブル
+# ==============================================================================
+class ConversationEmbedding(Base):
+    """会話発言ごとのEmbeddingベクターを保存。アイドル時にバックグラウンドで生成。"""
+    __tablename__ = 'conversation_embeddings'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    history_id = Column(Integer, nullable=False, index=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    role = Column(String(10), nullable=False)
+    content_snippet = Column(String(500), nullable=False)
+    embedding = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ConversationSummary(Base):
+    """ユーザーごとの会話要約 (20往復ごとに自動生成)。"""
+    __tablename__ = 'conversation_summaries'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_uuid = Column(String(255), nullable=False, index=True)
+    summary = Column(Text, nullable=False)
+    covered_until = Column(DateTime, nullable=False)
+    message_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 
 class HolomemWiki(Base):
     __tablename__ = 'holomem_wiki'
@@ -1185,6 +1506,28 @@ class AnimeInfoCache(Base):
 # ==============================================================================
 # ★ 追加: 専門サイト検索結果キャッシュテーブル
 # ==============================================================================
+class MemvidEmbedding(Base):
+    """
+    Memvid風RAGシステム - ベクトル埋め込みストア。
+    Memvidが .mp4+.json に保存するものをPostgreSQLに永続化する。
+    
+    chunk_type:
+      'conversation' - 会話履歴チャンク (user発言)
+      'hololive_news' - ホロライブニュース本文
+      'holomem_wiki'  - ホロメンWiki情報
+      'holomem_lingo' - ファン用語・呼称
+    """
+    __tablename__ = 'memvid_embeddings'
+    id = Column(Integer, primary_key=True)
+    chunk_type = Column(String(30), nullable=False, index=True)
+    source_id = Column(Integer, nullable=True)          # 元テーブルのid
+    user_uuid = Column(String(255), nullable=True, index=True)
+    content = Column(Text, nullable=False)               # チャンクテキスト
+    embedding_json = Column(Text, nullable=True)         # JSON形式の埋め込みベクトル
+    embedding_dim = Column(Integer, default=768)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    last_accessed = Column(DateTime, default=datetime.utcnow)
+
 class SpecializedNews(Base):
     """
     専門サイト（Blender公式ドキュメント・CGニュース等）への
@@ -1410,6 +1753,293 @@ def get_weather_forecast(location: str = "東京") -> str:
     except Exception as e:
         logger.error(f"天気取得エラー: {e}")
         return f"{location}の天気情報が取得できなかったよ…"
+
+# ==============================================================================
+# 折衷案: Step2(LIKE検索) + Step3(Embedding検索) + 会話要約
+# ==============================================================================
+
+_MEMORY_TRIGGER_WORDS = [
+    '覚えてる', 'おぼえてる', '前に言った', '以前言った', '前話した',
+    '以前話した', 'あの話', 'あの件', '言ったじゃん', '話したじゃん',
+    '記憶', '忘れた', '思い出して', '前のこと', '以前のこと',
+]
+
+
+def detect_memory_trigger(message: str) -> bool:
+    """「前に話したこと覚えてる？」系の発言を検出する"""
+    return any(kw in message for kw in _MEMORY_TRIGGER_WORDS)
+
+
+def search_history_by_keyword(session, user_uuid: str, message: str, limit: int = 5) -> str:
+    """Step2: LIKE検索で過去の関連発言を取得する。毎回実行・ロスほぼ0。"""
+    try:
+        stop_words = {
+            'は', 'が', 'を', 'に', 'で', 'と', 'も', 'の', 'か',
+            'て', 'し', 'た', 'だ', 'な', 'よ', 'ね', 'よね',
+            'じゃん', 'って', 'けど', 'から', 'まじ', 'やばい',
+        }
+        words = [
+            w for w in re.findall(r'[ぁ-んァ-ヶーa-zA-Z0-9一-龥]{2,}', message)
+            if w not in stop_words
+        ]
+        if not words:
+            return ''
+
+        search_words = words[:3]
+        recent_ids = [
+            row.id for row in
+            session.query(ConversationHistory.id)
+            .filter_by(user_uuid=user_uuid)
+            .order_by(ConversationHistory.timestamp.desc())
+            .limit(10).all()
+        ]
+
+        results = []
+        for word in search_words:
+            hits = (
+                session.query(ConversationHistory)
+                .filter(
+                    ConversationHistory.user_uuid == user_uuid,
+                    ConversationHistory.content.ilike('%' + word + '%'),
+                )
+                .order_by(ConversationHistory.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
+            results.extend([h for h in hits if h.id not in recent_ids])
+
+        if not results:
+            return ''
+
+        seen = set()
+        unique = []
+        for r in sorted(results, key=lambda x: x.timestamp, reverse=True):
+            if r.id not in seen:
+                seen.add(r.id)
+                unique.append(r)
+
+        out_lines = []
+        for r in unique[:limit]:
+            jst = (r.timestamp + timedelta(hours=9)).strftime('%m/%d %H:%M')
+            role_label = 'あなた' if r.role == 'user' else 'もちこ'
+            out_lines.append('  [' + jst + '] ' + role_label + ': ' + r.content[:120])
+
+        return '【過去の関連会話（キーワード検索）】\n' + '\n'.join(out_lines)
+
+    except Exception as e:
+        logger.error('LIKE検索エラー: ' + str(e))
+        return ''
+
+
+def _embed_text_simple(text: str) -> list:
+    """Gemini text-embedding-004 でテキストをベクター化する。失敗時は空リスト。"""
+    try:
+        result = genai.embed_content(
+            model='models/text-embedding-004',
+            content=text[:2000],
+            task_type='RETRIEVAL_DOCUMENT',
+        )
+        return result['embedding']
+    except Exception as e:
+        logger.warning('Embedding生成エラー: ' + str(e))
+        return []
+
+
+def _cosine_sim(a: list, b: list) -> float:
+    """2つのベクターのコサイン類似度を返す。"""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def search_history_by_embedding(session, user_uuid: str, message: str, limit: int = 4) -> str:
+    """Step3: Embeddingベクター類似検索。トリガーワード検出時のみ呼ばれる。"""
+    try:
+        query_vec = _embed_text_simple(message)
+        if not query_vec:
+            return ''
+
+        rows = (
+            session.query(ConversationEmbedding)
+            .filter_by(user_uuid=user_uuid)
+            .order_by(ConversationEmbedding.created_at.desc())
+            .limit(300)
+            .all()
+        )
+        if not rows:
+            return ''
+
+        scored = []
+        for row in rows:
+            if not row.embedding:
+                continue
+            try:
+                vec = json.loads(row.embedding)
+                score = _cosine_sim(query_vec, vec)
+                scored.append((score, row))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [(s, r) for s, r in scored[:limit] if s >= 0.6]
+        if not top:
+            return ''
+
+        out_lines = []
+        for score, row in top:
+            jst = (row.created_at + timedelta(hours=9)).strftime('%m/%d %H:%M')
+            role_label = 'あなた' if row.role == 'user' else 'もちこ'
+            out_lines.append(
+                '  [' + jst + '] ' + role_label +
+                '(類似度' + str(round(score, 2)) + '): ' + row.content_snippet[:120]
+            )
+
+        return '【過去の類似会話（意味検索）】\n' + '\n'.join(out_lines)
+
+    except Exception as e:
+        logger.error('Embedding検索エラー: ' + str(e))
+        return ''
+
+
+def get_conversation_summary_ctx(session, user_uuid: str) -> str:
+    """最新の会話要約をDBから取得してプロンプト注入用テキストで返す。"""
+    try:
+        summary = (
+            session.query(ConversationSummary)
+            .filter_by(user_uuid=user_uuid)
+            .order_by(ConversationSummary.created_at.desc())
+            .first()
+        )
+        if summary:
+            date_str = (summary.covered_until + timedelta(hours=9)).strftime('%m/%d')
+            header = '【過去の会話まとめ（' + date_str + 'まで）】'
+            return '\n' + header + '\n' + summary.summary + '\n'
+    except Exception as e:
+        logger.error('会話要約取得エラー: ' + str(e))
+    return ''
+
+
+def build_conversation_summary_bg(session, user_uuid: str, user_name: str):
+    """過去の会話履歴（20往復以上）をGemini/Groqで要約してDB保存。アイドル時実行。"""
+    try:
+        all_hist = (
+            session.query(ConversationHistory)
+            .filter_by(user_uuid=user_uuid)
+            .order_by(ConversationHistory.timestamp.desc())
+            .all()
+        )
+        target = all_hist[10:]
+        if len(target) < 20:
+            return
+
+        latest_summary = (
+            session.query(ConversationSummary)
+            .filter_by(user_uuid=user_uuid)
+            .order_by(ConversationSummary.created_at.desc())
+            .first()
+        )
+        if latest_summary:
+            target = [h for h in target if h.timestamp > latest_summary.covered_until]
+            if len(target) < 20:
+                return
+
+        target_sorted = sorted(target, key=lambda x: x.timestamp)[-60:]
+        convo_lines = []
+        for h in target_sorted:
+            label = 'あなた' if h.role == 'user' else 'もちこ'
+            convo_lines.append(label + ': ' + h.content[:150])
+        convo_text = '\n'.join(convo_lines)
+        covered_until = target_sorted[-1].timestamp
+
+        prompt = (
+            '以下は「' + user_name + '」さんともちこの過去の会話です。\n'
+            '重要な情報・話題・エピソードを200文字以内で箇条書き（・）にまとめてください。\n'
+            '「' + user_name + 'さんは〜が好き」「〜という話題で盛り上がった」など。\n\n'
+            '【会話】\n' + convo_text + '\n\n'
+            '【出力形式】\n・（重要情報1）\n・（重要情報2）\n（前置き不要）'
+        )
+
+        summary_text = None
+        model = gemini_model_manager.get_current_model()
+        if model:
+            try:
+                resp = model.generate_content(
+                    prompt,
+                    generation_config={"temperature": 0.3, "max_output_tokens": 400}
+                )
+                if hasattr(resp, 'candidates') and resp.candidates:
+                    summary_text = resp.candidates[0].content.parts[0].text.strip()
+            except Exception as e:
+                logger.warning('要約Geminiエラー: ' + str(e))
+
+        if not summary_text and groq_client:
+            summary_text = call_groq(prompt, '', [], 400, task_type='analysis')
+
+        if summary_text:
+            session.add(ConversationSummary(
+                user_uuid=user_uuid,
+                summary=summary_text[:1000],
+                covered_until=covered_until,
+                message_count=len(target_sorted),
+            ))
+            logger.info(
+                '✅ 会話要約生成: ' + user_name +
+                ' (' + str(len(target_sorted)) + '件 → ' + str(len(summary_text)) + '文字)'
+            )
+
+    except Exception as e:
+        logger.error('会話要約エラー: ' + str(e))
+
+
+def embed_new_history_bg(user_uuid: str):
+    """アイドル時に新しい会話履歴をEmbedding化してDB保存。1回最大20件。"""
+    try:
+        with get_db_session() as session:
+            embedded_ids = {
+                row.history_id
+                for row in session.query(ConversationEmbedding.history_id)
+                .filter_by(user_uuid=user_uuid).all()
+            }
+            all_hist = (
+                session.query(ConversationHistory)
+                .filter(
+                    ConversationHistory.user_uuid == user_uuid,
+                    ConversationHistory.role == 'user',
+                )
+                .order_by(ConversationHistory.timestamp.desc())
+                .all()
+            )
+            new_hist = [h for h in all_hist[10:] if h.id not in embedded_ids][:20]
+
+            if not new_hist:
+                return
+
+            logger.info('🔢 Embedding化開始: ' + user_uuid[:8] + ' ' + str(len(new_hist)) + '件')
+            for hist in new_hist:
+                if not conversation_activity.is_idle():
+                    break
+                vec = _embed_text_simple(hist.content[:500])
+                if not vec:
+                    continue
+                session.add(ConversationEmbedding(
+                    history_id=hist.id,
+                    user_uuid=user_uuid,
+                    role=hist.role,
+                    content_snippet=hist.content[:500],
+                    embedding=json.dumps(vec),
+                    created_at=hist.timestamp,
+                ))
+                time.sleep(0.1)
+
+            logger.info('✅ Embedding化完了: ' + user_uuid[:8])
+
+    except Exception as e:
+        logger.error('embed_new_history_bg エラー: ' + str(e))
+
+
 
 def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
     user = session.query(UserMemory).filter_by(user_uuid=user_uuid).first()
@@ -2653,80 +3283,6 @@ def fetch_specialized_news():
 
 def wrapped_news_fetch():
     """ニュース収集タスク (run_managed_task から呼ばれる)"""
-    try:
-        fetch_hololive_news()
-    except Exception as e:
-        logger.error(f"❌ fetch_hololive_news 失敗: {e}")
-
-    try:
-        fetch_specialized_news()
-    except Exception as e:
-        logger.error(f"❌ fetch_specialized_news 失敗: {e}")
-# ==============================================================================
-# SpecializedNews 取得（v35.2 のモデルを活用）
-# ホロライブ通信 + アニメDB など "専門サイト" 枠
-# ==============================================================================
-
-def fetch_specialized_news():
-    """専門サイトからニュースを取得してSpecializedNewsテーブルに保存"""
-    logger.info("📰 専門ニュース更新開始...")
-    added = 0
-
-    with get_db_session() as session:
-
-        # ============================================================
-        # ホロライブ通信（WordPress系。セレクタ複数試行）
-        # ============================================================
-        try:
-            url = "https://hololive-tsuushin.com/category/holonews/"
-            res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
-
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.content, 'html.parser')
-                articles = (
-                    soup.select('.post-item') or
-                    soup.select('article.post') or
-                    soup.select('.entry-item') or
-                    soup.select('article')
-                )
-                logger.info(f"  [通信] {len(articles)}件の記事要素を検出")
-
-                for art in articles[:15]:
-                    title_elem = (
-                        art.select_one('h2') or art.select_one('h3') or
-                        art.select_one('.entry-title')
-                    )
-                    link_elem = art.find('a')
-                    title = title_elem.text.strip() if title_elem else ''
-                    title = ' '.join(title.split())
-                    link = link_elem.get('href', '') if link_elem else ''
-
-                    if title and len(title) > 5 and link:
-                        news_hash = hashlib.md5(link.encode()).hexdigest()
-                        if not session.query(SpecializedNews).filter_by(news_hash=news_hash).first():
-                            session.add(SpecializedNews(
-                                site_name='hololive_tsuushin',
-                                title=title, content=title, url=link,
-                                news_hash=news_hash, created_at=datetime.utcnow(),
-                                published_date=datetime.utcnow()
-                            ))
-                            added += 1
-                logger.info(f"  ✅ ホロライブ通信: {added}件追加")
-            else:
-                logger.warning(f"  ⚠️ ホロライブ通信 HTTP {res.status_code}")
-
-        except Exception as e:
-            logger.warning(f"  ❌ ホロライブ通信失敗: {str(e)[:60]}")
-
-    logger.info(f"✅ 専門ニュース更新完了: {added}件追加")
-
-
-# ==============================================================================
-# wrapped_news_fetch() ← TASK_SCHEDULE から呼ばれる統合エントリーポイント
-# ==============================================================================
-
-def wrapped_news_fetch():
-    """ニュース収集タスク (run_managed_task から呼ばれる)"""
     # ★ 毎回シーケンスを修復してからニュース取得（NULL identity key対策）
     try:
         fix_postgres_sequences(quiet=True)
@@ -2737,6 +3293,11 @@ def wrapped_news_fetch():
         fetch_hololive_news()
     except Exception as e:
         logger.error(f"❌ fetch_hololive_news 失敗: {e}")
+
+    try:
+        fetch_hololive_tsuushin_news()
+    except Exception as e:
+        logger.error(f"❌ fetch_hololive_tsuushin_news 失敗: {e}")
 
     try:
         fetch_specialized_news()
@@ -3340,32 +3901,32 @@ def fetch_hololive_schedule():
 # ==============================================================================
 
 SL_SOURCES = [
-    # 公式ブログ RSS
+    # Google News RSS (Second Life 英語) - 安定ソース
+    {
+        'name': 'google_news_sl',
+        'type': 'google_news_rss',
+        'query': 'Second Life virtual world Linden',
+        'category': 'news',
+    },
+    # Google News RSS (日本語SL情報) - 安定ソース
+    {
+        'name': 'google_news_sl_jp',
+        'type': 'google_news_rss',
+        'query': 'セカンドライフ SL インワールド',
+        'category': 'news',
+    },
+    # Google News RSS (SLイベント情報)
+    {
+        'name': 'google_news_sl_event',
+        'type': 'google_news_rss',
+        'query': 'Second Life event sale 2026',
+        'category': 'event',
+    },
+    # 公式ブログ RSS (生きていれば取得、死んでいてもエラーにならない)
     {
         'name': 'official_blog',
         'type': 'rss',
         'url': 'https://community.secondlife.com/blogs.xml/',
-        'category': 'news',
-    },
-    # SLuniverseニュース RSS
-    {
-        'name': 'sluniverse',
-        'type': 'rss',
-        'url': 'https://www.sluniverse.com/php/vb/external.php?type=RSS2',
-        'category': 'community',
-    },
-    # 公式Twitter/Xの代わりにGoogle News RSS (Second Life)
-    {
-        'name': 'google_news_sl',
-        'type': 'google_news_rss',
-        'query': 'Second Life virtual world',
-        'category': 'news',
-    },
-    # Google News RSS (日本語SL情報)
-    {
-        'name': 'google_news_sl_jp',
-        'type': 'google_news_rss',
-        'query': 'セカンドライフ SL',
         'category': 'news',
     },
 ]
@@ -3939,11 +4500,6 @@ def cleanup_anime_cache():
         logger.error(f"アニメキャッシュクリーンアップエラー: {e}")
 
 
-def wrapped_news_fetch():
-    """ニュース収集タスク (run_managed_task から呼ばれる)"""
-    fetch_hololive_news()
-    fetch_hololive_tsuushin_news()
-
 def wrapped_holomem_update():
     """ホロメンDB更新タスク (run_managed_task から呼ばれる)"""
     update_holomem_database()
@@ -4002,7 +4558,10 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'fetch_sl_news':        {'func': 'fetch_all_sl_news',   'interval_hours': 11.0},  # 1日2回
     'cleanup_anime_cache':  {'func': 'cleanup_anime_cache', 'interval_hours': 167.0}, # 週1回
     # ★ 追加
-    'cleanup_specialized_news': {'func': 'cleanup_old_specialized_news', 'interval_hours': 167.0},  # 週1回
+    'cleanup_specialized_news': {'func': 'cleanup_old_specialized_news', 'interval_hours': 167.0},
+    # ★ Memvid RAGタスク
+    'memvid_build_index':   {'func': 'memvid_rag.build_knowledge_index', 'interval_hours': 23.0},
+    'memvid_cleanup':       {'func': 'memvid_rag.cleanup_old_embeddings', 'interval_hours': 167.0},  # 週1回
     # ── ローカルファイル (起動のたびに実行して問題ない軽いもの) ──────────────
     'cleanup_voices':       {'func': 'cleanup_old_voice_files',          'interval_hours': 1.0},   # 起動時は常に実行
     # ★ 追加: もちこ知識ベースをDBから自動生成してGemini File APIへアップロード
@@ -5115,6 +5674,34 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Anime context injection error: {e}")
 
+    # 2d-1. ★ 折衷案: LIKE検索 + 要約 + トリガー時Embedding検索
+    try:
+        if session is not None:
+            summary_ctx = get_conversation_summary_ctx(session, user_data.uuid)
+            if summary_ctx:
+                internal_context += summary_ctx
+            like_ctx = search_history_by_keyword(session, user_data.uuid, message)
+            if like_ctx:
+                internal_context += '\n' + like_ctx
+            if detect_memory_trigger(message):
+                logger.info('🧠 メモリトリガー検出 → Embedding検索実行')
+                emb_ctx = search_history_by_embedding(session, user_data.uuid, message)
+                if emb_ctx:
+                    internal_context += '\n' + emb_ctx
+    except Exception as _mem_err:
+        logger.error('過去会話検索エラー: ' + str(_mem_err))
+
+    # 2d-2. ★ Memvid RAG: セマンティック検索コンテキストの注入
+    try:
+        memvid_ctx = memvid_rag.get_context_for_query(
+            message,
+            user_uuid=user_data.uuid if user_data else None
+        )
+        if memvid_ctx:
+            internal_context += memvid_ctx
+    except Exception as e:
+        logger.debug(f"Memvid RAGコンテキスト注入エラー: {e}")
+
     # 2d. ★ 追加: 専門サイト検索キャッシュの注入
     # Blender / CGニュース / 脳科学など専門ドメインの蓄積情報を注入
     try:
@@ -5715,86 +6302,6 @@ def background_specialized_search(task_id: str, query_data: Dict):
 # 変更2: generate_voice_file() をまるごと置き換え
 # （元の 3332〜3385行あたり）
 # ============================================================
-
-def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
-    """
-    v33.17: テキストの音声長を概算する（秒）。
-
-    su-shiki API のレスポンスに正確な duration が含まれないため、
-    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
-    speed=1.4 倍速指定なので、その分短くなる。
-
-    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
-
-    最小 1.0秒、最大 30.0秒で clip する。
-    """
-    if not text:
-        return 1.0
-    char_count = len(text)
-    base_duration = char_count * 0.13
-    actual_duration = base_duration / max(speed, 1.0) + 0.3
-    return max(1.0, min(actual_duration, 30.0))
-
-
-def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
-    """
-    v33.17: テキストの音声長を概算する（秒）。
-
-    su-shiki API のレスポンスに正確な duration が含まれないため、
-    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
-    speed=1.4 倍速指定なので、その分短くなる。
-
-    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
-
-    最小 1.0秒、最大 30.0秒で clip する。
-    """
-    if not text:
-        return 1.0
-    char_count = len(text)
-    base_duration = char_count * 0.13
-    actual_duration = base_duration / max(speed, 1.0) + 0.3
-    return max(1.0, min(actual_duration, 30.0))
-
-
-def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
-    """
-    v33.17: テキストの音声長を概算する（秒）。
-
-    su-shiki API のレスポンスに正確な duration が含まれないため、
-    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
-    speed=1.4 倍速指定なので、その分短くなる。
-
-    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
-
-    最小 1.0秒、最大 30.0秒で clip する。
-    """
-    if not text:
-        return 1.0
-    char_count = len(text)
-    base_duration = char_count * 0.13
-    actual_duration = base_duration / max(speed, 1.0) + 0.3
-    return max(1.0, min(actual_duration, 30.0))
-
-
-def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
-    """
-    v33.17: テキストの音声長を概算する（秒）。
-
-    su-shiki API のレスポンスに正確な duration が含まれないため、
-    日本語の標準発話速度 (1秒あたり7-8モーラ ≒ 0.13秒/文字) から概算する。
-    speed=1.4 倍速指定なので、その分短くなる。
-
-    式: 文字数 × 0.13秒 / speed + 0.3秒（先頭/末尾マージン）
-
-    最小 1.0秒、最大 30.0秒で clip する。
-    """
-    if not text:
-        return 1.0
-    char_count = len(text)
-    base_duration = char_count * 0.13
-    actual_duration = base_duration / max(speed, 1.0) + 0.3
-    return max(1.0, min(actual_duration, 30.0))
-
 
 def estimate_audio_duration(text: str, speed: float = 1.4) -> float:
     """
@@ -6586,6 +7093,13 @@ def chat_lsl():
 
             session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
 
+            # ★ Memvid: ユーザー発言をバックグラウンドでインデックス化
+            if len(message) >= 20:
+                background_executor.submit(
+                    memvid_rag.index_conversation,
+                    user_uuid, message
+                )
+
             # ★ v33.16: 指摘っぽい発言を検出したらバックグラウンドで自動学習
             # (lingo + Holodex でファクトチェックして信頼度60以上ならDB更新)
             try:
@@ -6597,6 +7111,19 @@ def chat_lsl():
                 logger.debug(f"自動学習トリガーエラー: {learn_err}")
 
             # ★ v33.7.0: アニメ発言を自動検知してバックグラウンドでキャッシュを温める
+            # ★ 折衷案: 5往復ごとにアイドル時Embedding化 + 要約更新
+            if user_data.interaction_count % 5 == 0:
+                _emb_uuid = user_uuid
+                _emb_name = user_name
+                def _idle_mem_tasks(_uuid=_emb_uuid, _name=_emb_name):
+                    if not conversation_activity.is_idle():
+                        return
+                    embed_new_history_bg(_uuid)
+                    with get_db_session() as _s:
+                        build_conversation_summary_bg(_s, _uuid, _name)
+                task_executor.submit(_idle_mem_tasks)
+
+
            
             # ★ v33.7.0: SL発言なら最新SL情報をバックグラウンドでリフレッシュ予約
             # (次回の応答に間に合わせるため早めに投げておく)
@@ -7640,6 +8167,18 @@ def check_and_migrate_db():
                     except: pass
                 logger.info("ℹ️ friend_profiles テーブルは Base.metadata.create_all で作成されます")
 
+            # ★ 折衷案: conversation_embeddings / conversation_summaries
+            for _tbl in ['conversation_embeddings', 'conversation_summaries']:
+                try:
+                    _t = conn.begin()
+                    conn.execute(text('SELECT id FROM ' + _tbl + ' LIMIT 1'))
+                    _t.commit()
+                    logger.info('✅ ' + _tbl + ' テーブル確認OK')
+                except Exception:
+                    try: _t.rollback()
+                    except: pass
+                    logger.info('ℹ️ ' + _tbl + ' は Base.metadata.create_all で作成されます')
+
             # ★ v33.7.0: secondlife_news / anime_info_cache
             for tbl in ['secondlife_news', 'anime_info_cache', 'specialized_news']:  # ★ 追加
                 try:
@@ -7778,20 +8317,6 @@ def fix_hololive_news_constraints():
         logger.warning(f"\u26a0\ufe0f url インデックス作成スキップ: {e}")
 
 
-def needs_run(task_name: str, interval_hours: float) -> bool:
-    """
-    前回の実行から interval_hours 以上経過していれば True を返す。
-    DBに記録がなければ（初回 or スリープで記録消失）必ず True。
-    """
-    last = get_task_last_run(task_name)
-    if last is None:
-        return True
-    return (datetime.utcnow() - last) >= timedelta(hours=interval_hours)
-
-def is_allowed_time_for_task(task_name: str) -> Tuple[bool, Optional[str]]:
-    """時間帯チェックのスタブ関数（現状は常に許可）"""
-    return True, None
-    
 def setup_stream_processing_schedule():
     """
     配信処理は TASK_SCHEDULE で管理するため、この関数は
@@ -7892,6 +8417,9 @@ def initialize_app():
         'fetch_schedule':       fetch_hololive_schedule,
         # ★ v33.10 追加: 未登録だったクリーンアップ
         'cleanup_specialized_news': cleanup_old_specialized_news,
+        # ★ Memvid RAGタスク
+        'memvid_build_index': memvid_rag.build_knowledge_index,
+        'memvid_cleanup':     memvid_rag.cleanup_old_embeddings,
     })
 
     # ★ v33.11 変更: 起動時に Gemini API を使う処理をすぐに走らせない
