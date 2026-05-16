@@ -5562,6 +5562,8 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                 if latest_news:
                     news_lines = []
                     for i, n in enumerate(latest_news, 1):
+                        if n is None:
+                            continue
                         body_preview = n.content[:200] if n.content and n.content != n.title else ""
                         if body_preview:
                             news_lines.append(f"{i}. 【{n.title}】{body_preview}")
