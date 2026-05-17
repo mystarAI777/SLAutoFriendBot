@@ -2936,14 +2936,25 @@ def process_daily_streams():
                 ).first()
                 
                 if not existing:
-                    new_reaction = StreamReaction(
-                        member_name=detected_member,
-                        stream_title=title[:300],
-                        stream_date=stream_info['date'],
-                        mochiko_feeling=mochiko_reaction['feeling'][:300],
-                        emotion_tags=mochiko_reaction['emotion_tags'][:50]
-                    )
-                    session.add(new_reaction)
+                    try:
+                        from sqlalchemy import text as _text
+                        with engine.connect() as _conn:
+                            with _conn.begin():
+                                _conn.execute(_text(
+                                    "INSERT INTO stream_reactions "
+                                    "(member_name, stream_title, stream_date, mochiko_feeling, emotion_tags, created_at) "
+                                    "VALUES (:mn, :st, :sd, :mf, :et, :ca) "
+                                    "ON CONFLICT DO NOTHING"
+                                ), {
+                                    "mn": detected_member,
+                                    "st": title[:300],
+                                    "sd": stream_info['date'],
+                                    "mf": mochiko_reaction['feeling'][:300],
+                                    "et": mochiko_reaction['emotion_tags'][:50],
+                                    "ca": datetime.utcnow(),
+                                })
+                    except Exception as _ins_err:
+                        logger.warning(f"stream_reactions INSERT スキップ: {_ins_err}")
                     processed_count += 1
                     
                     feeling = session.query(HolomemFeeling).filter_by(member_name=detected_member).first()
@@ -8391,6 +8402,7 @@ def initialize_app():
     logger.info("🎀 ホロメンシステム初期化...")
     if holomem_manager.load_from_db():
         logger.info(f"✅ ホロメン: {holomem_manager.get_member_count()}名ロード")
+    initialize_pronunciation_from_lingo()
     if holomem_manager.get_member_count() == 0:
         logger.info("📡 DBが空のため初回収集実行")
         task_executor.submit(update_holomem_database)
