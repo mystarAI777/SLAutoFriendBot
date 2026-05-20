@@ -161,8 +161,9 @@ TOPIC_SUGGESTION_INTERVAL = 10
 # v33.20.4: gemini-1.5系列は2025年9月に廃止 (v1beta APIで404)
 #           gemini-2.5系列のみを使用する
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",       # 最新・メイン
+    "gemini-3.1-flash-lite",  # フォールバック1
+    "gemini-2.5-flash",       # フォールバック2
 ]
 # ==========================================
 # Groqで使用するモデルの優先順位 (v33.8.2 更新)
