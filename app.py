@@ -4063,27 +4063,38 @@ def fetch_all_sl_news() -> int:
     all_items.extend(fetch_sl_marketplace_trends())
 
     new_count = 0
-    with get_db_session() as session:
-        for item in all_items:
-            h = _make_news_hash(item['title'])
-            if session.query(SecondLifeNews).filter_by(news_hash=h).first():
-                continue
-            session.add(SecondLifeNews(
-                source=item['source'],
-                title=item['title'],
-                content=item.get('content', ''),
-                url=item.get('url', ''),
-                news_hash=h,
-                category=item.get('category', 'news'),
-                created_at=datetime.utcnow(),
-            ))
+    for item in all_items:
+        h = _make_news_hash(item['title'])
+        try:
+            with engine.connect() as _conn:
+                with _conn.begin():
+                    _conn.execute(text(
+                        "INSERT INTO secondlife_news "
+                        "(source, title, content, url, news_hash, category, created_at) "
+                        "VALUES (:source, :title, :content, :url, :hash, :category, :now) "
+                        "ON CONFLICT (news_hash) DO NOTHING"
+                    ), {
+                        "source": str(item['source'])[:100],
+                        "title": str(item['title'])[:500],
+                        "content": str(item.get('content', ''))[:600],
+                        "url": str(item.get('url', ''))[:600],
+                        "hash": str(h),
+                        "category": str(item.get('category', 'news'))[:50],
+                        "now": datetime.utcnow(),
+                    })
             new_count += 1
+        except Exception as _sl_ins_err:
+            logger.warning(f"  ❌ SLニュース INSERT スキップ: {str(_sl_ins_err)[:80]}")
 
-        # 30日以上前のデータを削除
+    # 30日以上前のデータを削除
+    try:
         cutoff = datetime.utcnow() - timedelta(days=30)
-        deleted = session.query(SecondLifeNews).filter(SecondLifeNews.created_at < cutoff).delete()
-        if deleted:
-            logger.info(f"🗑️ 古いSLニュース {deleted}件を削除")
+        with get_db_session() as session:
+            deleted = session.query(SecondLifeNews).filter(SecondLifeNews.created_at < cutoff).delete()
+            if deleted:
+                logger.info(f"🗑️ 古いSLニュース {deleted}件を削除")
+    except Exception as _sl_del_err:
+        logger.warning(f"SLニュース削除エラー: {_sl_del_err}")
 
     logger.info(f"✅ SL情報収集完了: 新規{new_count}件")
     return new_count
@@ -7117,7 +7128,15 @@ def chat_lsl():
                         ai_text = f"{nickname_input}ね！了解！これからそう呼ぶね😊💖 よろしく！"
                         is_task_started = False
 
-            session.add(ConversationHistory(user_uuid=user_uuid, role='user', content=message))
+            try:
+                with engine.connect() as _ch_conn:
+                    with _ch_conn.begin():
+                        _ch_conn.execute(text(
+                            "INSERT INTO conversation_history (user_uuid, role, content, timestamp) "
+                            "VALUES (:uuid, :role, :content, :ts)"
+                        ), {"uuid": user_uuid, "role": "user", "content": message, "ts": datetime.utcnow()})
+            except Exception as _ch_err1:
+                logger.warning(f"conversation_history user INSERT失敗: {str(_ch_err1)[:80]}")
 
             # ★ Memvid: ユーザー発言をバックグラウンドでインデックス化
             if len(message) >= 20:
@@ -7242,7 +7261,15 @@ def chat_lsl():
                 ai_text = _generate_with_timeout(user_data, message, history, session, user_uuid)
             
             if not is_task_started:
-                session.add(ConversationHistory(user_uuid=user_uuid, role='assistant', content=ai_text))
+                try:
+                    with engine.connect() as _ch_conn2:
+                        with _ch_conn2.begin():
+                            _ch_conn2.execute(text(
+                                "INSERT INTO conversation_history (user_uuid, role, content, timestamp) "
+                                "VALUES (:uuid, :role, :content, :ts)"
+                            ), {"uuid": user_uuid, "role": "assistant", "content": ai_text, "ts": datetime.utcnow()})
+                except Exception as _ch_err2:
+                    logger.warning(f"conversation_history assistant INSERT失敗: {str(_ch_err2)[:80]}")
 
         # v33.22: SL表示・TTS・音声生成の完全分離
         # voice_text : パイプ除去済みフルテキスト（絵文字付き）
@@ -7326,7 +7353,15 @@ def check_task_endpoint():
                 res = task.result or ""
                 try:
                     session.delete(task)
-                    session.add(ConversationHistory(user_uuid=data['uuid'], role='assistant', content=res))
+                    try:
+                        with engine.connect() as _ch_conn3:
+                            with _ch_conn3.begin():
+                                _ch_conn3.execute(text(
+                                    "INSERT INTO conversation_history (user_uuid, role, content, timestamp) "
+                                    "VALUES (:uuid, :role, :content, :ts)"
+                                ), {"uuid": data['uuid'], "role": "assistant", "content": res, "ts": datetime.utcnow()})
+                    except Exception as _ch_err3:
+                        logger.warning(f"conversation_history check_task INSERT失敗: {str(_ch_err3)[:80]}")
                 except Exception as _ct_err:
                     logger.warning(f"⚠️ check_task DB操作スキップ: {_ct_err}")
                     try:
