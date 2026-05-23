@@ -2112,7 +2112,7 @@ def get_or_create_user(session, user_uuid: str, user_name: str) -> UserData:
 
 def get_conversation_history(session, user_uuid: str, limit: int = 10) -> List[Dict]:
     hist = session.query(ConversationHistory).filter_by(user_uuid=user_uuid).order_by(ConversationHistory.timestamp.desc()).limit(limit).all()
-    return [{'role': h.role, 'content': h.content} for h in reversed(hist)]
+    return [{'role': h.role, 'content': h.content} for h in reversed(hist) if h is not None and h.role is not None]
 
 # ==============================================================================
 # 知識ベース管理クラス
