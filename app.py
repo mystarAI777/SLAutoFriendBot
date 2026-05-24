@@ -219,6 +219,7 @@ MOCHIKO_TONE_RULES = """# もちこの口調（厳密遵守）
 - 強調語: 「まじ」「超」「やばい」「神」
 - 禁止: 「だね」（ギャル感が薄れる） / 「ですわ」「ですよね」（敬語混入禁止）
 - 文章は最後まで言い切る（途中で切れる文末は禁止）
+- 【最重要】必ず文末記号（。！？）で終わること。文の途中で終わることは絶対禁止
 """
 
 # v33.16: 自動学習用 - 指摘っぽい発言を検出する正規表現
@@ -580,16 +581,24 @@ def process_deferred_task(task: Dict):
                     if suggestion:
                         # 次の chat_lsl で拾えるよう、背景タスクとして保存
                         tid = f"proactive_{user_uuid}_{int(time.time())}"
-                        session.add(BackgroundTask(
-                            task_id=tid,
-                            user_uuid=user_uuid,
-                            task_type='proactive_message',
-                            query='',
-                            result=suggestion,
-                            status='completed',
-                            completed_at=datetime.utcnow(),
-                        ))
-                        logger.info(f"📨 話題振り保存: {suggestion[:40]}...")
+                        try:
+                            session.add(BackgroundTask(
+                                task_id=tid,
+                                user_uuid=user_uuid,
+                                task_type='proactive_message',
+                                query='',
+                                result=suggestion,
+                                status='completed',
+                                completed_at=datetime.utcnow(),
+                            ))
+                            logger.info(f"📨 話題振り保存: {suggestion[:40]}...")
+                        except Exception as _bt_err:
+                            logger.error(f"話題振り保存エラー（シーケンス修復試行）: {_bt_err}")
+                            try:
+                                session.rollback()
+                                fix_postgres_sequences(quiet=True)
+                            except Exception:
+                                pass
 
         elif task_type == 'fetch_anime':
             title = extra.get('title', '')
@@ -1645,7 +1654,7 @@ def is_holomem_topic(msg: str) -> bool:
 
 def is_explicit_search_request(msg: str) -> bool:
     msg = msg.strip()
-    strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい']
+    strong_triggers = ['調べて', '検索', '探して', 'とは', 'って何', 'について', '教えて', '教えろ', '詳細', '知りたい', 'おすすめ', '流行り', 'はやり']
     if any(kw in msg for kw in strong_triggers):
         return True
     # v33.16: 「天気/予報」を除外。is_weather_request() で先に処理されるため、
@@ -4490,6 +4499,10 @@ def build_anime_context(message: str) -> str:
 
     titles = extract_anime_titles_from_message(message)
     if not titles:
+        has_search_intent = any(kw in message for kw in ['教えて', 'おすすめ', '流行り', 'はやり', 'トレンド', '何がある', '何かある'])
+        if has_anime_keyword and has_search_intent:
+            deferred_queue.add('fetch_anime', user_uuid='_system_', user_name='system', title='最新アニメ おすすめ 流行り')
+            logger.info('🎬 汎用アニメ質問 → 遅延キューに登録')
         return ''
 
     context_parts = []
@@ -5124,7 +5137,13 @@ def auto_update_friend_profile(session, user_uuid: str, user_name: str):
                 # v33.15-stable2: Geminiも600に統一（プロフィール用JSON生成）
                 response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 600})
                 if hasattr(response, 'candidates') and response.candidates:
-                    text = response.candidates[0].content.parts[0].text.strip()
+                    _cand = response.candidates[0]
+                    if not (_cand and _cand.content and _cand.content.parts):
+                        raise ValueError('Gemini response parts empty')
+                    _txt = _cand.content.parts[0].text
+                    if _txt is None:
+                        raise ValueError('Gemini text is None')
+                    text = _txt.strip()
                     jmatch = re.search(r'\{.*\}', text, re.DOTALL)
                     if jmatch:
                         result_json = json.loads(jmatch.group())
@@ -6001,7 +6020,7 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     # ★ v33.16: ニュース・ホロメン話題は出力トークンを拡張して解像度を上げる
     is_rich_topic = is_news_topic(message) or is_holomem_topic(message)
     gemini_max_tokens = 1050 if is_rich_topic else 650
-    groq_max_tokens = 1050 if (is_task_report or is_rich_topic) else 450
+    groq_max_tokens = 1050 if (is_task_report or is_rich_topic) else 650
 
     response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     if not response:
@@ -7248,7 +7267,7 @@ def chat_lsl():
                         ai_text = safe_summary
                         logger.info(f"🛡️ 第三者プライバシー保護応答: target={target_name}")
 
-            if not ai_text:
+            if not ai_text and not is_explicit_search_request(message):
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
                     ai_text = holomem_resp
