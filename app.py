@@ -5905,10 +5905,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 7. **【セカンドライフ最新情報】がある場合、SLユーザーと話しているので積極的に活用してください。**
 8. **【アニメ情報】がある場合、それを使ってアニメの話を盛り上げてください。知らなかった作品でも、検索して得た情報から「あー、それ知ってる！〇〇なやつでしょ？」と自然に反応してください。**
 
-# 【出力のルール（超重要）】
-1. **文字数の目安**:
-   - 通常会話: 200〜250文字
-   - ニュース・配信情報・ホロメン語り: 300〜450文字（解像度を上げる）
+# 【出力のルール（超重要・最優先で厳守）】
+1. **【最重要】文章量の上限**:
+   - 通常会話: 必ず3〜4行以内、200文字程度に収めること。これより長くしてはいけません。
+   - ニュース・配信情報・ホロメン語り: 5〜6行以内、300〜400文字程度まで許容（それでも詰め込みすぎない）。
+   - 長くなりそうな内容は、要点を絞って短くまとめること。情報を全部詰め込もうとしないこと。
 2. **1メッセージに1テーマまで**。複数の話題を詰め込まず、1つの話題に集中して返してください。
 3. **相手に2つ以上の質問を同時にしない**。質問するなら1個だけ。
 4. 絵文字（✨💖😂など）や「あてぃし」「〜じゃん！」「〜だよね！」といった「もちこ」らしい情熱的な口調は維持してください。
@@ -5933,66 +5934,6 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
   - 悪い例: 「あてぃし勉強不足でごめん！」
 - ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
 - 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
-- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
-  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
-- 代わりに **相手から情報を引き出す質問** で返してください。
-  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
-  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
-  - 悪い例: 「リオナって誰？知らないよ〜」
-  - 悪い例: 「あてぃし勉強不足でごめん！」
-- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
-- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
-- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
-  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
-- 代わりに **相手から情報を引き出す質問** で返してください。
-  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
-  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
-  - 悪い例: 「リオナって誰？知らないよ〜」
-  - 悪い例: 「あてぃし勉強不足でごめん！」
-- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
-- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
-- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
-  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
-- 代わりに **相手から情報を引き出す質問** で返してください。
-  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
-  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
-  - 悪い例: 「リオナって誰？知らないよ〜」
-  - 悪い例: 「あてぃし勉強不足でごめん！」
-- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
-- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
-- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
-  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
-- 代わりに **相手から情報を引き出す質問** で返してください。
-  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
-  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
-  - 悪い例: 「リオナって誰？知らないよ〜」
-  - 悪い例: 「あてぃし勉強不足でごめん！」
-- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
-- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# 【知らないホロメン名・グループ名が出た時の対応 (重要)】
-- ユーザーが言ったホロメン名・グループ名 (例: 「リオナ」「FLOW GLOW」「DEV_IS」) が
-  【人物データ】や【参考】に詳細がなくても、「**知らない**」「**勉強不足**」と即答してはいけません。
-- 代わりに **相手から情報を引き出す質問** で返してください。
-  - 良い例: 「あー、リオナちゃんね！最近の配信どうだった？どんな子？」
-  - 良い例: 「FLOW GLOWって新しい世代だっけ？よあさんの推しは誰なの？」
-  - 悪い例: 「リオナって誰？知らないよ〜」
-  - 悪い例: 「あてぃし勉強不足でごめん！」
-- ユーザーが教えてくれた情報は **会話の続きで活かす** こと(「そうなんだ！じゃあ○○なんだね」)。
-- 教えてもらった内容は内部システムが記録するので、もちこ自身は「覚えとく」と返せばOK。
-
-# もちこの口調:
-- 一人称: 「あてぃし」
-- 語尾: 「〜じゃん」「〜て感じ」「〜だし」「〜的な？」
-- ユーザーは友達です。敬語は使わないでください。
 
 # 【与えられた前提知識（以下の情報は事実として扱ってください）】
 {internal_context if internal_context else '（特になし）'}
@@ -8303,6 +8244,10 @@ def fix_postgres_sequences(quiet: bool = False):
         'user_interest_logs', 'friend_profiles',
         'secondlife_news', 'anime_info_cache', 'specialized_news',
         'holomem_lingo', 'live_schedules',
+        # ★ 修正: 漏れていた6テーブルを追加（DB再作成時のNULL identity key対策）
+        'conversation_embeddings', 'conversation_summaries',
+        'holomem_pronunciations', 'mochiko_self',
+        'learning_log', 'memvid_embeddings',
         # task_logs は primary key=task_name(VARCHAR) なので除外
     ]
 
@@ -8355,46 +8300,54 @@ def fix_postgres_sequences(quiet: bool = False):
         logger.info(f"🔧 シーケンス修正: {fixed}件成功 / {failed}件失敗")
 
 def fix_hololive_news_constraints():
-    """hololive_newsテーブルのUNIQUE制約を実テーブルに追加する。"""
+    """
+    UNIQUE制約を要するテーブルに対し、NULL行削除 + UNIQUE INDEX作成を行う。
+
+    修正: hololive_news 専用だった処理を汎用化。
+    Render無料枠でDBを毎月作り直す際、Base.metadata.create_all() は
+    新規テーブルにはUNIQUE制約を正しく作るが、既存テーブルへの制約追加には
+    対応しないため、対象を secondlife_news / anime_info_cache / specialized_news
+    にも拡張する（前回障害: secondlife_news の news_hash UNIQUE INDEX欠落）。
+    """
     if 'sqlite' in str(DATABASE_URL):
         return
 
-    # Step 1: news_hash が NULL の古い行を削除
-    try:
-        with engine.connect() as conn:
-            with conn.begin():
-                result = conn.execute(text(
-                    "DELETE FROM hololive_news WHERE news_hash IS NULL"
-                ))
-                deleted = result.rowcount
-                if deleted > 0:
-                    logger.info(f"\U0001f5d1\ufe0f hololive_news: news_hash NULL行を{deleted}件削除")
-    except Exception as e:
-        logger.warning(f"\u26a0\ufe0f NULL行削除スキップ: {e}")
+    # (テーブル名, NULL可UNIQUEカラム名のリスト) の組
+    # NULL可カラムは事前にNULL行を削除してからUNIQUE INDEXを張る
+    targets = [
+        ('hololive_news',    ['news_hash', 'url']),
+        ('secondlife_news',  ['news_hash']),
+        ('anime_info_cache', ['title']),
+        ('specialized_news', ['news_hash']),
+    ]
 
-    # Step 2: news_hash UNIQUE INDEX
-    try:
-        with engine.connect() as conn:
-            with conn.begin():
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uix_hololive_news_news_hash "
-                    "ON hololive_news (news_hash)"
-                ))
-        logger.info("\u2705 hololive_news.news_hash UNIQUEインデックス OK")
-    except Exception as e:
-        logger.warning(f"\u26a0\ufe0f news_hash インデックス作成スキップ: {e}")
+    for table, columns in targets:
+        for col in columns:
+            # Step 1: NULL行を削除（UNIQUE INDEX作成の妨げになるため）
+            try:
+                with engine.connect() as conn:
+                    with conn.begin():
+                        result = conn.execute(text(
+                            f"DELETE FROM {table} WHERE {col} IS NULL"
+                        ))
+                        deleted = result.rowcount
+                        if deleted > 0:
+                            logger.info(f"\U0001f5d1\ufe0f {table}: {col} NULL行を{deleted}件削除")
+            except Exception as e:
+                logger.warning(f"\u26a0\ufe0f {table}.{col} NULL行削除スキップ: {e}")
 
-    # Step 3: url UNIQUE INDEX
-    try:
-        with engine.connect() as conn:
-            with conn.begin():
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uix_hololive_news_url "
-                    "ON hololive_news (url)"
-                ))
-        logger.info("\u2705 hololive_news.url UNIQUEインデックス OK")
-    except Exception as e:
-        logger.warning(f"\u26a0\ufe0f url インデックス作成スキップ: {e}")
+            # Step 2: UNIQUE INDEX作成
+            try:
+                idx_name = f"uix_{table}_{col}"
+                with engine.connect() as conn:
+                    with conn.begin():
+                        conn.execute(text(
+                            f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} "
+                            f"ON {table} ({col})"
+                        ))
+                logger.info(f"\u2705 {table}.{col} UNIQUEインデックス OK")
+            except Exception as e:
+                logger.warning(f"\u26a0\ufe0f {table}.{col} インデックス作成スキップ: {e}")
 
 
 def setup_stream_processing_schedule():
