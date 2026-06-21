@@ -2988,6 +2988,10 @@ def process_daily_streams():
                 
             except Exception as e:
                 logger.error(f"配信処理エラー: {e}")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
     
     logger.info(f"✅ 日次配信処理完了 ({processed_count}件処理)")
     cleanup_old_stream_reactions()
@@ -5695,6 +5699,16 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
                             lore_blocks.append(f"▼{matched_member.member_name}のファン用語:\n" + " / ".join(lingo_parts))
                     except json.JSONDecodeError:
                         pass
+
+                # 修正: もちこの感想（HolomemFeeling）も注入
+                # Gemini File API経由でしか反映されなかった感想データを
+                # Groqフォールバック時にも反映されるよう internal_context に追加
+                feeling = session_lore.query(HolomemFeeling).filter_by(
+                    member_name=matched_member.member_name
+                ).first()
+                if feeling and feeling.summary_feeling:
+                    feeling_line = f"▼もちこの{matched_member.member_name}への気持ち（推し度{feeling.love_level}/100）:\n{feeling.summary_feeling[:200]}"
+                    lore_blocks.append(feeling_line)
 
                 if lore_blocks:
                     internal_context += f"\n\n【{matched_member.member_name}詳細情報】\n" + "\n\n".join(lore_blocks)
