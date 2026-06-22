@@ -1555,6 +1555,19 @@ class SpecializedNews(Base):
     query_keyword = Column(String(200), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+
+class UserTaughtKnowledge(Base):
+    """ユーザーがURLを貼って『覚えて』と教えた知識を恒久保存するテーブル。
+    SpecializedNews と異なり自動削除しない（教わった記憶は保持する）。"""
+    __tablename__ = 'user_taught_knowledge'
+    id = Column(Integer, primary_key=True)
+    user_uuid = Column(String(100), index=True)
+    source_url = Column(String(1000))
+    title = Column(String(500))
+    content = Column(Text)
+    news_hash = Column(String(100), unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 # ==============================================================================
 # セッション & ユーティリティ
 # ==============================================================================
@@ -4357,6 +4370,109 @@ def get_specialized_news_context(message: str, limit: int = 3) -> str:
         return ''
 
 
+def extract_first_url(message: str):
+    """メッセージから最初のURLを抽出。なければ None。"""
+    if not message:
+        return None
+    m = re.search(r'https?://[^\s|｜　]+', message)
+    return m.group(0) if m else None
+
+
+def fetch_and_remember_url(user_uuid: str, url: str):
+    """URLを読み込み、本文を user_taught_knowledge に恒久保存する（バックグラウンド実行）。"""
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ URL記憶: 取得失敗 HTTP {res.status_code} ({url[:60]})")
+            return
+        try:
+            res.encoding = res.apparent_encoding or res.encoding
+        except Exception:
+            pass
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        title = ''
+        og = soup.find('meta', property='og:title')
+        if og and og.get('content'):
+            title = clean_text(og['content'])
+        if not title and soup.title and soup.title.string:
+            title = clean_text(soup.title.string)
+        if not title:
+            title = url[:200]
+
+        for tag in soup(['script', 'style', 'nav', 'footer', 'header',
+                         'aside', 'form', 'iframe', 'noscript']):
+            tag.decompose()
+        body_elem = (
+            soup.select_one('article') or
+            soup.select_one('main') or
+            soup.select_one('.entry-content') or
+            soup.select_one('.post-content') or
+            soup.body or soup
+        )
+        content = clean_text(body_elem.get_text(separator='\n'))[:1500]
+        if not content:
+            content = title
+
+        news_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(
+                    "INSERT INTO user_taught_knowledge "
+                    "(user_uuid, source_url, title, content, news_hash, created_at) "
+                    "VALUES (:u, :url, :t, :c, :h, :ts) "
+                    "ON CONFLICT (news_hash) DO UPDATE SET "
+                    "title = :t, content = :c, created_at = :ts"
+                ), {
+                    "u": user_uuid, "url": url[:1000], "t": title[:500],
+                    "c": content, "h": news_hash, "ts": datetime.utcnow()
+                })
+        logger.info(f"🧠 URL記憶完了: {title[:40]} ({url[:50]})")
+    except Exception as e:
+        logger.error(f"❌ URL記憶エラー ({url[:50]}): {str(e)[:100]}")
+
+
+def get_taught_knowledge_context(message: str, limit: int = 2) -> str:
+    """user_taught_knowledge から、メッセージに関連する教わった知識を注入用に返す。
+    日本語に対応するため 2-gram で照合する。"""
+    try:
+        with get_db_session() as session:
+            items = session.query(UserTaughtKnowledge).order_by(
+                UserTaughtKnowledge.created_at.desc()
+            ).limit(50).all()
+            if not items:
+                return ''
+            msg = (message or '').lower()
+            grams = set()
+            for i in range(len(msg) - 1):
+                g = msg[i:i + 2].strip()
+                if len(g) == 2:
+                    grams.add(g)
+            if not grams:
+                return ''
+            scored: List[tuple] = []
+            for it in items:
+                hay = ((it.title or '') + ' ' + (it.content or '')).lower()
+                score = sum(1 for g in grams if g in hay)
+                if score > 0:
+                    scored.append((score, it))
+            if not scored:
+                return ''
+            scored.sort(key=lambda x: x[0], reverse=True)
+            relevant = [it for _, it in scored[:limit]]
+            lines = []
+            for it in relevant:
+                line = f"【{it.title}】"
+                if it.content and len(it.content) > 5:
+                    line += f"\n{it.content[:300]}"
+                lines.append(line)
+            return "\n\n【以前あなたが教えてくれた知識】\n" + "\n\n".join(lines)
+    except Exception as e:
+        logger.error(f"taught_knowledge コンテキスト取得エラー: {e}")
+        return ''
+
+
 def cleanup_old_specialized_news():
     """30日以上前のspecialized_newsを削除"""
     try:
@@ -5769,6 +5885,14 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     except Exception as e:
         logger.error(f"Specialized news context injection error: {e}")
 
+    # 2d-2. ★ 追加: ユーザーがURLで教えてくれた知識の注入
+    try:
+        taught_ctx = get_taught_knowledge_context(message)
+        if taught_ctx:
+            internal_context += taught_ctx
+    except Exception as e:
+        logger.error(f"Taught knowledge context injection error: {e}")
+
     # 2e. ★ v33.15-stable2: もちこ自己認識データの注入
     # 「あてぃしの容姿」「もちこってどんな子？」と聞かれた時に答えられるよう
     # システムプロンプトに自己認識を常に薄く注入する
@@ -6012,11 +6136,19 @@ def _generate_with_timeout(
     18秒以内に応答できない場合は「待ってて」メッセージを即返し、
     バックグラウンドで処理を継続してタスクとして保存する。
     """
-    future = background_executor.submit(
-        generate_ai_response_safe,
-        user_data, message, history,
-        session=session
-    )
+    def _run_generation():
+        _bg_sess = Session() if Session is not None else None
+        try:
+            return generate_ai_response_safe(
+                user_data, message, history, session=_bg_sess
+            )
+        finally:
+            if _bg_sess is not None:
+                try:
+                    _bg_sess.close()
+                except Exception:
+                    pass
+    future = background_executor.submit(_run_generation)
     try:
         return future.result(timeout=timeout)
 
@@ -7035,6 +7167,14 @@ def chat_lsl():
             msg = gemini_model_manager.get_status_report() + "\n" + groq_model_manager.get_status_report()
             msg += f"\n🎀 ホロメンDB: {holomem_manager.get_member_count()}名"
             return Response(f"{msg}|", 200)
+
+        # ★ URL記憶: メッセージにURLが含まれていたら裏で読んで覚える（B型: 即返信のみ）
+        _raw_msg_for_url = data.get('message', '') if isinstance(data, dict) else ''
+        _taught_url = extract_first_url(_raw_msg_for_url)
+        if _taught_url:
+            task_executor.submit(fetch_and_remember_url, user_uuid, _taught_url)
+            logger.info(f"🧠 URL記憶リクエスト: {_taught_url[:60]}")
+            return Response("そのURL、あてぃしが読んで覚えとくね！✨ちょっとしたら、その話題で話しかけてみてじゃん！💖|", 200)
 
         ai_text = ""
         is_task_started = False
@@ -8257,7 +8397,7 @@ def fix_postgres_sequences(quiet: bool = False):
         'stream_reactions', 'holomem_feelings',
         'user_interest_logs', 'friend_profiles',
         'secondlife_news', 'anime_info_cache', 'specialized_news',
-        'holomem_lingo', 'live_schedules',
+        'holomem_lingo', 'live_schedules', 'user_taught_knowledge',
         # ★ 修正: 漏れていた6テーブルを追加（DB再作成時のNULL identity key対策）
         'conversation_embeddings', 'conversation_summaries',
         'holomem_pronunciations', 'mochiko_self',
