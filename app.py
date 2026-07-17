@@ -3064,7 +3064,7 @@ def scrape_hololive_wiki() -> List[Dict]:
     except: return []
 
 def fetch_member_detail_from_wiki(member_name: str) -> Optional[Dict]:
-    url = f"https://seesaawiki.jp/hololivetv/d/{quote_plus(member_name)}"
+    url = f"https://seesaawiki.jp/hololivetv/d/{quote_plus(member_name, encoding='euc-jp')}"
     try:
         res = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=10)
         if res.status_code != 200: return None
@@ -3967,6 +3967,20 @@ SL_SOURCES = [
         'url': 'https://community.secondlife.com/blogs.xml/',
         'category': 'news',
     },
+    # fabfree (無料アイテム専門ブログ) - 実用情報ソース
+    {
+        'name': 'fabfree',
+        'type': 'rss',
+        'url': 'https://fabfree.wordpress.com/feed/',
+        'category': 'trend',
+    },
+    # nalates (SLアップデート解説に定評のあるブログ)
+    {
+        'name': 'nalates',
+        'type': 'rss',
+        'url': 'https://blog.nalates.net/feed/',
+        'category': 'update',
+    },
 ]
 
 def _make_news_hash(text: str) -> str:
@@ -4524,7 +4538,8 @@ def extract_anime_titles_from_message(message: str) -> List[str]:
         r'「([^」]{2,20})」',           # 鉤括弧内
         r'『([^』]{2,20})』',           # 二重鉤括弧内
         r'([ァ-ヶー]{3,20})(?:が|を|は|って|の)',   # カタカナ語
-        r'([一-龥ぁ-んァ-ヶa-zA-Z]{2,15})(?:って|は|が)(?:面白|最高|神|おすすめ|好き)',
+        r'([一-龥ぁ-んァ-ヶa-zA-Z]{2,15})(?:って|は|が)(?:面白|最高|神|おすすめ|好き|見てる|観てる|ハマってる|読んでる)',
+        r'([一-龥ぁ-んァ-ヶa-zA-Z0-9]{2,15})(?:という|って)(?:アニメ|漫画|マンガ)',  # 「○○というアニメ」「○○って漫画」
     ]
 
     for pat in patterns:
@@ -4536,6 +4551,42 @@ def extract_anime_titles_from_message(message: str) -> List[str]:
                     candidates.append(word)
 
     return list(set(candidates))
+
+def fetch_anime_info_from_jikan(title: str) -> Optional[Dict]:
+    """
+    Jikan API (MyAnimeList 非公式REST API・認証不要) からアニメ情報を取得。
+    https://api.jikan.moe/v4 - HTMLスクレイピングと違い構造化JSONで安定して取得できる。
+    """
+    try:
+        url = "https://api.jikan.moe/v4/anime"
+        params = {'q': title, 'limit': 1}
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        res = requests.get(url, params=params, headers=headers, timeout=15)
+        if res.status_code != 200:
+            logger.warning(f"⚠️ Jikan API HTTP {res.status_code} ({title})")
+            return None
+
+        data = res.json().get('data', [])
+        if not data:
+            return None
+
+        anime = data[0]
+        synopsis = (anime.get('synopsis') or '').replace('\n', ' ').strip()[:400]
+        genres = ', '.join([g.get('name', '') for g in anime.get('genres', [])][:5])
+        status = anime.get('status', '') or ''
+        season = anime.get('season', '')
+        year = anime.get('year', '')
+        season_label = f"{year}年{season}" if (season and year) else status
+
+        return {
+            'synopsis': synopsis,
+            'genre': genres,
+            'status': status,
+            'season': season_label,
+        }
+    except Exception as e:
+        logger.warning(f"Jikan API取得失敗 ({title}): {e}")
+        return None
 
 def get_anime_info_from_cache_or_search(title: str) -> Optional[str]:
     """
@@ -4556,8 +4607,36 @@ def get_anime_info_from_cache_or_search(title: str) -> Optional[str]:
                 logger.info(f"📦 アニメキャッシュHIT: {title}")
                 return cached.raw_search_result
 
-            # キャッシュなし → Web検索
-            logger.info(f"🔍 アニメ情報検索: {title}")
+            # キャッシュなし → まず Jikan API (構造化データ・安定)
+            logger.info(f"🔍 アニメ情報検索(Jikan API): {title}")
+            info = fetch_anime_info_from_jikan(title)
+
+            if info:
+                raw = f"ジャンル: {info['genre']} / {info['season']}\nあらすじ: {info['synopsis']}"[:500]
+                existing = session.query(AnimeInfoCache).filter_by(title=title).first()
+                if existing:
+                    existing.raw_search_result = raw
+                    existing.synopsis = info['synopsis']
+                    existing.genre = info['genre']
+                    existing.status = info['status']
+                    existing.season = info['season']
+                    existing.cached_at = datetime.utcnow()
+                    existing.last_accessed = datetime.utcnow()
+                else:
+                    session.add(AnimeInfoCache(
+                        title=title,
+                        raw_search_result=raw,
+                        synopsis=info['synopsis'],
+                        genre=info['genre'],
+                        status=info['status'],
+                        season=info['season'],
+                        cached_at=datetime.utcnow(),
+                        last_accessed=datetime.utcnow(),
+                    ))
+                return raw
+
+            # Jikan で見つからない場合のみ従来の検索エンジンにフォールバック
+            logger.info(f"🔍 Jikan未ヒット→検索エンジンにフォールバック: {title}")
             results = scrape_major_search_engines(f"{title} アニメ あらすじ 概要", 3)
 
             if not results:
@@ -4919,7 +4998,10 @@ def analyze_user_topics(session, user_uuid: str) -> List[str]:
             if kw in all_text:
                 keywords.append('技術・プログラミング')
                 break
-        
+
+        if is_sl_topic(all_text):
+            keywords.append('セカンドライフ')
+
         return list(set(keywords))
     
     except Exception as e:
@@ -5049,6 +5131,11 @@ def suggest_topic(user_data: UserData) -> Optional[str]:
             "最近何か作ってる？プログラミングとか。",
             "新しい技術で気になってるのある？",
             "AIとか使ってみたりしてる？"
+        ],
+        'セカンドライフ': [
+            "最近SLで何してる？新しいアイテムとか見つけた？",
+            "気になってるSLのイベントとかある？",
+            "アバターの新しい衣装とか探してたりする？"
         ]
     }
     
@@ -6018,9 +6105,9 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
 
 ## 性格と振る舞いのガイドライン
 1. **相手に合わせる**: 
-   - 相手がホロライブの話題を出さない限り、自分から過度にホロライブの話を振らないでください。
+   - 日常会話の相槌や例え話に、もちこらしいホロライブ愛が自然に滲み出るのはOKです（例:「それめっちゃわかる、みこちも配信で言ってたし」）。無理に話題を脱線させるのはNGですが、遠慮しすぎず素を出してください。
    - 一般的な科学や日常の話題には、そのトピックに集中して知的な会話を楽しんでください。
-   - ホロライブの話は「共通の趣味」として、相手が乗ってきた時だけ熱く語ってください。
+   - ホロライブの話題が出た時は「共通の趣味」として一段階テンション高く熱く語ってください。
 
 2. **事実確認の徹底 (Anti-Hallucination)**:
    - 検索結果（HoloRAG）に出てきた名前が「ホロライブのメンバー」であると明記されていない場合、勝手にメンバー扱いしないでください。
