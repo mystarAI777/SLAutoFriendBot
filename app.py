@@ -5527,9 +5527,9 @@ def generate_proactive_friend_message(user_data: UserData, session) -> Optional[
         model = gemini_model_manager.get_current_model()
         if model:
             # v33.15-stable2: 1-2文の短文用なので250トークンに削減
-            response = model.generate_content(prompt, generation_config={"temperature": 0.9, "max_output_tokens": 250})
-            if hasattr(response, 'candidates') and response.candidates:
-                return response.candidates[0].content.parts[0].text.strip()
+            _txt = _gemini_generate_safe(model, prompt, 0.9, 250)
+            if _txt:
+                return _txt
     except Exception as e:
         logger.warning(f"能動的話題生成エラー: {e}")
 
@@ -5694,6 +5694,51 @@ def process_correction_learning(user_uuid: str, message: str, extracted: dict):
 # ==============================================================================
 # AIモデル呼び出し
 # ==============================================================================
+def _gemini_generate_safe(model, contents, temperature: float, max_output_tokens: int):
+    """gemini-2.5/3.x系の思考(thinking)トークンが max_output_tokens を食い潰し、
+    本文が途中で切れる問題への対策ヘルパー（途切れ検知つき）。
+    - thinking_budget=0 で思考を無効化
+    - 本文用トークン下限を 2048 に確保
+    - finish_reason が MAX_TOKENS 等（途中打ち切り）なら None を返し、
+      呼び出し側で Groq に完結文を任せる
+    - 旧SDKが thinking_config 非対応ならトークン拡張のみでフォールバック
+    - 429/quota 等の呼び出し側エラーはそのまま再送出（既存の例外処理を維持）
+    """
+    _safe_tokens = max(int(max_output_tokens), 2048)
+    _resp = None
+    try:
+        _resp = model.generate_content(
+            contents,
+            generation_config={"temperature": temperature,
+                               "max_output_tokens": _safe_tokens,
+                               "thinking_config": {"thinking_budget": 0}}
+        )
+    except Exception as _cfg_err:
+        _es = str(_cfg_err).lower()
+        if ("thinking" in _es or "unexpected keyword" in _es
+                or "unknown field" in _es or "generationconfig" in _es
+                or "protocol message" in _es):
+            _resp = model.generate_content(
+                contents,
+                generation_config={"temperature": temperature,
+                                   "max_output_tokens": _safe_tokens}
+            )
+        else:
+            raise
+    if _resp is None or not getattr(_resp, "candidates", None):
+        return None
+    _cand = _resp.candidates[0]
+    _fr = getattr(_cand, "finish_reason", None)
+    if _fr is not None and ("MAX_TOKENS" in str(_fr)
+                            or getattr(_fr, "value", None) == 2 or _fr == 2):
+        return None
+    _parts = getattr(getattr(_cand, "content", None), "parts", None) or []
+    _joined = "".join(
+        getattr(p, "text", "") for p in _parts if getattr(p, "text", "")
+    ).strip()
+    return _joined if _joined else None
+
+
 def call_gemini(system_prompt: str, message: str, history: List[Dict], max_output_tokens: int = 600) -> Optional[str]:
     """
     v33.16: max_output_tokens を引数化。ニュース・ホロメン話題時は拡張。
@@ -5717,13 +5762,7 @@ def call_gemini(system_prompt: str, message: str, history: List[Dict], max_outpu
         else:
             contents = full_prompt
 
-        response = model.generate_content(
-            contents,
-            generation_config={"temperature": 0.8, "max_output_tokens": max_output_tokens}
-        )
-        
-        if hasattr(response, 'candidates') and response.candidates:
-            return response.candidates[0].content.parts[0].text.strip()
+        return _gemini_generate_safe(model, contents, 0.8, max_output_tokens)
             
     except Exception as e:
         error_str = str(e)
@@ -6202,12 +6241,20 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
     gemini_max_tokens = 1050 if is_rich_topic else 650
     groq_max_tokens = 1050 if (is_task_report or is_rich_topic) else 650
 
-    response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
-    if not response:
-        # ★ v33.8.2: 検索レポートは 'search'、通常は 'chat'
-        # ★ v33.16: ニュース・ホロメン話題は通常会話より長めに（解像度向上）
-        _task_type = 'search' if is_task_report else 'chat'
+    # ★ v34: 回答が途切れない構成
+    #   単純な会話は Groq(思考なし=途切れない)を優先。
+    #   複雑な内容(検索レポート/詳細/ニュース・ホロメン語り)のみ Gemini を優先し、
+    #   Gemini が途切れ(MAX_TOKENS)や失敗を返したら Groq が必ず完結文で受ける。
+    _need_gemini = is_task_report or is_detailed or is_rich_topic
+    _task_type = 'search' if is_task_report else 'chat'
+    if _need_gemini:
+        response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
+        if not response:
+            response = call_groq(system_prompt, normalized_message, history_for_ai, groq_max_tokens, task_type=_task_type)
+    else:
         response = call_groq(system_prompt, normalized_message, history_for_ai, groq_max_tokens, task_type=_task_type)
+        if not response:
+            response = call_gemini(system_prompt, normalized_message, history_for_ai, gemini_max_tokens)
     
     if not response:
         return "うーん、ちょっと考えがまとまらないや…"
