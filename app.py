@@ -170,11 +170,8 @@ GEMINI_MODELS = [
 # 参考: https://console.groq.com/docs/models
 # ==========================================
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",              # 汎用メイン: 日本語・推論・コードのバランス最強
-    "llama-4-maverick-17b-128e-instruct",   # Llama4最新: 128k超長文コンテキスト対応・高速
-    "compound-beta",                        # 複合推論特化: RAG・マルチステップ検索に最適
-    "llama-3.1-8b-instant",                 # 超高速軽量: 日常チャット・短文応答の常用
-    "deepseek-r1-distill-llama-70b",        # 推論特化フォールバック (上記が全滅した場合)
+    "openai/gpt-oss-120b",   # メイン
+    "openai/gpt-oss-20b",    # 高速フォールバック
 ]
 
 # 用途別モデル選択マップ (v33.16 再設計)
@@ -187,15 +184,9 @@ GROQ_MODELS = [
 #       150文字以内の制約や「あてぃし」口調の維持に失敗しやすい。
 #       会話用途では最終フォールバックに格下げ。
 GROQ_TASK_MODELS = {
-    'chat':     ['llama-3.3-70b-versatile',
-                 'llama-4-maverick-17b-128e-instruct',
-                 'llama-3.1-8b-instant'],
-    'search':   ['llama-4-maverick-17b-128e-instruct',
-                 'compound-beta',
-                 'llama-3.3-70b-versatile'],
-    'analysis': ['llama-3.3-70b-versatile',
-                 'deepseek-r1-distill-llama-70b',
-                 'llama-4-maverick-17b-128e-instruct'],
+    'chat':     ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    'search':   ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    'analysis': ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
     'default':  GROQ_MODELS,
 }
 
