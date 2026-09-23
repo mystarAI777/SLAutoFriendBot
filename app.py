@@ -5711,7 +5711,8 @@ def _gemini_generate_safe(model, contents, temperature: float, max_output_tokens
             contents,
             generation_config={"temperature": temperature,
                                "max_output_tokens": _safe_tokens,
-                               "thinking_config": {"thinking_budget": 0}}
+                               "thinking_config": {"thinking_budget": 0}},
+            request_options={"timeout": 10, "retry": None}
         )
     except Exception as _cfg_err:
         _es = str(_cfg_err).lower()
@@ -5721,7 +5722,8 @@ def _gemini_generate_safe(model, contents, temperature: float, max_output_tokens
             _resp = model.generate_content(
                 contents,
                 generation_config={"temperature": temperature,
-                                   "max_output_tokens": _safe_tokens}
+                                   "max_output_tokens": _safe_tokens},
+                request_options={"timeout": 10, "retry": None}
             )
         else:
             raise
@@ -6321,7 +6323,7 @@ def _generate_with_timeout(
                         completed_at=datetime.utcnow()
                     ))
             except Exception as e:
-                logger.error(f"タイムアウト回復エラー: {e}")
+                logger.error(f"タイムアウト回復エラー: {type(e).__name__}: {e}")
 
         background_executor.submit(_save_when_done)
         return "ごめん、ちょっと考えるのに時間かかってるみたい！少しだけ待ってからもう一度話しかけてみて！"
