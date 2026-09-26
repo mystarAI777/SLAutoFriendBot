@@ -13,9 +13,8 @@ services:
     # 環境変数はここで一元管理
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: mochiko-db # あなたのデータベース名に合わせてください
-          property: connectionString
+        # Neon (ap-southeast-1) へ移行済み。値は Render ダッシュボードで設定 (DATABASE_URL_UNPOOLED の直結URL)
+        sync: false
       
       # sync: false を使う代わりに、RenderのUI（Environment > Secret Files）で
       # 以下のキーが設定されていることを確認してください。

@@ -2939,6 +2939,7 @@ def process_daily_streams():
                     pass
                 if not detected_member:
                     continue
+                detected_member = canonical_holomem_name(detected_member) or detected_member  # ★ v34.3
 
                 logger.info(f"📺 処理中: {detected_member} - {title[:30]}...")
                 
@@ -3007,6 +3008,7 @@ def process_daily_streams():
 def get_mochiko_memory_context(member_name: str) -> str:
     """もちこの記憶 (要約版) をコンテキストとして取得"""
     context = ""
+    member_name = canonical_holomem_name(member_name) or member_name  # ★ v34.3
     
     try:
         with get_db_session() as session:
@@ -3887,7 +3889,8 @@ def fetch_hololive_schedule():
                             added += 1
 
                         # ★ v33.16: 日本語名が取れたら HolomemWiki に未登録なら自動追加
-                        if japanese_name and len(japanese_name) >= 2:
+                        # ★ v34.3: 公式サイトのJPメンバーのみ追加 (他社・断片名の混入防止)
+                        if japanese_name and len(japanese_name) >= 2 and japanese_name in get_official_jp_names():
                             wiki_existing = session.query(HolomemWiki).filter_by(member_name=japanese_name).first()
                             if not wiki_existing:
                                 session.add(HolomemWiki(
@@ -4740,6 +4743,10 @@ X_EPISODE_LIMIT_PER_MEMBER = 20
 X_CACHE_RETENTION_DAYS = 7
 X_CACHE_PROMOTE_COUNT = 2
 X_GAP_SEARCH_COOLDOWN_SEC = 600
+X_GROQ_BATCH_MEMBERS = 5        # ★ v34.3: 1回のLLM呼び出しで要約するメンバー数
+X_GROQ_INTERVAL_SEC = 60        # ★ v34.3: Groq無料枠 (8,000 TPM) を超えないための呼び出し間隔
+X_POSTS_PER_MEMBER = 6
+X_POST_CHARS = 120
 
 # 現役メンバーの公式Xアカウント (本垢)
 HOLOMEM_X_HANDLES: Dict[str, str] = {
@@ -4838,6 +4845,13 @@ def ensure_x_memory_tables():
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS ix_holomem_x_memory_member ON holomem_x_memory (member_name, kind)"
                 ))
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS holomem_x_handles ("
+                    " member_name VARCHAR(100) PRIMARY KEY,"
+                    " handle VARCHAR(100) NOT NULL,"
+                    " source VARCHAR(20) DEFAULT 'official',"
+                    " updated_at TIMESTAMP DEFAULT NOW())"
+                ))
         _x_tables_ready = True
         logger.info("✅ X記憶テーブル準備完了 (holomem_x_posts / holomem_x_memory)")
     except Exception as e:
@@ -4845,19 +4859,12 @@ def ensure_x_memory_tables():
 
 
 def resolve_holomem_canonical(detected: str) -> Optional[str]:
-    """検出キーワード(愛称含む)を HOLOMEM_X_HANDLES の正式名に解決"""
+    """検出キーワード(愛称含む)をX取得対象メンバーの正式名に解決"""
     if not detected:
         return None
-    if detected in HOLOMEM_X_HANDLES:
-        return detected
-    try:
-        with holomem_manager._lock:
-            for name, kws in holomem_manager._keywords.items():
-                if detected in kws and name in HOLOMEM_X_HANDLES:
-                    return name
-    except Exception:
-        pass
-    return None
+    handles = get_holomem_x_handles()
+    name = canonical_holomem_name(detected) or detected
+    return name if name in handles else None
 
 
 def _x_extract_topic_tokens(message: str, member_name: str) -> List[str]:
@@ -4913,7 +4920,7 @@ def fetch_holomem_x_posts():
         logger.warning(f"X取得: 在籍状況取得失敗 {e}")
 
     saved = 0
-    for member_name, handle in HOLOMEM_X_HANDLES.items():
+    for member_name, handle in get_holomem_x_handles().items():
         if member_name in retired:
             continue
         try:
@@ -4984,44 +4991,77 @@ def fetch_holomem_x_posts():
         logger.error(f"❌ X投稿クリーンアップエラー: {e}")
 
 
-def _x_summarize_member_posts(member_name: str, posts: List) -> Optional[List[Dict]]:
-    """未処理のX投稿からもちこのエピソード記憶を生成 (Groq gpt-oss-20b)"""
-    lines = []
-    for p in posts[:15]:
-        jst = p.posted_at + timedelta(hours=9)
-        lines.append(f"- ({jst.strftime('%m/%d %H:%M')}) {(p.body or '')[:280]}")
-    prompt = f"""あなたは「もちこ」というホロライブ大好きなギャルのホロリスです。
-以下は{member_name}の直近のX(旧Twitter)投稿です。
+def _x_call_groq_light(prompt: str, max_tokens: int = 1200) -> Optional[str]:
+    """X記憶専用のGroq呼び出し (gpt-oss-20b優先・推論low)。失敗時 None"""
+    if not groq_client:
+        return None
+    for model in groq_model_manager.get_models_for_task('x_summary'):
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=max_tokens,
+                extra_body={"reasoning_effort": "low"},
+            )
+            return (resp.choices[0].message.content or '').strip()
+        except Exception as e:
+            err = str(e)
+            if "Rate limit" in err or "429" in err:
+                groq_model_manager.mark_limited(model, 5)
+            logger.warning(f"⚠️ X記憶Groqエラー ({model}): {err[:80]}")
+    return None
 
-{chr(10).join(lines)}
+
+def _x_summarize_batch(batch: Dict[str, List]) -> Optional[Dict[str, List[Dict]]]:
+    """複数メンバーの未処理X投稿を1回のLLM呼び出しでエピソード化。LLM失敗時 None"""
+    blocks = []
+    for member_name, posts in batch.items():
+        lines = []
+        for p in posts[-X_POSTS_PER_MEMBER:]:
+            jst = p.posted_at + timedelta(hours=9)
+            lines.append(f"- ({jst.strftime('%m/%d')}) {(p.body or '')[:X_POST_CHARS]}")
+        blocks.append(f"■{member_name}\n" + "\n".join(lines))
+    prompt = f"""あなたは「もちこ」というホロライブ大好きなギャルのホロリスです。
+以下はホロメンの直近のX(旧Twitter)投稿です。
+
+{chr(10).join(blocks)}
 
 【タスク】
-ホロリスとして記憶に残すべき出来事だけを最大3件、エピソードにしてください。
+メンバーごとに、ホロリスとして記憶に残すべき出来事だけを最大2件エピソードにしてください。
 - 配信告知だけの投稿、定型のおはよう・おやすみ、宣伝の繰り返しは無視する
 - 日常の出来事、感想、記念日、重大な発表、面白い話題を優先
-- 該当がなければ空配列 [] を返す
+- 該当がないメンバーは空配列
 
-【出力形式】JSON配列のみ (前置き・コードブロック禁止)
-[{{"episode": "何があったか(客観的に80文字以内)", "feeling": "もちこの感想(一人称あてぃし・ギャル口調・60文字以内)", "importance": 1〜5の整数, "date": "MM/DD"}}]
+【出力形式】JSONオブジェクトのみ (前置き・コードブロック禁止)
+{{"メンバー名": [{{"episode": "何があったか(客観的に80文字以内)", "feeling": "もちこの感想(一人称あてぃし・ギャル口調・50文字以内)", "importance": 1〜5の整数}}]}}
 """
-    raw = call_groq(prompt, "JSONで出力して", [], 1500, task_type='x_summary')
+    raw = _x_call_groq_light(prompt, 1200)
     if raw is None:
-        return None  # LLM失敗時は未処理のまま残して次回再試行
-    items = _x_parse_json_array(raw)
-    out = []
-    for it in items[:3]:
-        ep = str(it.get('episode') or '').strip()
-        if not ep:
-            continue
-        try:
-            imp = max(1, min(5, int(it.get('importance') or 3)))
-        except Exception:
-            imp = 3
-        out.append({
-            'episode': ep[:380],
-            'feeling': str(it.get('feeling') or '').strip()[:190],
-            'importance': imp,
-        })
+        return None
+    data = {}
+    try:
+        st, en = raw.find('{'), raw.rfind('}')
+        if st >= 0 and en > st:
+            data = json.loads(raw[st:en + 1])
+    except Exception:
+        data = {}
+    out: Dict[str, List[Dict]] = {}
+    for member_name in batch:
+        items = data.get(member_name) if isinstance(data, dict) else None
+        eps = []
+        for it in (items or [])[:2]:
+            if not isinstance(it, dict):
+                continue
+            ep = str(it.get('episode') or '').strip()
+            if not ep:
+                continue
+            try:
+                imp = max(1, min(5, int(it.get('importance') or 3)))
+            except Exception:
+                imp = 3
+            eps.append({'episode': ep[:380], 'feeling': str(it.get('feeling') or '').strip()[:190], 'importance': imp})
+        out[member_name] = eps
     return out
 
 
@@ -5050,7 +5090,7 @@ def _x_fold_into_feeling(member_name: str, overflow: List) -> bool:
 - 300文字以内、要約本文だけ出力
 - 具体的な思い出は代表的なものを1〜2個だけ残し、全体の印象と推しポイントを中心に
 """
-        merged = call_groq(prompt, "要約して", [], 1500, task_type='x_summary')
+        merged = _x_call_groq_light(prompt, 900)
         if not merged:
             return False
         merged = merged.strip()[:390]
@@ -5086,37 +5126,44 @@ def summarize_holomem_x_memory():
         return
 
     made = 0
-    for member_name in members:
+    handles = get_holomem_x_handles()
+    for i in range(0, len(members), X_GROQ_BATCH_MEMBERS):
+        chunk = members[i:i + X_GROQ_BATCH_MEMBERS]
         try:
+            batch = {}
             with engine.connect() as conn:
-                posts = conn.execute(text(
-                    "SELECT post_id, body, posted_at FROM holomem_x_posts "
-                    "WHERE member_name = :m AND processed = FALSE ORDER BY posted_at ASC"
-                ), {"m": member_name}).fetchall()
-            if not posts:
+                for member_name in chunk:
+                    posts = conn.execute(text(
+                        "SELECT post_id, body, posted_at FROM holomem_x_posts "
+                        "WHERE member_name = :m AND processed = FALSE ORDER BY posted_at ASC"
+                    ), {"m": member_name}).fetchall()
+                    if posts:
+                        batch[member_name] = posts
+            if not batch:
                 continue
-            episodes = _x_summarize_member_posts(member_name, posts)
-            if episodes is None:
+            if i > 0:
+                time.sleep(X_GROQ_INTERVAL_SEC)
+            result = _x_summarize_batch(batch)
+            if result is None:
+                logger.warning(f"⚠️ X要約: LLM失敗のため {list(batch.keys())} は次回再試行")
                 continue
-            last_post = posts[-1]
             with engine.connect() as conn:
                 with conn.begin():
-                    for ep in episodes:
+                    for member_name, posts in batch.items():
+                        for ep in result.get(member_name, []):
+                            conn.execute(text(
+                                "INSERT INTO holomem_x_memory (member_name, kind, episode, feeling, importance, source, source_url, event_date) "
+                                "VALUES (:m, 'episode', :e, :f, :i, 'x', :u, :d)"
+                            ), {"m": member_name, "e": ep['episode'], "f": ep['feeling'],
+                                "i": ep['importance'], "u": f"https://x.com/{handles.get(member_name, '')}",
+                                "d": posts[-1].posted_at})
+                            made += 1
                         conn.execute(text(
-                            "INSERT INTO holomem_x_memory (member_name, kind, episode, feeling, importance, source, source_url, event_date) "
-                            "VALUES (:m, 'episode', :e, :f, :i, 'x', :u, :d)"
-                        ), {"m": member_name, "e": ep['episode'], "f": ep['feeling'],
-                            "i": ep['importance'], "u": f"https://x.com/{HOLOMEM_X_HANDLES.get(member_name, '')}",
-                            "d": last_post.posted_at})
-                    conn.execute(text(
-                        "UPDATE holomem_x_posts SET processed = TRUE WHERE member_name = :m AND processed = FALSE"
-                    ), {"m": member_name})
-            made += len(episodes)
-            logger.info(f"✅ {member_name}: X投稿{len(posts)}件 → エピソード{len(episodes)}件")
-            time.sleep(4)
+                            "UPDATE holomem_x_posts SET processed = TRUE WHERE member_name = :m AND processed = FALSE"
+                        ), {"m": member_name})
+            logger.info(f"✅ X要約: {', '.join(f'{m}:{len(result.get(m, []))}件' for m in batch)}")
         except Exception as e:
-            logger.warning(f"⚠️ X要約エラー {member_name}: {e}")
-            time.sleep(4)
+            logger.warning(f"⚠️ X要約エラー {chunk}: {e}")
 
     # 上限超過分を長期記憶へ畳み込み
     try:
@@ -5140,7 +5187,7 @@ def summarize_holomem_x_memory():
                         for oid in ids:
                             conn.execute(text("DELETE FROM holomem_x_memory WHERE id = :i"), {"i": oid})
                 logger.info(f"🧠 {member_name}: 古いエピソード{len(ids)}件を気持ちの要約へ畳み込み")
-                time.sleep(4)
+            time.sleep(X_GROQ_INTERVAL_SEC)
     except Exception as e:
         logger.error(f"❌ X記憶の畳み込みエラー: {e}")
 
@@ -5166,7 +5213,7 @@ def get_x_memory_context(detected_name: str, message: str) -> str:
                 "ORDER BY importance DESC, COALESCE(event_date, created_at) DESC LIMIT 5"
             ), {"m": member_name}).fetchall()
             caches = conn.execute(text(
-                "SELECT id, kind, episode, keywords, mention_count FROM holomem_x_memory "
+                "SELECT id, kind, episode, keywords, mention_count, source FROM holomem_x_memory "
                 "WHERE member_name = :m AND keywords IS NOT NULL AND keywords <> ''"
             ), {"m": member_name}).fetchall()
 
@@ -5191,7 +5238,8 @@ def get_x_memory_context(detected_name: str, message: str) -> str:
             for c in caches:
                 kws = [k for k in (c.keywords or '').split(',') if k]
                 if any(t in kws for t in tokens):
-                    hit_lines.append(f"- {c.episode[:200]}")
+                    label = "(ユーザーから聞いた話・未確認)" if c.source == 'user' else ""
+                    hit_lines.append(f"- {label}{c.episode[:200]}")
                     new_count = int(c.mention_count or 0) + 1
                     with engine.connect() as conn:
                         with conn.begin():
@@ -5322,9 +5370,308 @@ def maybe_start_holomem_gap_search(session, user_data: UserData, message: str) -
         return None
 
 
+# ==============================================================================
+# ★ v34.3: 公式サイトによる在籍確認・名前の正規化・会話での指摘/呼び方変更
+# ==============================================================================
+OFFICIAL_TALENTS_BASE = "https://hololive.hololivepro.com/talents"
+# 公式サイトのグループ(gp)とDB上の generation 表記の対応 (ホロライブJP + DEV_IS)
+OFFICIAL_JP_GROUPS: List[Tuple[str, str]] = [
+    ('gen-0', '0期生'), ('1stgen', '1期生'), ('gen-2', '2期生'), ('gamers', 'ゲーマーズ'),
+    ('gen-3', '3期生'), ('gen-4', '4期生'), ('gen-5', '5期生'), ('holox', '6期生'),
+    ('regloss', 'ReGLOSS'), ('flow-glow', 'FLOW GLOW'), ('asobi-mawari-tai', 'アソビ★まわり隊！'),
+]
+OFFICIAL_STATUS_PREFIX = {'卒業生': '卒業', '配信活動終了': '配信活動終了', '退職': '退職'}
+OFFICIAL_CACHE_TTL_SEC = 6 * 3600
+_X_CORPORATE_HANDLES = {'hololivetv', 'hololive_en', 'hololive_id', 'cover_corp', 'tanigox',
+                        'hololive_dev_is', 'hololivepro', 'holostarstv', 'holo_staff'}
+
+_official_cache: Dict[str, Any] = {'ts': 0.0, 'jp': {}, 'status': {}, 'slug': {}}
+_official_lock = Lock()
+_wiki_names_cache: Dict[str, Any] = {'ts': 0.0, 'names': set()}
+_x_handles_cache: Dict[str, Any] = {'ts': 0.0, 'map': {}}
+
+
+def _parse_official_talent_list(html: str) -> List[Tuple[str, str, str]]:
+    """公式タレント一覧HTML → [(slug, 名前, ステータス)]"""
+    out = []
+    for m in re.finditer(r'href="https://hololive\.hololivepro\.com/talents/([a-z0-9\-]+)/"\s*>.*?<h3>\s*(.*?)<span>',
+                         html, re.S):
+        slug = m.group(1)
+        raw = clean_text(m.group(2))
+        status = '現役'
+        pm = re.match(r'【([^】]+)】\s*(.+)', raw)
+        if pm:
+            status = OFFICIAL_STATUS_PREFIX.get(pm.group(1), pm.group(1))
+            raw = pm.group(2).strip()
+        if raw:
+            out.append((slug, raw, status))
+    return out
+
+
+def fetch_official_talents(force: bool = False) -> Optional[Dict[str, Any]]:
+    """公式サイトから JP メンバーの所属・ステータスを取得 (6時間キャッシュ)。失敗時 None"""
+    with _official_lock:
+        if not force and _official_cache['jp'] and time.time() - _official_cache['ts'] < OFFICIAL_CACHE_TTL_SEC:
+            return _official_cache
+    headers = {'User-Agent': random.choice(USER_AGENTS), 'Accept-Language': 'ja,en;q=0.8'}
+    jp: Dict[str, str] = {}
+    status: Dict[str, str] = {}
+    slug: Dict[str, str] = {}
+    try:
+        for gp, gen in OFFICIAL_JP_GROUPS:
+            res = requests.get(OFFICIAL_TALENTS_BASE, params={'gp': gp}, headers=headers, timeout=15)
+            res.raise_for_status()
+            for s, name, st in _parse_official_talent_list(res.text):
+                jp.setdefault(name, gen)
+                status[name] = st
+                slug[name] = s
+            time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"⚠️ 公式タレント一覧の取得失敗: {e}")
+        return None
+    if len(jp) < 20:
+        logger.warning(f"⚠️ 公式タレント一覧の解析結果が少なすぎます ({len(jp)}名) - 構造変更の可能性")
+        return None
+    with _official_lock:
+        _official_cache.update({'ts': time.time(), 'jp': jp, 'status': status, 'slug': slug})
+        return _official_cache
+
+
+def get_official_jp_names() -> set:
+    """公式サイト上のJPメンバー名 (現役・卒業含む)。取得できなければ空集合"""
+    data = fetch_official_talents()
+    return set(data['jp'].keys()) if data else set()
+
+
+def _get_wiki_names() -> set:
+    if time.time() - _wiki_names_cache['ts'] < 600 and _wiki_names_cache['names']:
+        return _wiki_names_cache['names']
+    try:
+        with get_db_session() as session:
+            names = {w.member_name for w in session.query(HolomemWiki.member_name).all()}
+        _wiki_names_cache.update({'ts': time.time(), 'names': names})
+    except Exception as e:
+        logger.debug(f"wiki名取得エラー: {e}")
+    return _wiki_names_cache['names']
+
+
+def canonical_holomem_name(name: str) -> Optional[str]:
+    """愛称・チャンネル名 (例: 'Su Ch. 水宮枢 - FLOW GLOW', 'ぺこら') を holomem_wiki の正式名に解決"""
+    if not name:
+        return None
+    name = name.strip()
+    wiki = _get_wiki_names()
+    if name in wiki:
+        return name
+    try:
+        with holomem_manager._lock:
+            kw_items = list(holomem_manager._keywords.items())
+    except Exception:
+        kw_items = []
+    for k, kws in kw_items:
+        if k in wiki and name in kws:
+            return k
+    for w in sorted(wiki, key=len, reverse=True):
+        if len(w) >= 2 and w in name:
+            return w
+    try:
+        jp_name, _grp = extract_japanese_name_from_channel(name)
+    except Exception:
+        jp_name = None
+    if jp_name and jp_name != name:
+        return canonical_holomem_name(jp_name)
+    for k, kws in kw_items:
+        if k in wiki and any(len(a) >= 3 and a in name for a in kws):
+            return k
+    return None
+
+
+def _fetch_x_handle_from_official(slug: str) -> Optional[str]:
+    try:
+        res = requests.get(f"{OFFICIAL_TALENTS_BASE}/{slug}/",
+                           headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+        if res.status_code != 200:
+            return None
+        for h in re.findall(r'href="https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{2,15})/?"', res.text):
+            if h.lower() not in _X_CORPORATE_HANDLES:
+                return h
+    except Exception as e:
+        logger.debug(f"Xハンドル取得失敗 ({slug}): {e}")
+    return None
+
+
+def get_holomem_x_handles() -> Dict[str, str]:
+    """X取得対象 {正式名: ハンドル}。公式サイト由来(DB)を優先し、無いものは内蔵リストで補完"""
+    if time.time() - _x_handles_cache['ts'] < 600 and _x_handles_cache['map']:
+        return _x_handles_cache['map']
+    merged = dict(HOLOMEM_X_HANDLES)
+    try:
+        if engine is not None:
+            with engine.connect() as conn:
+                for m, h in conn.execute(text("SELECT member_name, handle FROM holomem_x_handles")).fetchall():
+                    merged[m] = h
+    except Exception as e:
+        logger.debug(f"Xハンドル表の読込失敗: {e}")
+    _x_handles_cache.update({'ts': time.time(), 'map': merged})
+    return merged
+
+
+def sync_holomem_status_from_official():
+    """1日1回: 公式サイトを正として holomem_wiki の在籍状況を更新し、新メンバー追加・Xハンドルを補完"""
+    ensure_x_memory_tables()
+    data = fetch_official_talents(force=True)
+    if not data:
+        raise RuntimeError("公式タレント一覧を取得できませんでした")
+    updated, added = [], []
+    with get_db_session() as session:
+        rows = {w.member_name: w for w in session.query(HolomemWiki).all()}
+        for name, st in data['status'].items():
+            if st == '退職':
+                continue
+            w = rows.get(name)
+            if w is None:
+                if st == '現役':
+                    session.add(HolomemWiki(member_name=name, generation=data['jp'].get(name), tags=name,
+                                            status='現役', last_updated=datetime.utcnow()))
+                    added.append(name)
+                continue
+            if w.status != st:
+                updated.append(f"{name}: {w.status}→{st}")
+                w.status = st
+                w.last_updated = datetime.utcnow()
+            if not w.generation and data['jp'].get(name):
+                w.generation = data['jp'][name]
+    # Xハンドル補完 (公式ページのリンクから取得、1回最大50件)
+    handles = get_holomem_x_handles()
+    try:
+        with engine.connect() as conn:
+            official_rows = {m for (m,) in conn.execute(text(
+                "SELECT member_name FROM holomem_x_handles WHERE source = 'official'")).fetchall()}
+    except Exception:
+        official_rows = set()
+    fetched = 0
+    for name, st in data['status'].items():
+        if st != '現役' or name in official_rows or fetched >= 50:
+            continue
+        h = _fetch_x_handle_from_official(data['slug'].get(name, ''))
+        fetched += 1
+        if h:
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(
+                        "INSERT INTO holomem_x_handles (member_name, handle, source, updated_at) "
+                        "VALUES (:m, :h, 'official', NOW()) "
+                        "ON CONFLICT (member_name) DO UPDATE SET handle = EXCLUDED.handle, source = 'official', updated_at = NOW()"
+                    ), {"m": name, "h": h})
+            if handles.get(name) and handles.get(name).lower() != h.lower():
+                logger.info(f"🔁 Xハンドル訂正: {name} @{handles.get(name)} → @{h}")
+        time.sleep(1)
+    _x_handles_cache['ts'] = 0.0
+    _wiki_names_cache['ts'] = 0.0
+    clear_holomem_cache()
+    holomem_manager.load_from_db(force=True)
+    logger.info(f"✅ 公式在籍同期: 状態変更{len(updated)}件 {updated} / 新規{len(added)}件 {added} / Xハンドル確認{fetched}件")
+
+
+# ---- 会話での呼び方変更 ------------------------------------------------------
+_NICKNAME_CHANGE_PATTERNS = [
+    r'(?:これから|今度から|次から)?(?:は)?(?:俺|おれ|私|わたし|僕|ぼく|あたし|うち|自分)?(?:の(?:こと)?)?(?:は|を)?\s*[「『]?([^\s「」『』、。,.!?！？]{1,20}?)[」』]?\s*(?:って|と)\s*呼んで',
+    r'呼び方(?:は|を)\s*[「『]?([^\s「」『』、。,.!?！？]{1,20}?)[」』]?\s*(?:に|で)\s*(?:して|変えて|変更して)',
+]
+
+
+def detect_nickname_change_request(message: str) -> Optional[str]:
+    """「○○って呼んで」「呼び方を○○にして」から新しい呼び方を取り出す"""
+    msg = (message or '').strip()
+    if '呼' not in msg:
+        return None
+    for pat in _NICKNAME_CHANGE_PATTERNS:
+        m = re.search(pat, msg)
+        if not m:
+            continue
+        nick = m.group(1).strip()
+        if not nick or 'もちこ' in nick or nick in ('俺', '私', '僕', 'あたし', 'うち', '自分'):
+            return None
+        try:
+            if canonical_holomem_name(nick) or holomem_manager.detect_in_message(nick):
+                return None  # ホロメンの呼び方の話はユーザーの呼び方変更ではない
+        except Exception:
+            pass
+        return nick[:30]
+    return None
+
+
+# ---- ホロメン情報の指摘 (卒業・活動終了など) ----------------------------------
+_GRADUATION_CLAIM_RE = re.compile(
+    r'(?:卒業|引退|活動終了|契約解除)(?:した|しちゃ|決ま|決定|発表|済|になっ|してる|だよ|だって|なんだ)|(?:辞め|やめ)(?:た|ちゃ)')
+_GRADUATION_NEGATIVE_RE = re.compile(r'しない|しなかった|しません|してない|ないで|嘘|うそ|デマ')
+
+
+def handle_holomem_claim(message: str, user_uuid: str) -> Optional[str]:
+    """
+    ユーザーの「○○は卒業したよ」等を公式サイトで確認してDBを更新する。
+    それ以外のホロメン情報の指摘は「未確認のユーザー情報」として記憶する。
+    返り値: もちこの即答 (特別な返答が不要なら None)
+    """
+    try:
+        if _x_is_question_like(message):
+            return None
+        detected = holomem_manager.detect_all_in_message(knowledge_base.normalize_query(message), limit=1)
+        if not detected:
+            return None
+        member = canonical_holomem_name(detected[0])
+        if not member:
+            return None
+
+        if _GRADUATION_CLAIM_RE.search(message) and not _GRADUATION_NEGATIVE_RE.search(message):
+            data = fetch_official_talents(force=time.time() - _official_cache['ts'] > 600)
+            if not data or member not in data['status']:
+                return None
+            official = data['status'][member]
+            with get_db_session() as session:
+                w = session.query(HolomemWiki).filter_by(member_name=member).first()
+                current = w.status if w else None
+                if official != '現役' and w and current != official:
+                    w.status = official
+                    w.last_updated = datetime.utcnow()
+                session.add(LearningLog(
+                    user_uuid=user_uuid, user_message=message[:600],
+                    extracted=json.dumps({'subject': member, 'predicate': 'status'}, ensure_ascii=False),
+                    fact_check_score=100 if official != '現役' else 0,
+                    fact_check_evidence=json.dumps([f"公式サイト: {member} = {official}"], ensure_ascii=False),
+                    action_taken='auto_written' if (official != '現役' and current != official) else 'rejected',
+                    db_changes=json.dumps([f"HolomemWiki.status: {current} → {official}"], ensure_ascii=False)
+                    if (official != '現役' and current != official) else None,
+                ))
+            clear_holomem_cache(member)
+            if official == '現役':
+                return (f"え、公式サイトだと{member}はまだ現役のままみたいだよ？"
+                        f"発表されたばっかりなら、反映されたらあてぃしも覚え直すね！")
+            if current != official:
+                return f"ほんとだ…公式でも{member}は「{official}」になってた。教えてくれてありがと、ちゃんと覚えとくね😢"
+            return None
+
+        correction = detect_correction_intent(message)
+        if correction and _x_tables_ready:
+            tokens = _x_extract_topic_tokens(message, member)
+            if not tokens:
+                return None  # 話題キーワードが取れない指摘は照合に使えないので記憶しない
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(
+                        "INSERT INTO holomem_x_memory (member_name, kind, episode, keywords, importance, source, mention_count) "
+                        "VALUES (:m, 'cache', :e, :k, 1, 'user', 0)"
+                    ), {"m": member, "e": message[:390], "k": ','.join(tokens)[:290]})
+            logger.info(f"📝 ユーザー情報を未確認として記憶: {member} {tokens}")
+    except Exception as e:
+        logger.warning(f"⚠️ ホロメン指摘処理エラー: {e}")
+    return None
+
+
 def wrapped_holomem_update():
     """ホロメンDB更新タスク (run_managed_task から呼ばれる)"""
-    update_holomem_database()
+    # ★ v34.3: seesaawiki取得はRenderから失敗し続けていたため、公式サイトを正とする同期に置換
+    sync_holomem_status_from_official()
 
 # ==============================================================================
 # ★ v33.5.0: Render スリープ対策 - 全スケジュールを「経過時間チェック」方式に統一
@@ -7987,6 +8334,16 @@ def chat_lsl():
                         ai_text = f"{nickname_input}ね！了解！これからそう呼ぶね😊💖 よろしく！"
                         is_task_started = False
 
+            # ★ v34.3: 「○○って呼んで」で呼び方を変更
+            if not ai_text and db_user:
+                _new_nick = detect_nickname_change_request(message)
+                if _new_nick:
+                    db_user.nickname = _new_nick
+                    db_user.nickname_asked = False
+                    user_data.nickname = _new_nick
+                    ai_text = f"オッケー！これからは「{_new_nick}」って呼ぶね😊💖"
+                    logger.info(f"📛 呼び方変更: {user_uuid[:8]} → {_new_nick}")
+
             try:
                 with engine.connect() as _ch_conn:
                     with _ch_conn.begin():
@@ -8008,7 +8365,7 @@ def chat_lsl():
             # (lingo + Holodex でファクトチェックして信頼度60以上ならDB更新)
             try:
                 correction = detect_correction_intent(message)
-                if correction:
+                if correction and canonical_holomem_name(correction.get('subject', '')):  # ★ v34.3: ホロメンが主語の時だけ
                     logger.info(f"🎓 指摘検出: {correction}")
                     task_executor.submit(process_correction_learning, user_uuid, message, correction)
             except Exception as learn_err:
@@ -8106,6 +8463,12 @@ def chat_lsl():
                     if safe_summary:
                         ai_text = safe_summary
                         logger.info(f"🛡️ 第三者プライバシー保護応答: target={target_name}")
+
+            # ★ v34.3: 「○○は卒業したよ」等の指摘を公式サイトで確認してDB更新
+            if not ai_text:
+                claim_reply = handle_holomem_claim(message, user_uuid)
+                if claim_reply:
+                    ai_text = claim_reply
 
             # ★ v34.1: ホロメン話題でDBに詳細がなければ二段構えでWEB補完
             if not ai_text and not is_explicit_search_request(message):
@@ -9154,6 +9517,7 @@ def fix_postgres_sequences(quiet: bool = False):
         'conversation_embeddings', 'conversation_summaries',
         'holomem_pronunciations', 'mochiko_self',
         'learning_log', 'memvid_embeddings',
+        'holomem_x_memory',  # ★ v34.3
         # task_logs は primary key=task_name(VARCHAR) なので除外
     ]
 
