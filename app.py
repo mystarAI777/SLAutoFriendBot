@@ -187,6 +187,7 @@ GROQ_TASK_MODELS = {
     'chat':     ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
     'search':   ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
     'analysis': ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    'x_summary': ['openai/gpt-oss-20b', 'openai/gpt-oss-120b'],  # ★ v34.1 X記憶要約
     'default':  GROQ_MODELS,
 }
 
@@ -4726,6 +4727,603 @@ def cleanup_anime_cache():
         logger.error(f"アニメキャッシュクリーンアップエラー: {e}")
 
 
+# ==============================================================================
+# ★ v34.1: ホロメンX記憶システム (FxTwitter API)
+#   短期: holomem_x_posts   … Xの生投稿 (48時間で自動削除)
+#   中期: holomem_x_memory  … kind='episode' もちこのエピソード記憶 (1人20件上限)
+#                             kind='cache'   WEB補完キャッシュ (7日で失効 / 2回参照で episode に昇格)
+#   長期: holomem_feelings.summary_feeling … 溢れたエピソードを畳み込んだ気持ちの要約
+# ==============================================================================
+FXTWITTER_API_BASE = "https://api.fxtwitter.com/2"
+X_POST_RETENTION_HOURS = 48
+X_EPISODE_LIMIT_PER_MEMBER = 20
+X_CACHE_RETENTION_DAYS = 7
+X_CACHE_PROMOTE_COUNT = 2
+X_GAP_SEARCH_COOLDOWN_SEC = 600
+
+# 現役メンバーの公式Xアカウント (本垢)
+HOLOMEM_X_HANDLES: Dict[str, str] = {
+    'ときのそら': 'tokino_sora',
+    'ロボ子さん': 'robocosan',
+    'さくらみこ': 'sakuramiko35',
+    '星街すいせい': 'suisei_hosimati',
+    'AZKi': 'AZKi_VDiVA',
+    '白上フブキ': 'shirakamifubuki',
+    '夏色まつり': 'natsuiromatsuri',
+    'アキ・ローゼンタール': 'akirosenthal',
+    '赤井はあと': 'akaihaato',
+    '紫咲シオン': 'murasakishionch',
+    '百鬼あやめ': 'nakiriayame',
+    '癒月ちょこ': 'yuzukichococh',
+    '大空スバル': 'oozorasubaru',
+    '大神ミオ': 'ookamimio',
+    '猫又おかゆ': 'nekomataokayu',
+    '戌神ころね': 'inugamikorone',
+    '兎田ぺこら': 'usadapekora',
+    '不知火フレア': 'shiranuiflare',
+    '白銀ノエル': 'shiroganenoel',
+    '宝鐘マリン': 'houshoumarine',
+    '角巻わため': 'tsunomakiwatame',
+    '常闇トワ': 'tokoyamitowa',
+    '姫森ルーナ': 'himemoriluna',
+    '雪花ラミィ': 'yukihanalamy',
+    '桃鈴ねね': 'momosuzunene',
+    '獅白ぼたん': 'shishirobotan',
+    '尾丸ポルカ': 'omarupolka',
+    'ラプラス・ダークネス': 'LaplusDarknesss',
+    '鷹嶺ルイ': 'takanelui',
+    '博衣こより': 'hakuikoyori',
+    '沙花叉クロヱ': 'sakamatachloe',
+    '風真いろは': 'kazamairohach',
+    '音乃瀬奏': 'otonosekanade',
+    '一条莉々華': 'ichijouririka',
+    '儒烏風亭らでん': 'juufuuteiraden',
+    '轟はじめ': 'todoroki_hajime',
+    '響咲リオナ': 'isakiriona',
+    '虎金妃笑虎': 'koganeiniko',
+    '水宮枢': 'mizumiya_su',
+    '輪堂千速': 'rindochihaya',
+    '綺々羅々ヴィヴィ': 'kikiraravivi',
+}
+
+_x_tables_ready = False
+_x_gap_search_last: Dict[str, float] = {}
+_x_gap_lock = Lock()
+
+_X_TOPIC_STOPWORDS = {
+    '最近', '今日', '昨日', '明日', '配信', '本当', '本人', '感じ', '大丈夫', '何か',
+    '知って', '教えて', '今度', '最高', '可愛', '一緒', '自分', '普通', '結構',
+    'ホロライブ', 'ホロメン', 'ポスト', 'ツイート', 'リプ', 'コラボ',
+}
+
+
+def ensure_x_memory_tables():
+    """X記憶用テーブルを raw SQL で作成 (既存なら何もしない)"""
+    global _x_tables_ready
+    if _x_tables_ready or engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS holomem_x_posts ("
+                    " post_id VARCHAR(40) PRIMARY KEY,"
+                    " member_name VARCHAR(100) NOT NULL,"
+                    " screen_name VARCHAR(100),"
+                    " body TEXT,"
+                    " posted_at TIMESTAMP NOT NULL,"
+                    " likes INTEGER DEFAULT 0,"
+                    " reposts INTEGER DEFAULT 0,"
+                    " views INTEGER,"
+                    " url VARCHAR(300),"
+                    " processed BOOLEAN DEFAULT FALSE,"
+                    " fetched_at TIMESTAMP DEFAULT NOW())"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_holomem_x_posts_member ON holomem_x_posts (member_name, posted_at)"
+                ))
+                conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS holomem_x_memory ("
+                    " id SERIAL PRIMARY KEY,"
+                    " member_name VARCHAR(100) NOT NULL,"
+                    " kind VARCHAR(10) NOT NULL DEFAULT 'episode',"
+                    " episode VARCHAR(400) NOT NULL,"
+                    " feeling VARCHAR(200),"
+                    " keywords VARCHAR(300),"
+                    " importance INTEGER DEFAULT 3,"
+                    " source VARCHAR(10) DEFAULT 'x',"
+                    " source_url VARCHAR(300),"
+                    " event_date TIMESTAMP,"
+                    " mention_count INTEGER DEFAULT 0,"
+                    " created_at TIMESTAMP DEFAULT NOW())"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_holomem_x_memory_member ON holomem_x_memory (member_name, kind)"
+                ))
+        _x_tables_ready = True
+        logger.info("✅ X記憶テーブル準備完了 (holomem_x_posts / holomem_x_memory)")
+    except Exception as e:
+        logger.error(f"❌ X記憶テーブル作成エラー: {e}")
+
+
+def resolve_holomem_canonical(detected: str) -> Optional[str]:
+    """検出キーワード(愛称含む)を HOLOMEM_X_HANDLES の正式名に解決"""
+    if not detected:
+        return None
+    if detected in HOLOMEM_X_HANDLES:
+        return detected
+    try:
+        with holomem_manager._lock:
+            for name, kws in holomem_manager._keywords.items():
+                if detected in kws and name in HOLOMEM_X_HANDLES:
+                    return name
+    except Exception:
+        pass
+    return None
+
+
+def _x_extract_topic_tokens(message: str, member_name: str) -> List[str]:
+    """メッセージからホロメン名・愛称・ひらがなを除いた話題キーワードを抽出"""
+    msg = message
+    names = [member_name]
+    try:
+        with holomem_manager._lock:
+            names += holomem_manager._keywords.get(member_name, [])
+    except Exception:
+        pass
+    for n in sorted(set(names), key=len, reverse=True):
+        if n:
+            msg = msg.replace(n, ' ')
+    tokens = re.findall(r'[一-龥々〆ヵヶ]{2,}|[ァ-ヴー]{2,}|[A-Za-z0-9]{3,}', msg)
+    result = []
+    for t in tokens:
+        if t in _X_TOPIC_STOPWORDS or t in result:
+            continue
+        result.append(t)
+    return result[:5]
+
+
+def _x_parse_json_array(raw: str) -> List[Dict]:
+    if not raw:
+        return []
+    try:
+        s = raw.find('[')
+        e = raw.rfind(']')
+        if s < 0 or e <= s:
+            return []
+        data = json.loads(raw[s:e + 1])
+        return [d for d in data if isinstance(d, dict)]
+    except Exception:
+        return []
+
+
+def fetch_holomem_x_posts():
+    """全現役ホロメンのX投稿を差分取得して48時間バッファに保存 (LLM不使用)"""
+    ensure_x_memory_tables()
+    if not _x_tables_ready:
+        return
+    logger.info("🐦 ホロメンX投稿取得開始 (FxTwitter)")
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=X_POST_RETENTION_HOURS)
+    retired = set()
+    try:
+        with get_db_session() as session:
+            for w in session.query(HolomemWiki).all():
+                if w.status and w.status != '現役':
+                    retired.add(w.member_name)
+    except Exception as e:
+        logger.warning(f"X取得: 在籍状況取得失敗 {e}")
+
+    saved = 0
+    for member_name, handle in HOLOMEM_X_HANDLES.items():
+        if member_name in retired:
+            continue
+        try:
+            with engine.connect() as conn:
+                last = conn.execute(text(
+                    "SELECT MAX(posted_at) FROM holomem_x_posts WHERE member_name = :m"
+                ), {"m": member_name}).scalar()
+            since_dt = last if (last and last > cutoff) else cutoff
+            since_ts = int(since_dt.replace(tzinfo=timezone.utc).timestamp())
+            res = requests.get(
+                f"{FXTWITTER_API_BASE}/profile/{handle}/statuses",
+                params={'count': 20, 'since': since_ts},
+                headers={'User-Agent': 'MochikoBot/1.0 (+SLAutoFriendBot)'},
+                timeout=15
+            )
+            if res.status_code == 204:
+                time.sleep(1)
+                continue
+            if res.status_code != 200:
+                logger.warning(f"⚠️ X取得失敗 {member_name}(@{handle}): HTTP {res.status_code}")
+                time.sleep(2)
+                continue
+            results = (res.json() or {}).get('results') or []
+            rows = []
+            for r in results:
+                if r.get('type') != 'status':
+                    continue
+                if r.get('reposted_by') or r.get('replying_to'):
+                    continue
+                ts = r.get('created_timestamp')
+                if not ts:
+                    continue
+                posted_at = datetime.utcfromtimestamp(int(ts))
+                if posted_at < cutoff:
+                    continue
+                body = (r.get('text') or '').strip()
+                if not body:
+                    continue
+                rows.append({
+                    "pid": str(r.get('id')), "m": member_name, "sn": handle,
+                    "b": body[:1000], "pa": posted_at,
+                    "lk": int(r.get('likes') or 0), "rp": int(r.get('reposts') or 0),
+                    "vw": r.get('views'), "u": (r.get('url') or '')[:300],
+                })
+            if rows:
+                with engine.connect() as conn:
+                    with conn.begin():
+                        for row in rows:
+                            conn.execute(text(
+                                "INSERT INTO holomem_x_posts (post_id, member_name, screen_name, body, posted_at, likes, reposts, views, url) "
+                                "VALUES (:pid, :m, :sn, :b, :pa, :lk, :rp, :vw, :u) ON CONFLICT (post_id) DO NOTHING"
+                            ), row)
+                saved += len(rows)
+            time.sleep(1)
+        except Exception as e:
+            logger.warning(f"⚠️ X取得エラー {member_name}: {e}")
+            time.sleep(2)
+
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                d1 = conn.execute(text("DELETE FROM holomem_x_posts WHERE posted_at < :c"), {"c": cutoff}).rowcount
+                d2 = conn.execute(text(
+                    "DELETE FROM holomem_x_memory WHERE kind = 'cache' AND created_at < :c"
+                ), {"c": now - timedelta(days=X_CACHE_RETENTION_DAYS)}).rowcount
+        logger.info(f"✅ X投稿取得完了: 新規{saved}件 / 期限切れ削除 投稿{d1}件・キャッシュ{d2}件")
+    except Exception as e:
+        logger.error(f"❌ X投稿クリーンアップエラー: {e}")
+
+
+def _x_summarize_member_posts(member_name: str, posts: List) -> Optional[List[Dict]]:
+    """未処理のX投稿からもちこのエピソード記憶を生成 (Groq gpt-oss-20b)"""
+    lines = []
+    for p in posts[:15]:
+        jst = p.posted_at + timedelta(hours=9)
+        lines.append(f"- ({jst.strftime('%m/%d %H:%M')}) {(p.body or '')[:280]}")
+    prompt = f"""あなたは「もちこ」というホロライブ大好きなギャルのホロリスです。
+以下は{member_name}の直近のX(旧Twitter)投稿です。
+
+{chr(10).join(lines)}
+
+【タスク】
+ホロリスとして記憶に残すべき出来事だけを最大3件、エピソードにしてください。
+- 配信告知だけの投稿、定型のおはよう・おやすみ、宣伝の繰り返しは無視する
+- 日常の出来事、感想、記念日、重大な発表、面白い話題を優先
+- 該当がなければ空配列 [] を返す
+
+【出力形式】JSON配列のみ (前置き・コードブロック禁止)
+[{{"episode": "何があったか(客観的に80文字以内)", "feeling": "もちこの感想(一人称あてぃし・ギャル口調・60文字以内)", "importance": 1〜5の整数, "date": "MM/DD"}}]
+"""
+    raw = call_groq(prompt, "JSONで出力して", [], 1500, task_type='x_summary')
+    if raw is None:
+        return None  # LLM失敗時は未処理のまま残して次回再試行
+    items = _x_parse_json_array(raw)
+    out = []
+    for it in items[:3]:
+        ep = str(it.get('episode') or '').strip()
+        if not ep:
+            continue
+        try:
+            imp = max(1, min(5, int(it.get('importance') or 3)))
+        except Exception:
+            imp = 3
+        out.append({
+            'episode': ep[:380],
+            'feeling': str(it.get('feeling') or '').strip()[:190],
+            'importance': imp,
+        })
+    return out
+
+
+def _x_fold_into_feeling(member_name: str, overflow: List) -> bool:
+    """上限を超えたエピソードを holomem_feelings.summary_feeling に畳み込む"""
+    try:
+        with engine.connect() as conn:
+            current = conn.execute(text(
+                "SELECT summary_feeling FROM holomem_feelings WHERE member_name = :m"
+            ), {"m": member_name}).scalar()
+        ep_lines = "\n".join(
+            f"- ({(o.event_date or o.created_at).strftime('%Y/%m/%d')}) {o.episode} / {o.feeling or ''}"
+            for o in overflow
+        )
+        prompt = f"""あなたは「もちこ」というホロライブ大好きなギャルのホロリスです。
+{member_name}への今の気持ちの要約と、古くなった思い出を1つにまとめてください。
+
+【今の気持ちの要約】
+{current or '(まだなし)'}
+
+【まとめる思い出】
+{ep_lines}
+
+【ルール】
+- 一人称は「あてぃし」、語尾は「〜じゃん」「〜て感じ」「〜だし」「〜よね」
+- 300文字以内、要約本文だけ出力
+- 具体的な思い出は代表的なものを1〜2個だけ残し、全体の印象と推しポイントを中心に
+"""
+        merged = call_groq(prompt, "要約して", [], 1500, task_type='x_summary')
+        if not merged:
+            return False
+        merged = merged.strip()[:390]
+        with engine.connect() as conn:
+            with conn.begin():
+                cnt = conn.execute(text(
+                    "UPDATE holomem_feelings SET summary_feeling = :s, last_updated = :t WHERE member_name = :m"
+                ), {"s": merged, "t": datetime.utcnow(), "m": member_name}).rowcount
+                if cnt == 0:
+                    conn.execute(text(
+                        "INSERT INTO holomem_feelings (member_name, summary_feeling, total_watch_count, love_level, last_updated) "
+                        "VALUES (:m, :s, 0, 50, :t)"
+                    ), {"s": merged, "t": datetime.utcnow(), "m": member_name})
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ 気持ち畳み込みエラー {member_name}: {e}")
+        return False
+
+
+def summarize_holomem_x_memory():
+    """1日1回: X投稿→エピソード化、上限超過分を長期の気持ちへ畳み込み"""
+    ensure_x_memory_tables()
+    if not _x_tables_ready:
+        return
+    logger.info("📝 ホロメンX記憶の要約開始")
+    try:
+        with engine.connect() as conn:
+            members = [r[0] for r in conn.execute(text(
+                "SELECT DISTINCT member_name FROM holomem_x_posts WHERE processed = FALSE"
+            )).fetchall()]
+    except Exception as e:
+        logger.error(f"❌ X要約: 対象取得エラー {e}")
+        return
+
+    made = 0
+    for member_name in members:
+        try:
+            with engine.connect() as conn:
+                posts = conn.execute(text(
+                    "SELECT post_id, body, posted_at FROM holomem_x_posts "
+                    "WHERE member_name = :m AND processed = FALSE ORDER BY posted_at ASC"
+                ), {"m": member_name}).fetchall()
+            if not posts:
+                continue
+            episodes = _x_summarize_member_posts(member_name, posts)
+            if episodes is None:
+                continue
+            last_post = posts[-1]
+            with engine.connect() as conn:
+                with conn.begin():
+                    for ep in episodes:
+                        conn.execute(text(
+                            "INSERT INTO holomem_x_memory (member_name, kind, episode, feeling, importance, source, source_url, event_date) "
+                            "VALUES (:m, 'episode', :e, :f, :i, 'x', :u, :d)"
+                        ), {"m": member_name, "e": ep['episode'], "f": ep['feeling'],
+                            "i": ep['importance'], "u": f"https://x.com/{HOLOMEM_X_HANDLES.get(member_name, '')}",
+                            "d": last_post.posted_at})
+                    conn.execute(text(
+                        "UPDATE holomem_x_posts SET processed = TRUE WHERE member_name = :m AND processed = FALSE"
+                    ), {"m": member_name})
+            made += len(episodes)
+            logger.info(f"✅ {member_name}: X投稿{len(posts)}件 → エピソード{len(episodes)}件")
+            time.sleep(4)
+        except Exception as e:
+            logger.warning(f"⚠️ X要約エラー {member_name}: {e}")
+            time.sleep(4)
+
+    # 上限超過分を長期記憶へ畳み込み
+    try:
+        with engine.connect() as conn:
+            over = conn.execute(text(
+                "SELECT member_name, COUNT(*) FROM holomem_x_memory WHERE kind = 'episode' "
+                "GROUP BY member_name HAVING COUNT(*) > :lim"
+            ), {"lim": X_EPISODE_LIMIT_PER_MEMBER}).fetchall()
+        for member_name, cnt in over:
+            excess = int(cnt) - X_EPISODE_LIMIT_PER_MEMBER
+            with engine.connect() as conn:
+                overflow = conn.execute(text(
+                    "SELECT id, episode, feeling, event_date, created_at FROM holomem_x_memory "
+                    "WHERE member_name = :m AND kind = 'episode' "
+                    "ORDER BY importance ASC, COALESCE(event_date, created_at) ASC LIMIT :n"
+                ), {"m": member_name, "n": excess}).fetchall()
+            if overflow and _x_fold_into_feeling(member_name, overflow):
+                ids = [o.id for o in overflow]
+                with engine.connect() as conn:
+                    with conn.begin():
+                        for oid in ids:
+                            conn.execute(text("DELETE FROM holomem_x_memory WHERE id = :i"), {"i": oid})
+                logger.info(f"🧠 {member_name}: 古いエピソード{len(ids)}件を気持ちの要約へ畳み込み")
+                time.sleep(4)
+    except Exception as e:
+        logger.error(f"❌ X記憶の畳み込みエラー: {e}")
+
+    logger.info(f"✅ ホロメンX記憶の要約完了: 新規エピソード{made}件")
+
+
+def get_x_memory_context(detected_name: str, message: str) -> str:
+    """会話用: 直近48hのX投稿・エピソード・WEB補完キャッシュをコンテキスト化"""
+    member_name = resolve_holomem_canonical(detected_name)
+    if not member_name or not _x_tables_ready:
+        return ""
+    ctx = ""
+    now = datetime.utcnow()
+    try:
+        with engine.connect() as conn:
+            posts = conn.execute(text(
+                "SELECT body, posted_at FROM holomem_x_posts WHERE member_name = :m "
+                "ORDER BY posted_at DESC LIMIT 3"
+            ), {"m": member_name}).fetchall()
+            eps = conn.execute(text(
+                "SELECT episode, feeling, event_date, created_at FROM holomem_x_memory "
+                "WHERE member_name = :m AND kind = 'episode' "
+                "ORDER BY importance DESC, COALESCE(event_date, created_at) DESC LIMIT 5"
+            ), {"m": member_name}).fetchall()
+            caches = conn.execute(text(
+                "SELECT id, kind, episode, keywords, mention_count FROM holomem_x_memory "
+                "WHERE member_name = :m AND keywords IS NOT NULL AND keywords <> ''"
+            ), {"m": member_name}).fetchall()
+
+        if posts:
+            ctx += f"\n【{member_name}の直近のXポスト(本人)】\n"
+            for p in posts:
+                hours = int((now - p.posted_at).total_seconds() // 3600)
+                ctx += f"- ({hours}時間前) {(p.body or '')[:80]}\n"
+        if eps:
+            ctx += f"\n【もちこが覚えている{member_name}のエピソード】\n"
+            for e in eps:
+                d = (e.event_date or e.created_at) + timedelta(hours=9)
+                ctx += f"- ({d.strftime('%m/%d')}) {e.episode[:100]}"
+                if e.feeling:
+                    ctx += f" → あてぃしの感想: {e.feeling[:60]}"
+                ctx += "\n"
+            ctx += "※日付が古いものは「前に〜」「こないだ〜」と過去の話として扱うこと\n"
+
+        tokens = _x_extract_topic_tokens(message, member_name)
+        hit_lines = []
+        if tokens and caches:
+            for c in caches:
+                kws = [k for k in (c.keywords or '').split(',') if k]
+                if any(t in kws for t in tokens):
+                    hit_lines.append(f"- {c.episode[:200]}")
+                    new_count = int(c.mention_count or 0) + 1
+                    with engine.connect() as conn:
+                        with conn.begin():
+                            if c.kind == 'cache' and new_count >= X_CACHE_PROMOTE_COUNT:
+                                conn.execute(text(
+                                    "UPDATE holomem_x_memory SET kind = 'episode', importance = 3, "
+                                    "mention_count = :n, event_date = COALESCE(event_date, created_at) WHERE id = :i"
+                                ), {"n": new_count, "i": c.id})
+                                logger.info(f"⬆️ WEB補完キャッシュをエピソードに昇格: {member_name} {c.keywords}")
+                            else:
+                                conn.execute(text(
+                                    "UPDATE holomem_x_memory SET mention_count = :n WHERE id = :i"
+                                ), {"n": new_count, "i": c.id})
+                    if len(hit_lines) >= 2:
+                        break
+        if hit_lines:
+            ctx += f"\n【前に調べた{member_name}の話題】\n" + "\n".join(hit_lines) + "\n"
+    except Exception as e:
+        logger.debug(f"X記憶コンテキスト取得エラー: {e}")
+    return ctx
+
+
+def _x_memory_has_topic(member_name: str, tokens: List[str]) -> bool:
+    """話題キーワードがもちこの既存知識のどこかにあるか"""
+    corpus = []
+    try:
+        with engine.connect() as conn:
+            for r in conn.execute(text(
+                "SELECT body FROM holomem_x_posts WHERE member_name = :m"
+            ), {"m": member_name}).fetchall():
+                corpus.append(r[0] or '')
+            for r in conn.execute(text(
+                "SELECT episode, feeling, keywords FROM holomem_x_memory WHERE member_name = :m"
+            ), {"m": member_name}).fetchall():
+                corpus.append(f"{r[0] or ''} {r[1] or ''} {r[2] or ''}")
+        with get_db_session() as s:
+            w = s.query(HolomemWiki).filter_by(member_name=member_name).first()
+            if w:
+                corpus.append(f"{w.description or ''} {w.episodes or ''} {w.recent_activity or ''} {w.tags or ''}")
+            f = s.query(HolomemFeeling).filter_by(member_name=member_name).first()
+            if f:
+                corpus.append(f"{f.summary_feeling or ''} {f.memorable_streams or ''}")
+    except Exception as e:
+        logger.debug(f"X記憶トピック照合エラー: {e}")
+        return True  # 判定不能時は検索しない
+    joined = "\n".join(corpus)
+    for t in tokens:
+        if t in joined:
+            return True
+        # 漢字連結で語がくっついた場合 (例: 衣装知) は2文字単位でも照合
+        if len(t) >= 3 and re.fullmatch(r'[一-龥々〆ヵヶ]+', t):
+            if any(t[i:i + 2] in joined for i in range(len(t) - 1)):
+                return True
+    return False
+
+
+def _x_is_question_like(message: str) -> bool:
+    q = ['？', '?', '知ってる', '知ってた', 'どうなった', '何があった', 'あったの', 'なんで', 'ほんと', 'マジ', 'まじ', 'どういう', 'だっけ', '聞いた']
+    return any(k in message for k in q)
+
+
+def background_holomem_gap_search(task_id: str, query_data: Dict):
+    """二段構え検索: 既存の background_deep_search を実行し、結果を7日キャッシュとして記憶"""
+    background_deep_search(task_id, query_data)
+    try:
+        member_name = query_data.get('x_member')
+        tokens = query_data.get('x_tokens') or []
+        if not member_name or not tokens:
+            return
+        with get_db_session() as session:
+            task = session.query(BackgroundTask).filter_by(task_id=task_id).first()
+            result = task.result if task else None
+        if not result or '見つからなかった' in result:
+            return
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(
+                    "INSERT INTO holomem_x_memory (member_name, kind, episode, keywords, importance, source, mention_count) "
+                    "VALUES (:m, 'cache', :e, :k, 2, 'web', 1)"
+                ), {"m": member_name, "e": result[:390], "k": ','.join(tokens)[:290]})
+        logger.info(f"💾 WEB補完をキャッシュ: {member_name} {tokens}")
+    except Exception as e:
+        logger.warning(f"⚠️ WEB補完キャッシュ保存エラー: {e}")
+
+
+def maybe_start_holomem_gap_search(session, user_data: UserData, message: str) -> Optional[str]:
+    """ホロメン話題でDBに詳細がなければ裏でWEB検索し、即時の返答文を返す"""
+    try:
+        if not _x_tables_ready or not _x_is_question_like(message):
+            return None
+        detected = holomem_manager.detect_all_in_message(knowledge_base.normalize_query(message), limit=1)
+        if not detected:
+            return None
+        member_name = resolve_holomem_canonical(detected[0])
+        if not member_name:
+            return None
+        tokens = _x_extract_topic_tokens(message, member_name)
+        if not tokens or _x_memory_has_topic(member_name, tokens):
+            return None
+        key = f"{user_data.uuid}:{member_name}"
+        with _x_gap_lock:
+            if time.time() - _x_gap_search_last.get(key, 0) < X_GAP_SEARCH_COOLDOWN_SEC:
+                return None
+            _x_gap_search_last[key] = time.time()
+        tid = f"holoxgap_{user_data.uuid}_{int(time.time())}"
+        qdata = {
+            'query': message,
+            'x_member': member_name,
+            'x_tokens': tokens,
+            'user_data': {
+                'uuid': user_data.uuid,
+                'name': user_data.name,
+                'interaction_count': user_data.interaction_count,
+                'is_friend': user_data.is_friend,
+                'favorite_topics': user_data.favorite_topics,
+                'psychology': user_data.psychology,
+                'friend_profile': user_data.friend_profile,
+                'nickname': user_data.nickname,
+            }
+        }
+        session.add(BackgroundTask(task_id=tid, user_uuid=user_data.uuid, task_type='search',
+                                   query=json.dumps(qdata, ensure_ascii=False)))
+        search_executor.submit(background_holomem_gap_search, tid, qdata)
+        logger.info(f"🔎 ホロメン話題の補完検索開始: {member_name} {tokens}")
+        return f"あ、{member_name}のその話、あてぃしまだ詳しく知らないかも！ちょっと調べてくるじゃん、待ってて！"
+    except Exception as e:
+        logger.warning(f"⚠️ 補完検索判定エラー: {e}")
+        return None
+
+
 def wrapped_holomem_update():
     """ホロメンDB更新タスク (run_managed_task から呼ばれる)"""
     update_holomem_database()
@@ -4796,6 +5394,9 @@ TASK_SCHEDULE: Dict[str, Dict] = {
     'fetch_lingo':          {'func': 'fetch_hololive_dictionary',        'interval_hours': 167.0},  # 週1回（辞書はほぼ更新されない）
     'fetch_episodes':       {'func': 'fetch_holomem_episodes',           'interval_hours': 47.0},   # 2日に1回（15人ずつ順番に）
     'fetch_schedule':       {'func': 'fetch_hololive_schedule',          'interval_hours': 0.25},   # 15分ごと
+    # ★ v34.1: ホロメンX記憶
+    'fetch_x_posts':        {'func': 'fetch_holomem_x_posts',            'interval_hours': 11.0},   # 1日2回
+    'summarize_x_memory':   {'func': 'summarize_holomem_x_memory',       'interval_hours': 23.0},   # 1日1回
 }
 
 # タスク名 → 実際の関数のマッピング (initialize_app内で設定)
@@ -5843,6 +6444,11 @@ def generate_ai_response(user_data: UserData, message: str, history: List[Dict],
             memory_context = get_mochiko_memory_context(detected_name)
             if memory_context:
                 internal_context += memory_context
+
+            # ★ v34.1: X記憶 (直近ポスト・エピソード・WEB補完キャッシュ)
+            x_memory_context = get_x_memory_context(detected_name, message)
+            if x_memory_context:
+                internal_context += x_memory_context
 
     except Exception as e:
         logger.error(f"Context injection error: {e}")
@@ -7503,6 +8109,13 @@ def chat_lsl():
                         ai_text = safe_summary
                         logger.info(f"🛡️ 第三者プライバシー保護応答: target={target_name}")
 
+            # ★ v34.1: ホロメン話題でDBに詳細がなければ二段構えでWEB補完
+            if not ai_text and not is_explicit_search_request(message):
+                gap_reply = maybe_start_holomem_gap_search(session, user_data, message)
+                if gap_reply:
+                    ai_text = gap_reply
+                    is_task_started = True
+
             if not ai_text and not is_explicit_search_request(message):
                 holomem_resp = process_holomem_in_chat(message, user_data, history)
                 if holomem_resp:
@@ -8996,6 +9609,7 @@ def initialize_app():
         repair_missing_id_sequences()
         reconcile_column_types()
         fix_hololive_news_constraints()
+        ensure_x_memory_tables()  # ★ v34.1
         
         Session = sessionmaker(bind=engine)
         
@@ -9063,6 +9677,9 @@ def initialize_app():
         # ★ Memvid RAGタスク
         'memvid_build_index': memvid_rag.build_knowledge_index,
         'memvid_cleanup':     memvid_rag.cleanup_old_embeddings,
+        # ★ v34.1: ホロメンX記憶
+        'fetch_x_posts':      fetch_holomem_x_posts,
+        'summarize_x_memory': summarize_holomem_x_memory,
     })
 
     # ★ v33.11 変更: 起動時に Gemini API を使う処理をすぐに走らせない
