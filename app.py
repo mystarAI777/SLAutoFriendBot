@@ -8520,7 +8520,7 @@ def chat_lsl():
         voice_text = sanitize_response_for_sl(ai_text)  # パイプ除去のみ
         v_url = ""
         first_phrase_text = ""
-        if generate_voice and global_state.voicevox_enabled and not is_task_started:
+        if generate_voice and global_state.voicevox_enabled:  # ★ v34.5: is_task_startedでも必ず音声生成
             direct_url = generate_voice_file(voice_text, user_uuid)  # 絵文字付きで渡す
             if direct_url:
                 v_url = direct_url
