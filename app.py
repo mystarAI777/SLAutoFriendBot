@@ -2783,12 +2783,26 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
     """複数の感想を1つに要約 (詳細版: 解像度を保つ)"""
     if not reactions:
         return None
-    
+
     feelings_text = "\n".join([
-        f"- 「{r.stream_title[:40]}」: {r.mochiko_feeling}" 
+        f"- 「{r.stream_title[:40]}」: {r.mochiko_feeling}"
         for r in reactions[:10]
     ])
-    
+
+    # v34.4: emotion_tags は実カラム(StreamReaction.emotion_tags)から集計
+    _tag_seen = []
+    for r in reactions:
+        if getattr(r, 'emotion_tags', None):
+            for t in r.emotion_tags.split(','):
+                t = t.strip()
+                if t and t not in _tag_seen:
+                    _tag_seen.append(t)
+    emotion_tags_str = ','.join(_tag_seen)
+
+    # v34.4: memorable は実際の配信タイトル(直近3件)から生成 (reactionsはListなので.get()は使えない)
+    _titles = [r.stream_title for r in reactions[:3] if getattr(r, 'stream_title', None)]
+    memorable_str = "、".join(_titles)[:500]
+
     prompt = f"""あなたは「もちこ」というホロライブの熱狂的なファンです。
 
 【配信情報】
@@ -2813,44 +2827,43 @@ def generate_feeling_summary(member_name: str, reactions: List) -> Optional[Dict
 【出力形式】
 要約だけを出力してください (前置き不要)
 """
-    
+
     try:
         model = gemini_model_manager.get_current_model()
         if model:
             # v33.15-stable2: 400文字指定なので500トークンで十分
             response = model.generate_content(
-                prompt, 
+                prompt,
                 generation_config={"temperature": 0.8, "max_output_tokens": 500}
             )
             if hasattr(response, 'candidates') and response.candidates:
                 feeling = response.candidates[0].content.parts[0].text.strip()
                 return {
-                    'feeling': feeling[:300],
-                    'emotion_tags': ','.join(emotion_tags),
-                    'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                    'summary': feeling[:400],
+                    'memorable': memorable_str,
+                    'emotion_tags': emotion_tags_str,
                 }
     except Exception as e:
         error_str = str(e)
         if "location" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
             gemini_model_manager.mark_limited(60)
         logger.warning(f"感想生成Geminiエラー: {e}")
-        
+
     if groq_client:
         try:
             groq_result = call_groq(prompt, member_name, [], 500, task_type='analysis')
             if groq_result:
                 return {
-                    'feeling': groq_result[:300],
-                    'emotion_tags': ','.join(emotion_tags),
-                    'favorite_part': reactions.get('highlight_moments', [''])[0] if reactions.get('highlight_moments') else None
+                    'summary': groq_result[:400],
+                    'memorable': memorable_str,
+                    'emotion_tags': emotion_tags_str,
                 }
         except Exception as ge:
             logger.warning(f"感想生成Groqエラー: {ge}")
-    
-    # フォールバック: 詳細テンプレート
-    
-    return None
 
+    # フォールバック: 詳細テンプレート
+
+    return None
 def summarize_member_feelings():
     """各ホロメンへの想いを定期的に要約 (週1回実行)"""
     logger.info("📝 想いの要約処理開始...")
