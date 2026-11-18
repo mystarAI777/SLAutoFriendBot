@@ -9,11 +9,12 @@ TARGET = os.path.join(BASE, "dashboard.py")
 MARK = "# --- モデル取得（読み取り専用・追加機能）---"
 
 PROBE = r'''# --- モデル取得（読み取り専用・追加機能）---
+# --- v2: スリープ表示・FreeToken・停止時の注意 ---
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 N8N_KEY = os.environ.get("N8N_API_KEY", "")
-KINDS = (("ollama", ("ollama",)), ("llama", ("llama-server", "llama_server", "llama-")),
+KINDS = (("ollama", ("ollama",)), ("llama", ("llama-server", "llama_server", "llama-", "freetoken")),
          ("comfyui", ("comfy",)), ("n8n", ("n8n",)), ("tts", ("irodori", "voicevox")),
          ("hermes", ("hermes",)))
 MODEL_KEYS = ("ckpt_name", "unet_name", "lora_name", "vae_name", "clip_name", "clip_name1",
@@ -65,7 +66,7 @@ def probe_llama(port, proc):
         n = base(p.get("model_path") or "")
         ctx = (p.get("default_generation_settings") or {}).get("n_ctx") or p.get("n_ctx")
         if n:
-            names.append(n + ((" / ctx " + str(ctx)) if ctx else ""))
+            names.append(("【スリープ中】" if p.get("is_sleeping") else "") + n + ((" / ctx " + str(ctx)) if ctx else ""))
     except Exception:
         pass
     try:
@@ -228,6 +229,8 @@ def attach_info(items, out):
 
 # (置換前, 置換後) 置換前は dashboard.py 内に必ず1回だけ存在すること
 EDITS = [
+    ("v.name+' を停止します。よろしいですか？'",
+     "v.name+' を停止します。よろしいですか？'+(v.kind==='llama'?'\\\\n（自動復帰ジョブにより、数分〜夜間に再起動される場合があります）':'')"),
     ("def status():\n", PROBE + "def status():\n"),
     ("    # 警告（止めはしない）\n", "    dk = attach_info(items, out)\n\n    # 警告（止めはしない）\n"),
     ('"gpu": gp, "warnings": warn}', '"gpu": gp, "warnings": warn, "docker": dk}'),
@@ -250,18 +253,33 @@ EDITS = [
 ]
 
 
+MARK2 = "# --- v2: スリープ表示・FreeToken・停止時の注意 ---"
+UPGRADES = [
+    ('("llama", ("llama-server", "llama_server", "llama-")),',
+     '("llama", ("llama-server", "llama_server", "llama-", "freetoken")),'),
+    ('            names.append(n + ((" / ctx " + str(ctx)) if ctx else ""))',
+     '            names.append(("【スリープ中】" if p.get("is_sleeping") else "") + n + ((" / ctx " + str(ctx)) if ctx else ""))'),
+    ("# --- モデル取得（読み取り専用・追加機能）---\n",
+     "# --- モデル取得（読み取り専用・追加機能）---\n" + MARK2 + "\n"),
+    EDITS[0],
+]
+
+
 def main():
     if not os.path.isfile(TARGET):
         print("dashboard.py が見つかりません。apply_patch.py を dashboard.py と同じフォルダに置いてください。")
         return 1
     with open(TARGET, "r", encoding="utf-8", newline="") as f:
         src = f.read()
-    if MARK in src:
-        print("適用済みです。変更しません。")
-        return 0
     crlf = "\r\n" in src
     out = src
-    for i, (old, new) in enumerate(EDITS, 1):
+    edits = EDITS
+    if MARK in src:
+        if MARK2 in src:
+            print("適用済みです。変更しません。")
+            return 0
+        edits = UPGRADES
+    for i, (old, new) in enumerate(edits, 1):
         if crlf:
             old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
         n = out.count(old)
