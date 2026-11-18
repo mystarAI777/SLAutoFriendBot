@@ -245,8 +245,7 @@ EDITS = [
     ("}\nasync function load(){",
      " const dt=document.getElementById('det');dt.replaceChildren();\n"
      " d.services.concat(d.others).filter(v=>v.info&&v.info.length).forEach(v=>dt.append($('div',{},$('b',{},v.name),...v.info.map(x=>$('div',{},'　'+x)))));\n"
-     " if(d.docker===null)dt.append($('div',{},'Docker: 取得できません（未インストール/未起動）'));\n"
-     " else (d.docker||[]).forEach(c=>dt.append($('div',{},'Docker: '+(c.Names||'')+'　'+(c.Image||'')+'　'+(c.Ports||'')+'　'+(c.Status||''))));\n"
+     " (d.docker||[]).forEach(c=>dt.append($('div',{},'Docker: '+(c.Names||'')+'　'+(c.Image||'')+'　'+(c.Ports||'')+'　'+(c.Status||''))));\n"
      "}\nasync function load(){"),
 ]
 
